@@ -1,0 +1,43 @@
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: Go
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Build
+      run: go build ./cmd/gdns2tcp ./cmd/gdns2tcp-client
+
+    - name: Vet
+      run: go vet ./...
+
+    - name: Lint
+      uses: dominikh/staticcheck-action@v1
+      with:
+        version: "latest"
+        install-go: false
+
+    - name: Test
+      run: go test -race ./...
+
+    - name: Coverage
+      run: |
+        go test -coverprofile=cover.out -covermode=atomic ./...
+        pct=$(go tool cover -func=cover.out | awk '/^total:/{gsub(/%/,"",$3); printf "%.1f", $3}')
+        echo "Total test coverage: ${pct}%"
+        awk -v p="${pct}" 'BEGIN { if (p+0 < 80.0) { print "FAIL: coverage " p "% is below 80% threshold"; exit 1 } }'
