@@ -106,7 +106,11 @@ param(
     [int64]$MaxDownloadBytes = 33554432,
 
     [Parameter()]
-    [switch]$Tcp
+    [switch]$Tcp,
+
+    [Parameter()]
+    [ValidateRange(1, 64)]
+    [int]$Parallelism = 32
 )
 
 Set-StrictMode -Version Latest
@@ -538,6 +542,10 @@ public static class Gdns2TcpDownload {
         }
     }
 
+    // Updated by Interlocked.Increment from worker tasks; read by PowerShell
+    // to render Write-Progress while the parallel download is in flight.
+    public static int CompletedChunks;
+
     public static string[] DownloadChunks(
         string secret, string domain, string sid, int count,
         string server, int port, int timeoutMs, int retries, int retryDelayMs, int concurrency, bool tcp)
@@ -558,6 +566,7 @@ public static class Gdns2TcpDownload {
                             results[idx] = tcp
                                 ? QueryOnceTcp(qname, server, port, timeoutMs, id)
                                 : QueryOnceUdp(qname, server, port, timeoutMs, id);
+                            Interlocked.Increment(ref CompletedChunks);
                             return;
                         } catch (Exception ex) {
                             last = ex;
@@ -575,6 +584,18 @@ public static class Gdns2TcpDownload {
             throw new Exception("parallel chunk download: " + string.Join("; ", m));
         }
         return results;
+    }
+
+    // Async wrapper used by PowerShell to poll CompletedChunks while the
+    // download runs on a background thread.
+    public static Task<string[]> BeginDownloadChunks(
+        string secret, string domain, string sid, int count,
+        string server, int port, int timeoutMs, int retries, int retryDelayMs, int concurrency, bool tcp)
+    {
+        CompletedChunks = 0;
+        return Task.Run(() => DownloadChunks(
+            secret, domain, sid, count, server, port, timeoutMs,
+            retries, retryDelayMs, concurrency, tcp));
     }
 }
 '@ -ErrorAction Stop
@@ -1120,9 +1141,9 @@ function Format-TransferRate {
 function Format-ETA {
     param([Parameter(Mandatory = $true)][int]$Seconds)
     if ($Seconds -lt 60) { return "${Seconds}s" }
-    $m = [Math]::Floor($Seconds / 60); $s = $Seconds % 60
+    [int]$m = [Math]::Floor($Seconds / 60); [int]$s = $Seconds % 60
     if ($m -lt 60) { return ('{0}m{1:D2}s' -f $m, $s) }
-    $h = [Math]::Floor($m / 60); $m = $m % 60
+    [int]$h = [Math]::Floor($m / 60); [int]$m = $m % 60
     return ('{0}h{1:D2}m' -f $h, $m)
 }
 
@@ -1256,12 +1277,30 @@ function Invoke-Download {
         try {
             Import-DownloadCSharp
             $proto = if ($Tcp) { 'TCP' } else { 'UDP' }
-            Write-Log -Level 'INFO' -Message "Downloading $chunkCount chunks in parallel over $proto (up to 8 concurrent)."
-            [string[]]$chunkResults = [Gdns2TcpDownload]::DownloadChunks(
+            Write-Log -Level 'INFO' -Message "Downloading $chunkCount chunks in parallel over $proto (up to $Parallelism concurrent)."
+            $dlStart = Get-Date
+            $task = [Gdns2TcpDownload]::BeginDownloadChunks(
                 $Pass, $script:DomainName, $sid, $chunkCount,
                 $DnsServer, $DnsPort, 5000,
-                $Retries, ($RetryDelaySeconds * 1000), 8, $Tcp.IsPresent
+                $Retries, ($RetryDelaySeconds * 1000), $Parallelism, $Tcp.IsPresent
             )
+            while (-not $task.IsCompleted) {
+                $done = [Gdns2TcpDownload]::CompletedChunks
+                $elapsed = ((Get-Date) - $dlStart).TotalSeconds
+                $percent = [Math]::Min(100, [Math]::Round(($done / $chunkCount) * 100, 1))
+                $status = "$done of $chunkCount chunks"
+                if ($elapsed -gt 0.5 -and $done -gt 0) {
+                    $bps = $done * 254 / $elapsed
+                    $status += '  ' + (Format-TransferRate -BytesPerSecond $bps)
+                    if ($done -lt $chunkCount -and $bps -gt 0) {
+                        $remSec = [int][Math]::Round(($chunkCount - $done) * 254 / $bps)
+                        $status += '  ETA ' + (Format-ETA -Seconds $remSec)
+                    }
+                }
+                Write-Progress -Activity 'Downloading file' -Status $status -PercentComplete $percent
+                Start-Sleep -Milliseconds 250
+            }
+            [string[]]$chunkResults = $task.Result
             for ($i = 0; $i -lt $chunkResults.Length; $i++) {
                 $chunk = $chunkResults[$i]
                 if ($chunk -match '\s' -or $chunk -notmatch $chunkPattern) {

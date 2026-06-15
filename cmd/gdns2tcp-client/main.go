@@ -27,11 +27,12 @@ const (
 	// defaultChunkSize is the default and maximum encoded upload chunk size
 	// (in characters) the client will attempt before measuring against the
 	// 253-char DNS name limit. Independent from the server's artifact chunking.
-	defaultChunkSize    = 180
-	minChunkSize        = 32
-	retryBackoff        = 250 * time.Millisecond
-	downloadParallelism = 8
-	progressBarWidth    = 25
+	defaultChunkSize           = 180
+	minChunkSize               = 32
+	retryBackoff               = 250 * time.Millisecond
+	defaultDownloadParallelism = 32
+	maxDownloadParallelism     = 64
+	progressBarWidth           = 25
 )
 
 type config struct {
@@ -47,6 +48,7 @@ type config struct {
 	retries          int
 	maxDownloadBytes int64
 	tcp              bool
+	parallelism      int
 }
 
 type txtResolver struct {
@@ -225,6 +227,7 @@ func parseFlags() config {
 	flag.IntVar(&cfg.retries, "retries", 3, "DNS query attempts before failing")
 	flag.Int64Var(&cfg.maxDownloadBytes, "max-download-bytes", defaultMaxDownloadBytes, "maximum decompressed download size")
 	flag.BoolVar(&cfg.tcp, "tcp", false, "use TCP instead of UDP for DNS queries")
+	flag.IntVar(&cfg.parallelism, "parallelism", defaultDownloadParallelism, "concurrent DNS queries during download (1-64)")
 	flag.Parse()
 
 	cfg.domain = strings.TrimSuffix(strings.TrimSpace(cfg.domain), ".")
@@ -235,6 +238,12 @@ func parseFlags() config {
 	}
 	if cfg.maxDownloadBytes <= 0 {
 		cfg.maxDownloadBytes = defaultMaxDownloadBytes
+	}
+	if cfg.parallelism < 1 {
+		cfg.parallelism = defaultDownloadParallelism
+	}
+	if cfg.parallelism > maxDownloadParallelism {
+		cfg.parallelism = maxDownloadParallelism
 	}
 	return cfg
 }
@@ -493,7 +502,7 @@ func downloadFile(resolver txtResolver, cfg config) error {
 	chunkResults := make([]string, chunkCount)
 	chunkErrors := make([]error, chunkCount)
 	var completedChunks int64
-	sem := make(chan struct{}, downloadParallelism)
+	sem := make(chan struct{}, cfg.parallelism)
 	var wg sync.WaitGroup
 	pb := newProgressBar("downloading", chunkCount, codec.TXTChunkSize)
 	for i := 0; i < chunkCount; i++ {
