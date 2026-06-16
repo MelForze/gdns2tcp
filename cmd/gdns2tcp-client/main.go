@@ -32,7 +32,13 @@ const (
 	retryBackoff               = 250 * time.Millisecond
 	defaultDownloadParallelism = 32
 	maxDownloadParallelism     = 64
-	progressBarWidth           = 25
+	// defaultDownloadBatch is the number of chunks bundled into a single TXT
+	// response when using the batched download endpoint. 14 keeps the entire
+	// response (~3.5 KB plus headers) safely under the EDNS0 4096-byte UDP
+	// buffer across the full range of supported domain lengths.
+	defaultDownloadBatch = 14
+	maxDownloadBatch     = 32
+	progressBarWidth     = 25
 )
 
 type config struct {
@@ -49,6 +55,7 @@ type config struct {
 	maxDownloadBytes int64
 	tcp              bool
 	parallelism      int
+	batch            int
 }
 
 type txtResolver struct {
@@ -228,6 +235,7 @@ func parseFlags() config {
 	flag.Int64Var(&cfg.maxDownloadBytes, "max-download-bytes", defaultMaxDownloadBytes, "maximum decompressed download size")
 	flag.BoolVar(&cfg.tcp, "tcp", false, "use TCP instead of UDP for DNS queries")
 	flag.IntVar(&cfg.parallelism, "parallelism", defaultDownloadParallelism, "concurrent DNS queries during download (1-64)")
+	flag.IntVar(&cfg.batch, "batch", defaultDownloadBatch, "chunks per DNS response when downloading (1-32; 1 disables batching)")
 	flag.Parse()
 
 	cfg.domain = strings.TrimSuffix(strings.TrimSpace(cfg.domain), ".")
@@ -244,6 +252,12 @@ func parseFlags() config {
 	}
 	if cfg.parallelism > maxDownloadParallelism {
 		cfg.parallelism = maxDownloadParallelism
+	}
+	if cfg.batch < 1 {
+		cfg.batch = defaultDownloadBatch
+	}
+	if cfg.batch > maxDownloadBatch {
+		cfg.batch = maxDownloadBatch
 	}
 	return cfg
 }
@@ -499,23 +513,41 @@ func downloadFile(resolver txtResolver, cfg config) error {
 		return fmt.Errorf("download initialization failed: %s", chunkCountText)
 	}
 
-	chunkResults := make([]string, chunkCount)
-	chunkErrors := make([]error, chunkCount)
+	batchSize := cfg.batch
+	if batchSize < 1 {
+		batchSize = defaultDownloadBatch
+	}
+	parallelism := cfg.parallelism
+	if parallelism < 1 {
+		parallelism = defaultDownloadParallelism
+	}
+	nBatches := (chunkCount + batchSize - 1) / batchSize
+	batchResults := make([]string, nBatches)
+	batchErrors := make([]error, nBatches)
 	var completedChunks int64
-	sem := make(chan struct{}, cfg.parallelism)
+	sem := make(chan struct{}, parallelism)
 	var wg sync.WaitGroup
 	pb := newProgressBar("downloading", chunkCount, codec.TXTChunkSize)
-	for i := 0; i < chunkCount; i++ {
-		i := i
+	for k := 0; k < nBatches; k++ {
+		k := k
+		from := k * batchSize
+		count := batchSize
+		if from+count > chunkCount {
+			count = chunkCount - from
+		}
 		sem <- struct{}{}
 		wg.Add(1)
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			chunkResults[i], chunkErrors[i] = resolver.query(
-				authenticatedName(cfg.pass, cfg.domain, "d", []string{sid, strconv.Itoa(i)}),
-			)
-			if chunkErrors[i] == nil {
-				n := atomic.AddInt64(&completedChunks, 1)
+			var name string
+			if batchSize == 1 {
+				name = authenticatedName(cfg.pass, cfg.domain, "d", []string{sid, strconv.Itoa(from)})
+			} else {
+				name = authenticatedName(cfg.pass, cfg.domain, "db", []string{sid, strconv.Itoa(from), strconv.Itoa(count)})
+			}
+			batchResults[k], batchErrors[k] = resolver.query(name)
+			if batchErrors[k] == nil {
+				n := atomic.AddInt64(&completedChunks, int64(count))
 				pb.render(int(n))
 			}
 		}()
@@ -525,11 +557,11 @@ func downloadFile(resolver txtResolver, cfg config) error {
 
 	var encoded strings.Builder
 	encoded.Grow(chunkCount * codec.TXTChunkSize)
-	for i, err := range chunkErrors {
+	for k, err := range batchErrors {
 		if err != nil {
-			return fmt.Errorf("chunk %d: %w", i, err)
+			return fmt.Errorf("batch starting at chunk %d: %w", k*batchSize, err)
 		}
-		encoded.WriteString(chunkResults[i])
+		encoded.WriteString(batchResults[k])
 	}
 
 	protected, err := codec.DecodeDNSPayload(encoded.String(), "base64")

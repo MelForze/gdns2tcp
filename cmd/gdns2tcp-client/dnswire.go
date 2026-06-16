@@ -13,6 +13,12 @@ import (
 
 const dnsTypeTXT uint16 = 16
 
+// ednsUDPBufferSize is advertised to the server via EDNS0 OPT so it knows it
+// can return larger UDP responses (default DNS UDP cap is 512 bytes). 4096 is
+// the conventional EDNS0 buffer size and matches what the server can pack
+// inside a single UDP datagram when downloads are batched.
+const ednsUDPBufferSize uint16 = 4096
+
 var rcodeNames = map[byte]string{
 	0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED",
 }
@@ -34,14 +40,17 @@ func randomDNSID() uint16 {
 	return id
 }
 
-// buildTXTQuery encodes a DNS query for the TXT record of name.
+// buildTXTQuery encodes a DNS query for the TXT record of name, including an
+// EDNS0 OPT pseudo-RR in the additional section so the server may respond
+// with up to ednsUDPBufferSize bytes over UDP.
 func buildTXTQuery(name string, id uint16) ([]byte, error) {
 	name = strings.TrimSuffix(name, ".")
-	buf := make([]byte, 0, 32+len(name))
+	buf := make([]byte, 0, 64+len(name))
 	var hdr [12]byte
 	binary.BigEndian.PutUint16(hdr[0:2], id)
-	hdr[2] = 0x01                            // flags: RD=1
-	binary.BigEndian.PutUint16(hdr[4:6], 1)  // QDCOUNT=1
+	hdr[2] = 0x01                             // flags: RD=1
+	binary.BigEndian.PutUint16(hdr[4:6], 1)   // QDCOUNT=1
+	binary.BigEndian.PutUint16(hdr[10:12], 1) // ARCOUNT=1 (OPT record)
 	buf = append(buf, hdr[:]...)
 	for _, label := range strings.Split(name, ".") {
 		if label == "" {
@@ -58,6 +67,12 @@ func buildTXTQuery(name string, id uint16) ([]byte, error) {
 	binary.BigEndian.PutUint16(trailer[0:2], dnsTypeTXT)
 	binary.BigEndian.PutUint16(trailer[2:4], 1) // CLASS=IN
 	buf = append(buf, trailer[:]...)
+	// EDNS0 OPT pseudo-RR: root name(1) + type(2) + class=bufsize(2) +
+	// extended-RCODE/version/flags(4) + RDLEN=0 (2).
+	var opt [11]byte
+	binary.BigEndian.PutUint16(opt[1:3], 41) // OPT type
+	binary.BigEndian.PutUint16(opt[3:5], ednsUDPBufferSize)
+	buf = append(buf, opt[:]...)
 	return buf, nil
 }
 
@@ -77,6 +92,9 @@ func parseTXTResponse(resp []byte, expectID uint16) (string, error) {
 			name = fmt.Sprintf("rcode=%d", rcode)
 		}
 		return "", fmt.Errorf("DNS response code %s", name)
+	}
+	if resp[2]&0x02 != 0 {
+		return "", errors.New("DNS response truncated (TC=1); reduce batch size or use -tcp")
 	}
 	qdcount := int(binary.BigEndian.Uint16(resp[4:6]))
 	ancount := int(binary.BigEndian.Uint16(resp[6:8]))
@@ -164,7 +182,7 @@ func exchangeUDP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
 	if _, err := conn.Write(q); err != nil {
 		return nil, err
 	}
-	buf := make([]byte, 4096)
+	buf := make([]byte, ednsUDPBufferSize)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, err

@@ -2,6 +2,7 @@ package dnsserver
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"log"
@@ -1255,5 +1256,80 @@ func TestDownloadCacheEviction(t *testing.T) {
 	}
 	if orderLen != cacheSize {
 		t.Fatalf("downloadCacheOrder length %d != cache map size %d", orderLen, cacheSize)
+	}
+}
+
+func fetchDownloadBatch(t *testing.T, s *Server, sid string, from, count int) []string {
+	t.Helper()
+	return s.handleTXT(signedName("db", []string{sid, strconv.Itoa(from), strconv.Itoa(count)}), "127.0.0.1")
+}
+
+// TestDownloadBatchEqualsPerChunk verifies that the batched `db` endpoint
+// returns exactly the same chunks (in order) as repeated single-chunk `d`
+// queries would, both for an interior batch and for the last partial batch.
+func TestDownloadBatchEqualsPerChunk(t *testing.T) {
+	s := newTestServer(t)
+	filename := "batched.bin"
+	// 16 KB of incompressible random bytes → ~75 base64 chunks of 254 bytes.
+	payload := make([]byte, 16*1024)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.dataDir, filename), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	count := startDownload(t, s, "batchsid-aaaa", filename)
+	if count < 10 {
+		t.Skipf("payload produced only %d chunks; test needs ≥ 10 to be meaningful", count)
+	}
+
+	// Interior batch of size 7 starting at index 3.
+	from, batchSize := 3, 7
+	batch := fetchDownloadBatch(t, s, "batchsid-aaaa", from, batchSize)
+	if len(batch) != batchSize {
+		t.Fatalf("interior batch returned %d strings, want %d", len(batch), batchSize)
+	}
+	for i := 0; i < batchSize; i++ {
+		got := fetchDownloadChunk(t, s, "batchsid-aaaa", from+i)
+		if batch[i] != got {
+			t.Fatalf("chunk %d: batch=%q want %q", from+i, batch[i], got)
+		}
+	}
+
+	// Last partial batch — request more than available, server should clamp.
+	tail := fetchDownloadBatch(t, s, "batchsid-aaaa", count-3, 16)
+	if len(tail) != 3 {
+		t.Fatalf("partial batch returned %d strings, want 3", len(tail))
+	}
+	for i := 0; i < 3; i++ {
+		got := fetchDownloadChunk(t, s, "batchsid-aaaa", count-3+i)
+		if tail[i] != got {
+			t.Fatalf("tail chunk %d: batch=%q want %q", count-3+i, tail[i], got)
+		}
+	}
+}
+
+// TestDownloadBatchAuthFail rejects unsigned db queries.
+func TestDownloadBatchAuthFail(t *testing.T) {
+	s := newTestServer(t)
+	unsignedName := protocol.JoinName(testDomain, "db", []string{"batchsid-aaaa", "0", "8"})
+	got := s.handleTXT(unsignedName, "127.0.0.1")
+	if len(got) != 1 || got[0] != authFailedResponse {
+		t.Fatalf("expected authFailedResponse, got %v", got)
+	}
+}
+
+// TestDownloadBatchOutOfRange rejects from >= chunk count.
+func TestDownloadBatchOutOfRange(t *testing.T) {
+	s := newTestServer(t)
+	filename := "small.bin"
+	if err := os.WriteFile(filepath.Join(s.dataDir, filename), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	count := startDownload(t, s, "rangesid-bbbb", filename)
+	got := fetchDownloadBatch(t, s, "rangesid-bbbb", count, 4)
+	if len(got) != 1 || got[0] != "Wrong chunk number." {
+		t.Fatalf("expected wrong-chunk-number response, got %v", got)
 	}
 }

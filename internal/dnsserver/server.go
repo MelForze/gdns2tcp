@@ -32,6 +32,7 @@ const (
 	maxClientTransferState  = 1024
 	maxTransferChunks       = 1_000_000
 	maxDownloadCacheEntries = 16
+	maxDownloadBatch        = 32
 	transferTTL             = 10 * time.Minute
 	authFailedResponse     = "Authentication failed."
 )
@@ -229,6 +230,8 @@ func (s *Server) handleTXT(name, client string) []string {
 		return s.downloadInit(args, now)
 	case "d":
 		return s.downloadChunk(args, now)
+	case "db":
+		return s.downloadBatch(args, now)
 	case "uinit":
 		return s.uploadInit(args, now)
 	case "u":
@@ -433,6 +436,50 @@ func (s *Server) downloadChunk(args []string, now time.Time) []string {
 	s.downloads[sid] = state
 	s.mu.Unlock()
 	return []string{chunk}
+}
+
+// downloadBatch returns up to `count` consecutive chunks starting at `from`,
+// each as a separate TXT character-string within a single TXT RR. Combined
+// with EDNS0 on the client (advertising a larger UDP buffer), this reduces
+// the per-chunk DNS query overhead by a factor of ~batchSize.
+func (s *Server) downloadBatch(args []string, now time.Time) []string {
+	payload, ts, mac, ok := splitAuthenticatedArgs(args)
+	if !ok || !protocol.VerifyAuth(s.secret, s.authDomain, "db", payload, ts, mac, now) {
+		return []string{authFailedResponse}
+	}
+	if len(payload) != 3 {
+		return []string{authFailedResponse}
+	}
+	sid := strings.ToLower(payload[0])
+	from, errFrom := strconv.Atoi(payload[1])
+	count, errCount := strconv.Atoi(payload[2])
+	if !protocol.ValidSID(sid) || errFrom != nil || errCount != nil || from < 0 || count <= 0 {
+		return []string{"Wrong chunk number."}
+	}
+	if count > maxDownloadBatch {
+		count = maxDownloadBatch
+	}
+
+	s.mu.Lock()
+	s.cleanupExpiredLocked(now)
+	state, exists := s.downloads[sid]
+	if !exists {
+		s.mu.Unlock()
+		return []string{"Transfer not found."}
+	}
+	if from >= len(state.chunks) {
+		s.mu.Unlock()
+		return []string{"Wrong chunk number."}
+	}
+	end := from + count
+	if end > len(state.chunks) {
+		end = len(state.chunks)
+	}
+	batch := append([]string(nil), state.chunks[from:end]...)
+	state.expires = now.Add(transferTTL)
+	s.downloads[sid] = state
+	s.mu.Unlock()
+	return batch
 }
 
 func (s *Server) uploadInit(args []string, now time.Time) []string {

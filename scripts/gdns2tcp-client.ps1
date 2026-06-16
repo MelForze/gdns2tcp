@@ -110,7 +110,11 @@ param(
 
     [Parameter()]
     [ValidateRange(1, 64)]
-    [int]$Parallelism = 32
+    [int]$Parallelism = 32,
+
+    [Parameter()]
+    [ValidateRange(1, 32)]
+    [int]$BatchSize = 14
 )
 
 Set-StrictMode -Version Latest
@@ -433,14 +437,15 @@ using System.Threading.Tasks;
 public static class Gdns2TcpDownload {
     private static readonly char[] B32 = "abcdefghijklmnopqrstuvwxyz234567".ToCharArray();
 
-    private static string BuildName(string secret, string domain, string sid, string idx) {
-        long min = (long)Math.Floor(
-            (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds / 60.0);
-        string ts = min.ToString();
-        string msg = string.Join("|", new[] {
-            "gdns2tcp-auth-v1", domain.ToLowerInvariant().TrimEnd('.'), "d", ts, sid, idx });
+    private static string BuildAuthToken(string secret, string domain, string command, string ts, string[] args) {
+        var parts = new List<string>(args.Length + 4);
+        parts.Add("gdns2tcp-auth-v1");
+        parts.Add(domain.ToLowerInvariant().TrimEnd('.'));
+        parts.Add(command);
+        parts.Add(ts);
+        parts.AddRange(args);
         using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret))) {
-            byte[] h = hmac.ComputeHash(Encoding.UTF8.GetBytes(msg));
+            byte[] h = hmac.ComputeHash(Encoding.UTF8.GetBytes(string.Join("|", parts)));
             var sb = new StringBuilder(26);
             int buf = 0, bits = 0;
             for (int i = 0; i < 16; i++) {
@@ -448,22 +453,53 @@ public static class Gdns2TcpDownload {
                 while (bits >= 5) { bits -= 5; sb.Append(B32[(buf >> bits) & 31]); }
             }
             if (bits > 0) sb.Append(B32[(buf << (5 - bits)) & 31]);
-            return string.Format("{0}.{1}.{2}.{3}.d.{4}", sid, idx, ts, sb.ToString(), domain.TrimEnd('.'));
+            return sb.ToString();
         }
+    }
+
+    private static string CurrentMinute() {
+        long min = (long)Math.Floor(
+            (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds / 60.0);
+        return min.ToString();
+    }
+
+    private static string BuildName(string secret, string domain, string sid, string idx) {
+        string ts = CurrentMinute();
+        string token = BuildAuthToken(secret, domain, "d", ts, new[] { sid, idx });
+        return string.Format("{0}.{1}.{2}.{3}.d.{4}", sid, idx, ts, token, domain.TrimEnd('.'));
+    }
+
+    private static string BuildBatchName(string secret, string domain, string sid, int from, int count) {
+        string ts = CurrentMinute();
+        string fromStr = from.ToString();
+        string countStr = count.ToString();
+        string token = BuildAuthToken(secret, domain, "db", ts, new[] { sid, fromStr, countStr });
+        return string.Format("{0}.{1}.{2}.{3}.{4}.db.{5}", sid, fromStr, countStr, ts, token, domain.TrimEnd('.'));
     }
 
     private static byte[] BuildQuery(string name, ushort id) {
         var b = new List<byte>(256);
         b.Add((byte)(id >> 8)); b.Add((byte)id);
         b.Add(0x01); b.Add(0x00);
-        b.Add(0x00); b.Add(0x01);
-        b.Add(0x00); b.Add(0x00); b.Add(0x00); b.Add(0x00); b.Add(0x00); b.Add(0x00);
+        b.Add(0x00); b.Add(0x01);                       // QDCOUNT=1
+        b.Add(0x00); b.Add(0x00);                       // ANCOUNT=0
+        b.Add(0x00); b.Add(0x00);                       // NSCOUNT=0
+        b.Add(0x00); b.Add(0x01);                       // ARCOUNT=1 (EDNS0 OPT)
         foreach (string label in name.TrimEnd('.').Split('.')) {
             byte[] lb = Encoding.ASCII.GetBytes(label);
             b.Add((byte)lb.Length);
             b.AddRange(lb);
         }
-        b.Add(0x00); b.Add(0x00); b.Add(0x10); b.Add(0x00); b.Add(0x01);
+        b.Add(0x00);                                    // QNAME terminator
+        b.Add(0x00); b.Add(0x10);                       // QTYPE=TXT
+        b.Add(0x00); b.Add(0x01);                       // QCLASS=IN
+        // EDNS0 OPT pseudo-RR: tells the server we accept up to 4096-byte UDP
+        // responses so batched downloads can fit in a single packet.
+        b.Add(0x00);                                    // root name
+        b.Add(0x00); b.Add(0x29);                       // type=OPT (41)
+        b.Add(0x10); b.Add(0x00);                       // class=4096 UDP payload
+        b.Add(0x00); b.Add(0x00); b.Add(0x00); b.Add(0x00); // ext-rcode/version/flags
+        b.Add(0x00); b.Add(0x00);                       // RDLEN=0
         return b.ToArray();
     }
 
@@ -471,6 +507,7 @@ public static class Gdns2TcpDownload {
         if (r.Length < 12) throw new Exception("Response too short");
         if (((r[0] << 8) | r[1]) != id) throw new Exception("ID mismatch");
         if ((r[3] & 0x0F) != 0) throw new Exception("RCODE " + (r[3] & 0x0F));
+        if ((r[2] & 0x02) != 0) throw new Exception("DNS response truncated (TC=1); reduce -BatchSize or use -Tcp");
         int ancount = (r[6] << 8) | r[7];
         if (ancount == 0) throw new Exception("No answers");
         int pos = 12;
@@ -546,27 +583,37 @@ public static class Gdns2TcpDownload {
     // to render Write-Progress while the parallel download is in flight.
     public static int CompletedChunks;
 
+    // Downloads `count` chunks, batching `batchSize` chunks per DNS query.
+    // Returns an array of length ceil(count/batchSize); each element is the
+    // concatenated base64 of its batch, which the caller appends in order.
     public static string[] DownloadChunks(
         string secret, string domain, string sid, int count,
-        string server, int port, int timeoutMs, int retries, int retryDelayMs, int concurrency, bool tcp)
+        string server, int port, int timeoutMs, int retries, int retryDelayMs,
+        int concurrency, bool tcp, int batchSize)
     {
-        var results = new string[count];
+        if (batchSize < 1) batchSize = 1;
+        int nBatches = (count + batchSize - 1) / batchSize;
+        var results = new string[nBatches];
         var sem = new SemaphoreSlim(concurrency, concurrency);
-        var tasks = new Task[count];
-        for (int i = 0; i < count; i++) {
-            int idx = i;
-            tasks[idx] = Task.Run(() => {
+        var tasks = new Task[nBatches];
+        for (int i = 0; i < nBatches; i++) {
+            int batchIdx = i;
+            int from = i * batchSize;
+            int batchCount = Math.Min(batchSize, count - from);
+            tasks[batchIdx] = Task.Run(() => {
                 sem.Wait();
                 try {
-                    ushort id = (ushort)((idx % 65534) + 1);
+                    ushort id = (ushort)((batchIdx % 65534) + 1);
                     Exception last = null;
                     for (int att = 0; att < retries; att++) {
                         try {
-                            string qname = BuildName(secret, domain, sid, idx.ToString());
-                            results[idx] = tcp
+                            string qname = batchSize == 1
+                                ? BuildName(secret, domain, sid, from.ToString())
+                                : BuildBatchName(secret, domain, sid, from, batchCount);
+                            results[batchIdx] = tcp
                                 ? QueryOnceTcp(qname, server, port, timeoutMs, id)
                                 : QueryOnceUdp(qname, server, port, timeoutMs, id);
-                            Interlocked.Increment(ref CompletedChunks);
+                            Interlocked.Add(ref CompletedChunks, batchCount);
                             return;
                         } catch (Exception ex) {
                             last = ex;
@@ -590,12 +637,13 @@ public static class Gdns2TcpDownload {
     // download runs on a background thread.
     public static Task<string[]> BeginDownloadChunks(
         string secret, string domain, string sid, int count,
-        string server, int port, int timeoutMs, int retries, int retryDelayMs, int concurrency, bool tcp)
+        string server, int port, int timeoutMs, int retries, int retryDelayMs,
+        int concurrency, bool tcp, int batchSize)
     {
         CompletedChunks = 0;
         return Task.Run(() => DownloadChunks(
             secret, domain, sid, count, server, port, timeoutMs,
-            retries, retryDelayMs, concurrency, tcp));
+            retries, retryDelayMs, concurrency, tcp, batchSize));
     }
 }
 '@ -ErrorAction Stop
@@ -1277,12 +1325,12 @@ function Invoke-Download {
         try {
             Import-DownloadCSharp
             $proto = if ($Tcp) { 'TCP' } else { 'UDP' }
-            Write-Log -Level 'INFO' -Message "Downloading $chunkCount chunks in parallel over $proto (up to $Parallelism concurrent)."
+            Write-Log -Level 'INFO' -Message "Downloading $chunkCount chunks in parallel over $proto (up to $Parallelism concurrent, $BatchSize chunks per query)."
             $dlStart = Get-Date
             $task = [Gdns2TcpDownload]::BeginDownloadChunks(
                 $Pass, $script:DomainName, $sid, $chunkCount,
                 $DnsServer, $DnsPort, 5000,
-                $Retries, ($RetryDelaySeconds * 1000), $Parallelism, $Tcp.IsPresent
+                $Retries, ($RetryDelaySeconds * 1000), $Parallelism, $Tcp.IsPresent, $BatchSize
             )
             while (-not $task.IsCompleted) {
                 $done = [Gdns2TcpDownload]::CompletedChunks
@@ -1300,13 +1348,13 @@ function Invoke-Download {
                 Write-Progress -Activity 'Downloading file' -Status $status -PercentComplete $percent
                 Start-Sleep -Milliseconds 250
             }
-            [string[]]$chunkResults = $task.Result
-            for ($i = 0; $i -lt $chunkResults.Length; $i++) {
-                $chunk = $chunkResults[$i]
-                if ($chunk -match '\s' -or $chunk -notmatch $chunkPattern) {
-                    throw "Server returned an error for chunk ${i}: $chunk"
+            [string[]]$batchResults = $task.Result
+            for ($i = 0; $i -lt $batchResults.Length; $i++) {
+                $batch = $batchResults[$i]
+                if ($batch -match '\s' -or $batch -notmatch $chunkPattern) {
+                    throw ("Server returned an error for batch starting at chunk {0}: {1}" -f ($i * $BatchSize), $batch)
                 }
-                [void]$builder.Append($chunk)
+                [void]$builder.Append($batch)
             }
             Write-Progress -Activity 'Downloading file' -Completed
             $parallelDone = $true
