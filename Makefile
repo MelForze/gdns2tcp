@@ -1,10 +1,15 @@
-.PHONY: all build clients servers cover clean test
+.PHONY: all build clients servers cover clean test .FORCE
 
 BUILD_DIR  := clients
 SERVER_DIR := servers
 CLIENT_PKG := ./cmd/gdns2tcp-client
 SERVER_PKG := ./cmd/gdns2tcp
-GO_FILES   := $(shell find cmd internal -name '*.go')
+
+# Per-architecture binaries depend on .FORCE so the recipe always fires;
+# `go build` itself caches incrementally and is fast on no-op rebuilds. This
+# avoids the macOS/APFS quirk where mtime comparison occasionally misses
+# recently-edited source files.
+.FORCE:
 
 all: build
 
@@ -24,29 +29,29 @@ servers: \
 	$(SERVER_DIR)/gdns2tcp-server-darwin-amd64 \
 	$(SERVER_DIR)/gdns2tcp-server-darwin-arm64
 
-$(SERVER_DIR)/gdns2tcp-server-linux-amd64: $(GO_FILES)
-	GOOS=linux GOARCH=amd64 go build -o $@ $(SERVER_PKG)
+$(SERVER_DIR)/gdns2tcp-server-linux-amd64: .FORCE
+	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
 
-$(SERVER_DIR)/gdns2tcp-server-linux-arm64: $(GO_FILES)
-	GOOS=linux GOARCH=arm64 go build -o $@ $(SERVER_PKG)
+$(SERVER_DIR)/gdns2tcp-server-linux-arm64: .FORCE
+	GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
 
-$(SERVER_DIR)/gdns2tcp-server-darwin-amd64: $(GO_FILES)
-	GOOS=darwin GOARCH=amd64 go build -o $@ $(SERVER_PKG)
+$(SERVER_DIR)/gdns2tcp-server-darwin-amd64: .FORCE
+	GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
 
-$(SERVER_DIR)/gdns2tcp-server-darwin-arm64: $(GO_FILES)
-	GOOS=darwin GOARCH=arm64 go build -o $@ $(SERVER_PKG)
+$(SERVER_DIR)/gdns2tcp-server-darwin-arm64: .FORCE
+	GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-linux-amd64: $(GO_FILES)
-	GOOS=linux GOARCH=amd64 go build -o $@ $(CLIENT_PKG)
+$(BUILD_DIR)/gdns2tcp-client-linux-amd64: .FORCE
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-linux-arm64: $(GO_FILES)
-	GOOS=linux GOARCH=arm64 go build -o $@ $(CLIENT_PKG)
+$(BUILD_DIR)/gdns2tcp-client-linux-arm64: .FORCE
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-darwin-amd64: $(GO_FILES)
-	GOOS=darwin GOARCH=amd64 go build -o $@ $(CLIENT_PKG)
+$(BUILD_DIR)/gdns2tcp-client-darwin-amd64: .FORCE
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-darwin-arm64: $(GO_FILES)
-	GOOS=darwin GOARCH=arm64 go build -o $@ $(CLIENT_PKG)
+$(BUILD_DIR)/gdns2tcp-client-darwin-arm64: .FORCE
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
 
 $(BUILD_DIR)/gdns2tcp-client.ps1: scripts/gdns2tcp-client.ps1
 	cp $< $@

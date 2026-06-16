@@ -27,8 +27,10 @@ const (
 	DefaultMaxUploadBytes   = 32 << 20
 	DefaultMaxDownloadBytes = 32 << 20
 	// clientChunkSize is the base64 chunk length used when serving downloadable
-	// client artifacts over DNS. Independent from the client's upload chunking.
-	clientChunkSize        = 180
+	// client artifacts over DNS. 254 fills a single DNS TXT character-string
+	// (max 255 bytes) with one byte of safety margin. Independent from the
+	// client's upload chunking.
+	clientChunkSize        = 254
 	maxClientTransferState  = 1024
 	maxTransferChunks       = 1_000_000
 	maxDownloadCacheEntries = 16
@@ -248,6 +250,9 @@ func (s *Server) handleTXT(name, client string) []string {
 		}
 		if strings.HasPrefix(command, "cl-") {
 			return s.clientChunk(strings.TrimPrefix(command, "cl-"), args, client)
+		}
+		if strings.HasPrefix(command, "clb-") {
+			return s.clientBatch(strings.TrimPrefix(command, "clb-"), args, client)
 		}
 		return []string{"Unknown gdns2tcp command."}
 	}
@@ -720,6 +725,43 @@ func (s *Server) clientChunk(alias string, args []string, client string) []strin
 	s.logClientArtifactProgress(client, alias, artifact, index)
 	s.mu.Unlock()
 	return []string{artifact.chunks[index]}
+}
+
+// clientBatch is the batched counterpart of clientChunk: a single TXT response
+// returns up to `count` consecutive client artifact chunks as separate
+// character-strings, which the bootstrap script concatenates as-is. Like
+// clientChunk it is unauthenticated by design (the artifact endpoints are how
+// a fresh host obtains a client before it has the shared secret).
+func (s *Server) clientBatch(alias string, args []string, client string) []string {
+	artifact, ok := s.clientArtifacts[alias]
+	if !ok || len(artifact.chunks) == 0 {
+		s.logger.Printf("client %s requested unavailable artifact batch %s", client, alias)
+		return []string{"Client artifact is not configured."}
+	}
+	if len(args) != 2 {
+		return []string{"Missing chunk number."}
+	}
+	from, errFrom := strconv.Atoi(args[0])
+	count, errCount := strconv.Atoi(args[1])
+	if errFrom != nil || errCount != nil || from < 0 || count <= 0 {
+		return []string{"Incorrect chunk number."}
+	}
+	if count > maxDownloadBatch {
+		count = maxDownloadBatch
+	}
+	if from >= len(artifact.chunks) {
+		return []string{"Incorrect chunk number."}
+	}
+	end := from + count
+	if end > len(artifact.chunks) {
+		end = len(artifact.chunks)
+	}
+	s.mu.Lock()
+	for i := from; i < end; i++ {
+		s.logClientArtifactProgress(client, alias, artifact, i)
+	}
+	s.mu.Unlock()
+	return append([]string(nil), artifact.chunks[from:end]...)
 }
 
 func (s *Server) logClientArtifactProgress(client, alias string, artifact clientArtifact, index int) {

@@ -1333,3 +1333,83 @@ func TestDownloadBatchOutOfRange(t *testing.T) {
 		t.Fatalf("expected wrong-chunk-number response, got %v", got)
 	}
 }
+
+// newClientArtifactServer prepares a server with a >32 KB random-bytes client
+// artifact so the bootstrap chunking has enough chunks to exercise batching.
+func newClientArtifactServer(t *testing.T) (*Server, int) {
+	t.Helper()
+	clientPath := filepath.Join(t.TempDir(), "gdns2tcp-client.ps1")
+	payload := make([]byte, 32*1024)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clientPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.ClientArtifacts = []ClientArtifactConfig{{Alias: "win", Path: clientPath, Required: true}}
+	})
+	chunks := len(s.clientArtifacts["win"].chunks)
+	if chunks < 20 {
+		t.Fatalf("artifact only produced %d chunks; bump payload size", chunks)
+	}
+	return s, chunks
+}
+
+// TestClientBatchEqualsPerChunk: clb-<alias> returns the same chunks (in
+// order) as a sequence of cl-<alias> queries — for both an interior batch and
+// the last partial batch at the end of the artifact.
+func TestClientBatchEqualsPerChunk(t *testing.T) {
+	s, total := newClientArtifactServer(t)
+
+	from, batchSize := 4, 9
+	batch := s.clientBatch("win", []string{strconv.Itoa(from), strconv.Itoa(batchSize)}, "127.0.0.1")
+	if len(batch) != batchSize {
+		t.Fatalf("interior batch returned %d strings, want %d", len(batch), batchSize)
+	}
+	for i := 0; i < batchSize; i++ {
+		got := s.clientChunk("win", []string{strconv.Itoa(from + i)}, "127.0.0.1")
+		if len(got) != 1 || got[0] != batch[i] {
+			t.Fatalf("chunk %d: batch=%q want %q", from+i, batch[i], got)
+		}
+	}
+
+	tail := s.clientBatch("win", []string{strconv.Itoa(total - 3), "16"}, "127.0.0.1")
+	if len(tail) != 3 {
+		t.Fatalf("partial batch returned %d strings, want 3", len(tail))
+	}
+	for i := 0; i < 3; i++ {
+		got := s.clientChunk("win", []string{strconv.Itoa(total - 3 + i)}, "127.0.0.1")
+		if len(got) != 1 || got[0] != tail[i] {
+			t.Fatalf("tail chunk %d: batch=%q want %q", total-3+i, tail[i], got)
+		}
+	}
+}
+
+// TestClientBatchMissingArgs and TestClientBatchOutOfRange cover the two
+// distinct error paths in clientBatch validation.
+func TestClientBatchMissingArgs(t *testing.T) {
+	s, _ := newClientArtifactServer(t)
+	got := s.clientBatch("win", []string{"0"}, "127.0.0.1")
+	if len(got) != 1 || got[0] != "Missing chunk number." {
+		t.Fatalf("expected missing-chunk-number, got %v", got)
+	}
+}
+
+func TestClientBatchOutOfRange(t *testing.T) {
+	s, total := newClientArtifactServer(t)
+	got := s.clientBatch("win", []string{strconv.Itoa(total), "4"}, "127.0.0.1")
+	if len(got) != 1 || got[0] != "Incorrect chunk number." {
+		t.Fatalf("expected incorrect-chunk-number, got %v", got)
+	}
+}
+
+// TestClientBatchUnknownAlias verifies the artifact-not-configured response is
+// returned for an unknown alias (mirrors clientChunk behaviour).
+func TestClientBatchUnknownAlias(t *testing.T) {
+	s, _ := newClientArtifactServer(t)
+	got := s.clientBatch("nonexistent", []string{"0", "4"}, "127.0.0.1")
+	if len(got) != 1 || got[0] != "Client artifact is not configured." {
+		t.Fatalf("expected not-configured response, got %v", got)
+	}
+}

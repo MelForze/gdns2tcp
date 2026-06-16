@@ -58,36 +58,53 @@ The server publishes its own client binaries through public DNS endpoints
 with the host running gdns2tcp. Pick one snippet below.
 
 **Linux / macOS** — auto-detects OS+arch. Uses only default utilities
-(`dig`, `base64`, `shasum`):
+(`dig`, `base64`, `shasum`). Fetches 14 chunks per query via the batched
+`clb-` endpoint and runs 16 batches in parallel via background jobs:
 
 ```sh
-D=files.example.com S=<server-ip> sh -c '
+D=files.example.com S=<server-ip> B=14 P=16 sh -c '
 os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="$os-$a"
-q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\"\n"); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
+q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\" \n"); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
 m=$(q "client-$A.$D") || exit 1
 NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
-T=$(mktemp); i=0
-while [ $i -lt $N ]; do q "$i.cl-$A.$D" >> "$T" || exit 1; i=$((i+1)); done
-base64 -d < "$T" > "$NAME" 2>/dev/null || base64 -D < "$T" > "$NAME"
-rm "$T"
+T=$(mktemp -d); i=0; k=0
+while [ $i -lt $N ]; do
+    c=$B; [ $((i + c)) -gt $N ] && c=$((N - i))
+    (q "$i.$c.clb-$A.$D" > "$T/$k" || touch "$T/.err") &
+    i=$((i + c)); k=$((k + 1))
+    [ $((k % P)) -eq 0 ] && wait
+done
+wait
+[ -f "$T/.err" ] && { rm -rf "$T"; echo "fetch failed" >&2; exit 1; }
+F=$(mktemp); j=0
+while [ $j -lt $k ]; do cat "$T/$j" >> "$F"; j=$((j + 1)); done
+rm -rf "$T"
+base64 -d < "$F" > "$NAME" 2>/dev/null || base64 -D < "$F" > "$NAME"
+rm "$F"
 printf "%s  %s\n" "$SHA" "$NAME" | shasum -a 256 -c - || { rm -f "$NAME"; exit 1; }
 chmod +x "$NAME"; echo "saved ./$NAME"
 '
 ```
 
-**Windows PowerShell** — requires `nslookup`:
+**Windows PowerShell** — requires `nslookup`. Uses TCP (`-vc`) so the larger
+batched responses are not capped by Windows' default 512-byte UDP DNS buffer:
 
 ```powershell
-$D="files.example.com"; $S="<server-ip>"
-function q($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -type=TXT $n $S 2>$null
+$D="files.example.com"; $S="<server-ip>"; $B=14
+function q($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
   $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
   if($m.Count){ return (($m | %{ $_.Groups[1].Value }) -join "") }
   Start-Sleep -Milliseconds 400 }; throw "no TXT for $n" }
 $man=q "client-win.$D"; $p=$man.Split('|')
 $name=$p[0]; $n=[int]$p[1]; $sha=$p[2].ToLower()
-$b64=''; 0..($n-1) | %{ $b64 += q "$_.cl-win.$D" }
+$b64=''; $i=0
+while ($i -lt $n) {
+    $c = [Math]::Min($B, $n - $i)
+    $b64 += q "$i.$c.clb-win.$D"
+    $i += $c
+}
 $out=Join-Path (Get-Location) $name
 [IO.File]::WriteAllBytes($out, [Convert]::FromBase64String($b64))
 if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){
@@ -192,14 +209,13 @@ Mirror the Go flags with PascalCase names: `-Domain`, `-Mode`, `-Pass`,
 Client manifests return `filename|chunk_count|sha256`:
 
 ```
-client-win.<domain>                       <n>.cl-win.<domain>
-client-linux-amd64.<domain>               <n>.cl-linux-amd64.<domain>
-client-linux-arm64.<domain>               <n>.cl-linux-arm64.<domain>
-client-darwin-amd64.<domain>              <n>.cl-darwin-amd64.<domain>
-client-darwin-arm64.<domain>              <n>.cl-darwin-arm64.<domain>
+client-<alias>.<domain>          manifest
+<idx>.cl-<alias>.<domain>        one chunk per query (legacy / fallback)
+<from>.<count>.clb-<alias>.<domain>   up to 14 chunks per query (preferred)
 ```
 
-These endpoints are unauthenticated by design so a new host can bootstrap a
-client without already knowing the secret. The transfer endpoints
-(`uinit`/`u` for upload, `dinit`/`d`/`db` for download, `c` for catalog) all
-require the HMAC token derived from `-secret`.
+`<alias>` is one of `win`, `linux-amd64`, `linux-arm64`, `darwin-amd64`,
+`darwin-arm64`. These endpoints are unauthenticated by design so a new host
+can bootstrap a client without already knowing the secret. The transfer
+endpoints (`uinit`/`u` for upload, `dinit`/`d`/`db` for download, `c` for
+catalog) all require the HMAC token derived from `-secret`.
