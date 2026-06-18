@@ -56,6 +56,8 @@ type config struct {
 	tcp              bool
 	parallelism      int
 	batch            int
+	noResume         bool
+	cacheDir         string // override for tests; production callers leave empty to use defaultResumeRoot()
 }
 
 type txtResolver struct {
@@ -236,6 +238,7 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.tcp, "tcp", false, "use TCP instead of UDP for DNS queries")
 	flag.IntVar(&cfg.parallelism, "parallelism", defaultDownloadParallelism, "concurrent DNS queries during download (1-64)")
 	flag.IntVar(&cfg.batch, "batch", defaultDownloadBatch, "chunks per DNS response when downloading (1-32; 1 disables batching)")
+	flag.BoolVar(&cfg.noResume, "no-resume", false, "disable resume from local cache and always fetch all chunks")
 	flag.Parse()
 
 	cfg.domain = strings.TrimSuffix(strings.TrimSpace(cfg.domain), ".")
@@ -525,10 +528,39 @@ func downloadFile(resolver txtResolver, cfg config) error {
 	batchResults := make([]string, nBatches)
 	batchErrors := make([]error, nBatches)
 	var completedChunks int64
+
+	cacheRoot := cfg.cacheDir
+	if cacheRoot == "" {
+		cacheRoot = defaultResumeRoot()
+	}
+	cache := newResumeCache(cacheRoot, cfg.domain, cfg.filename, !cfg.noResume)
+	completed, _ := cache.loadCompleted(chunkCount, batchSize)
+	if err := cache.saveMeta(chunkCount, batchSize); err != nil {
+		return fmt.Errorf("write resume meta: %w", err)
+	}
+	for k, data := range completed {
+		if k < 0 || k >= nBatches {
+			continue
+		}
+		batchResults[k] = data
+		from := k * batchSize
+		count := batchSize
+		if from+count > chunkCount {
+			count = chunkCount - from
+		}
+		atomic.AddInt64(&completedChunks, int64(count))
+	}
+
 	sem := make(chan struct{}, parallelism)
 	var wg sync.WaitGroup
 	pb := newProgressBar("downloading", chunkCount, codec.TXTChunkSize)
+	if initial := int(atomic.LoadInt64(&completedChunks)); initial > 0 {
+		pb.render(initial)
+	}
 	for k := 0; k < nBatches; k++ {
+		if _, done := completed[k]; done {
+			continue
+		}
 		k := k
 		from := k * batchSize
 		count := batchSize
@@ -547,6 +579,7 @@ func downloadFile(resolver txtResolver, cfg config) error {
 			}
 			batchResults[k], batchErrors[k] = resolver.query(name)
 			if batchErrors[k] == nil {
+				_ = cache.saveBatch(k, batchResults[k])
 				n := atomic.AddInt64(&completedChunks, int64(count))
 				pb.render(int(n))
 			}
@@ -579,6 +612,7 @@ func downloadFile(resolver txtResolver, cfg config) error {
 	if err := writeOutput(outputPath, raw); err != nil {
 		return err
 	}
+	_ = cache.clear()
 	fmt.Printf("saved %s\n", outputPath)
 	return nil
 }

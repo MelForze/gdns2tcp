@@ -68,14 +68,16 @@ A="$os-$a"
 q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\" \n"); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
 m=$(q "client-$A.$D") || exit 1
 NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
+TOTAL=$(( (N + B - 1) / B ))
 T=$(mktemp -d); i=0; k=0
 while [ $i -lt $N ]; do
     c=$B; [ $((i + c)) -gt $N ] && c=$((N - i))
     (q "$i.$c.clb-$A.$D" > "$T/$k" || touch "$T/.err") &
     i=$((i + c)); k=$((k + 1))
-    [ $((k % P)) -eq 0 ] && wait
+    [ $((k % P)) -eq 0 ] && { wait; printf "\rfetched %d/%d batches" "$k" "$TOTAL" >&2; }
 done
 wait
+printf "\rfetched %d/%d batches\n" "$k" "$TOTAL" >&2
 [ -f "$T/.err" ] && { rm -rf "$T"; echo "fetch failed" >&2; exit 1; }
 F=$(mktemp); j=0
 while [ $j -lt $k ]; do cat "$T/$j" >> "$F"; j=$((j + 1)); done
@@ -98,12 +100,15 @@ function q($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
   Start-Sleep -Milliseconds 400 }; throw "no TXT for $n" }
 $man=q "client-win.$D"; $p=$man.Split('|')
 $name=$p[0]; $n=[int]$p[1]; $sha=$p[2].ToLower()
-$b64=''; $i=0
+$total = [int][Math]::Ceiling($n / $B)
+$b64=''; $i=0; $j=0
 while ($i -lt $n) {
     $c = [Math]::Min($B, $n - $i)
     $b64 += q "$i.$c.clb-win.$D"
-    $i += $c
+    $i += $c; $j++
+    Write-Progress -Activity "Fetching client" -Status "$j of $total batches" -PercentComplete ([Math]::Min(100, [Math]::Round($j * 100 / $total, 1)))
 }
+Write-Progress -Activity "Fetching client" -Completed
 $out=Join-Path (Get-Location) $name
 [IO.File]::WriteAllBytes($out, [Convert]::FromBase64String($b64))
 if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){

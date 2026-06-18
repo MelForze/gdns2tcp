@@ -1,0 +1,341 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"gdns2tcp/internal/protocol"
+)
+
+// --------------------------- unit tests ---------------------------
+
+func TestResumeCacheRoundtrip(t *testing.T) {
+	root := t.TempDir()
+	c := newResumeCache(root, "example.com", "file.bin", true)
+	if err := c.saveMeta(100, 14); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.saveBatch(3, "chunkA"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.saveBatch(0, "chunkB"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.loadCompleted(100, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] != "chunkB" || got[3] != "chunkA" {
+		t.Fatalf("loadCompleted = %v, want {0:chunkB, 3:chunkA}", got)
+	}
+	if len(got) != 2 {
+		t.Fatalf("loadCompleted returned %d entries, want 2", len(got))
+	}
+}
+
+func TestResumeCacheChunkCountMismatch(t *testing.T) {
+	root := t.TempDir()
+	c := newResumeCache(root, "example.com", "file.bin", true)
+	_ = c.saveMeta(100, 14)
+	_ = c.saveBatch(0, "data")
+
+	got, err := c.loadCompleted(200, 14) // different chunkCount
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty map on mismatch, got %v", got)
+	}
+	if _, err := os.Stat(c.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("cache dir should be removed after chunkCount mismatch")
+	}
+}
+
+func TestResumeCacheBatchSizeMismatch(t *testing.T) {
+	root := t.TempDir()
+	c := newResumeCache(root, "example.com", "file.bin", true)
+	_ = c.saveMeta(100, 14)
+	_ = c.saveBatch(0, "data")
+
+	got, err := c.loadCompleted(100, 8) // different batchSize
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty map on mismatch, got %v", got)
+	}
+	if _, err := os.Stat(c.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("cache dir should be removed after batchSize mismatch")
+	}
+}
+
+func TestResumeCacheNoMetaIgnoresStrayBatches(t *testing.T) {
+	root := t.TempDir()
+	c := newResumeCache(root, "example.com", "file.bin", true)
+	// Write a batch file directly without meta.json (simulates a crash after
+	// the very first saveBatch but before saveMeta — not the expected order
+	// but cache must still recover safely).
+	if err := os.MkdirAll(c.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(c.dir, "batch-000000"), []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.loadCompleted(100, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty map without meta, got %v", got)
+	}
+}
+
+func TestResumeCacheDisabled(t *testing.T) {
+	c := newResumeCache(t.TempDir(), "example.com", "file.bin", false)
+	if err := c.saveMeta(100, 14); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.saveBatch(0, "data"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.loadCompleted(100, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("disabled cache returned %d entries, want 0", len(got))
+	}
+	if err := c.clear(); err != nil {
+		t.Fatalf("clear on disabled cache returned %v", err)
+	}
+}
+
+func TestResumeCacheClear(t *testing.T) {
+	root := t.TempDir()
+	c := newResumeCache(root, "example.com", "file.bin", true)
+	_ = c.saveMeta(50, 7)
+	_ = c.saveBatch(0, "a")
+	_ = c.saveBatch(1, "b")
+	if _, err := os.Stat(c.dir); err != nil {
+		t.Fatalf("cache dir should exist before clear: %v", err)
+	}
+	if err := c.clear(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(c.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("cache dir should be removed after clear")
+	}
+}
+
+func TestResumeCacheCorruptMetaIsTreatedAsStale(t *testing.T) {
+	root := t.TempDir()
+	c := newResumeCache(root, "example.com", "file.bin", true)
+	_ = os.MkdirAll(c.dir, 0o700)
+	if err := os.WriteFile(filepath.Join(c.dir, "meta.json"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.loadCompleted(100, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty map for corrupt meta, got %v", got)
+	}
+	if _, err := os.Stat(c.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("cache dir should be removed when meta is corrupt")
+	}
+}
+
+func TestResumeCacheKeysAreDomainAndFilenameSensitive(t *testing.T) {
+	root := t.TempDir()
+	a := newResumeCache(root, "example.com", "file.bin", true)
+	b := newResumeCache(root, "example.com", "OTHER.bin", true)
+	c := newResumeCache(root, "other.com", "file.bin", true)
+	if a.dir == b.dir || a.dir == c.dir || b.dir == c.dir {
+		t.Fatalf("cache keys collided: %s %s %s", a.dir, b.dir, c.dir)
+	}
+}
+
+// --------------------------- integration tests ---------------------------
+
+// TestDownloadFileResumeCleansUpAfterSuccess verifies that the resume cache
+// directory does not exist after a successful end-to-end download.
+func TestDownloadFileResumeCleansUpAfterSuccess(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := txtResolver{server: ip, port: port, retries: 3}
+
+	payload := make([]byte, 4000)
+	for i := range payload {
+		payload[i] = byte(i * 37 % 251)
+	}
+	filename := "resume-cleanup.bin"
+	if err := os.WriteFile(filepath.Join(dataDir, filename), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheDir := t.TempDir()
+	cfg := config{
+		domain:           "files.test",
+		pass:             "integration-test-secret",
+		filename:         filename,
+		outFile:          filepath.Join(t.TempDir(), filename),
+		retries:          3,
+		dnsServer:        ip,
+		dnsPort:          port,
+		maxDownloadBytes: defaultMaxDownloadBytes,
+		cacheDir:         cacheDir,
+	}
+	if err := downloadFile(resolver, cfg); err != nil {
+		t.Fatalf("downloadFile: %v", err)
+	}
+
+	// The per-id directory should be gone; cacheDir itself may still exist
+	// (and that's fine — it's the parent root).
+	cacheParent := newResumeCache(cacheDir, cfg.domain, cfg.filename, true)
+	if _, err := os.Stat(cacheParent.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cache dir %s should be cleared after success", cacheParent.dir)
+	}
+}
+
+// TestDownloadFileResumeUsesCachedBatch proves the cache is actually read by
+// pre-seeding it with deliberately-broken data and expecting the download to
+// fail at the decode/decrypt step. A run without resume would have succeeded
+// against the same server, so the failure isolates "cache was used" as the
+// cause.
+func TestDownloadFileResumeUsesCachedBatch(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := txtResolver{server: ip, port: port, retries: 3}
+
+	payload := make([]byte, 6000)
+	for i := range payload {
+		payload[i] = byte(i*53%251 ^ 0x5A)
+	}
+	filename := "resume-uses-cache.bin"
+	if err := os.WriteFile(filepath.Join(dataDir, filename), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// First call dinit ourselves to discover chunkCount.
+	chunkCount := discoverChunkCount(t, resolver, "files.test", "integration-test-secret", filename)
+
+	// Pre-seed the cache: meta matches what downloadFile will compute, batch 0
+	// is intentional garbage that base64-decodes to bytes failing HMAC.
+	cacheDir := t.TempDir()
+	batchSize := defaultDownloadBatch
+	cache := newResumeCache(cacheDir, "files.test", filename, true)
+	if err := cache.saveMeta(chunkCount, batchSize); err != nil {
+		t.Fatal(err)
+	}
+	// Valid base64 alphabet but cryptographically wrong: decryption will
+	// fail HMAC verification and return an error.
+	if err := cache.saveBatch(0, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config{
+		domain:           "files.test",
+		pass:             "integration-test-secret",
+		filename:         filename,
+		outFile:          filepath.Join(t.TempDir(), filename),
+		retries:          3,
+		dnsServer:        ip,
+		dnsPort:          port,
+		maxDownloadBytes: defaultMaxDownloadBytes,
+		cacheDir:         cacheDir,
+	}
+	err := downloadFile(resolver, cfg)
+	if err == nil {
+		t.Fatal("expected decode/decrypt failure due to poisoned cache, got nil")
+	}
+}
+
+// TestDownloadFileResumeDisabled verifies that -no-resume bypasses the cache
+// even if valid pre-seeded data exists, so the download succeeds against the
+// real server regardless of cache content.
+func TestDownloadFileResumeDisabled(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := txtResolver{server: ip, port: port, retries: 3}
+
+	payload := make([]byte, 5000)
+	for i := range payload {
+		payload[i] = byte(i*19%251 ^ 0x33)
+	}
+	filename := "resume-disabled.bin"
+	if err := os.WriteFile(filepath.Join(dataDir, filename), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	chunkCount := discoverChunkCount(t, resolver, "files.test", "integration-test-secret", filename)
+
+	// Pre-seed poisoned cache.
+	cacheDir := t.TempDir()
+	cache := newResumeCache(cacheDir, "files.test", filename, true)
+	_ = cache.saveMeta(chunkCount, defaultDownloadBatch)
+	_ = cache.saveBatch(0, "AAAAAAAAAAAAAAAAAAAA")
+
+	cfg := config{
+		domain:           "files.test",
+		pass:             "integration-test-secret",
+		filename:         filename,
+		outFile:          filepath.Join(t.TempDir(), filename),
+		retries:          3,
+		dnsServer:        ip,
+		dnsPort:          port,
+		maxDownloadBytes: defaultMaxDownloadBytes,
+		cacheDir:         cacheDir,
+		noResume:         true,
+	}
+	if err := downloadFile(resolver, cfg); err != nil {
+		t.Fatalf("downloadFile with -no-resume should succeed despite poisoned cache, got %v", err)
+	}
+}
+
+// discoverChunkCount issues a dinit DNS query against the test server and
+// parses the chunk-count response — used by resume tests that need to
+// pre-seed a cache with the exact shape downloadFile will discover.
+func discoverChunkCount(t *testing.T, resolver txtResolver, domain, pass, filename string) int {
+	t.Helper()
+	sid, err := protocol.NewSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels, err := protocol.EncodeFilenameLabels(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initArgs := append([]string{sid}, labels...)
+	name := authenticatedName(pass, domain, "dinit", initArgs)
+	resp, err := resolver.query(name)
+	if err != nil {
+		t.Fatalf("dinit: %v", err)
+	}
+	var n int
+	if _, err := fmt.Sscanf(resp, "%d", &n); err != nil || n <= 0 {
+		t.Fatalf("dinit response not a chunk count: %q", resp)
+	}
+	return n
+}
+
+// jsonRoundtrip is a sanity sentinel that catches drift between the on-disk
+// meta.json schema and the resumeMeta struct. The shape is asserted directly
+// instead of going through json.Marshal because the test runs frequently and
+// schema changes should be intentional.
+func TestResumeMetaSchema(t *testing.T) {
+	raw, err := json.Marshal(resumeMeta{ChunkCount: 7, BatchSize: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); got != `{"chunk_count":7,"batch_size":2}` {
+		t.Fatalf("meta json shape changed: %s", got)
+	}
+}
