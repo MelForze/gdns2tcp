@@ -1,8 +1,7 @@
 # gdns2tcp
 
 File-transfer utility that tunnels uploads and downloads through DNS TXT
-records. Designed for authorized administration of owned infrastructure,
-lab/CTF setups, and training environments.
+records.
 
 - **Server** (Go) — authoritative DNS handler that stores files and serves
   client binaries
