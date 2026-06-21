@@ -14,6 +14,11 @@ import "sync"
 //
 // Anything that doesn't fit any class skips the pool entirely; allocations
 // at that size are rare enough that GC absorbs them without spike.
+//
+// The Get/Put API works with `*[]byte`, not `[]byte`. The pointer version
+// avoids the 24-byte slice-header escape that `Put(&local)` would incur on
+// every release — at axchgWorkers=16 × dozens of tunnels × hundreds of
+// release calls per second, that escape adds up.
 const (
 	bufSizeSmall  = 2 * 1024
 	bufSizeMedium = 8 * 1024
@@ -37,51 +42,57 @@ func newBytePool(size int) *sync.Pool {
 	}
 }
 
-// GetBuf returns a byte slice with len = requested and cap = the size
-// class it was drawn from. Caller must pass the returned slice (or a
-// reslice of it) to PutBuf when done; PutBuf reads cap() to route back to
-// the right pool. Sizes that fall outside the class set are heap-allocated
-// and PutBuf silently drops them.
-func GetBuf(size int) []byte {
+// GetBuf returns a pooled buffer wrapped in `*[]byte`. The slice's len is
+// the size you requested; cap is the size class it was drawn from. Pass the
+// returned pointer to PutBuf when done.
+//
+// Sizes that fall outside the class set are heap-allocated and PutBuf on
+// them silently drops the buffer — cheap fallback so callers don't have to
+// special-case unusual sizes.
+func GetBuf(size int) *[]byte {
 	if size <= 0 {
-		return nil
+		empty := []byte{}
+		return &empty
 	}
 	switch {
 	case size <= bufSizeSmall:
 		bp := poolSmall.Get().(*[]byte)
-		return (*bp)[:size]
+		*bp = (*bp)[:size]
+		return bp
 	case size <= bufSizeMedium:
 		bp := poolMedium.Get().(*[]byte)
-		return (*bp)[:size]
+		*bp = (*bp)[:size]
+		return bp
 	case size <= bufSizeLarge:
 		bp := poolLarge.Get().(*[]byte)
-		return (*bp)[:size]
+		*bp = (*bp)[:size]
+		return bp
 	case size <= bufSizeBulk:
 		bp := poolBulk.Get().(*[]byte)
-		return (*bp)[:size]
+		*bp = (*bp)[:size]
+		return bp
 	default:
-		return make([]byte, size)
+		one := make([]byte, size)
+		return &one
 	}
 }
 
 // PutBuf returns a buffer obtained from GetBuf. The routing key is cap();
-// passing a slice that was reshaped to a smaller cap (via three-arg slicing
-// or appending to an arbitrary base) will silently miss the pool. Safe to
-// call with nil.
-func PutBuf(buf []byte) {
-	c := cap(buf)
-	if c == 0 {
+// the pointer itself is what goes back into sync.Pool, so no slice-header
+// escape per Put. Safe to call with nil.
+func PutBuf(bp *[]byte) {
+	if bp == nil {
 		return
 	}
-	full := buf[:c]
+	c := cap(*bp)
 	switch c {
 	case bufSizeSmall:
-		poolSmall.Put(&full)
+		poolSmall.Put(bp)
 	case bufSizeMedium:
-		poolMedium.Put(&full)
+		poolMedium.Put(bp)
 	case bufSizeLarge:
-		poolLarge.Put(&full)
+		poolLarge.Put(bp)
 	case bufSizeBulk:
-		poolBulk.Put(&full)
+		poolBulk.Put(bp)
 	}
 }

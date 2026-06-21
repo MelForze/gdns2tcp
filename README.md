@@ -65,7 +65,7 @@ D=files.example.com S=<server-ip> B=14 P=16 sh -c '
 os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="$os-$a"
-q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\" \n"); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
+q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d '"\n '); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
 m=$(q "client-$A.$D") || exit 1
 NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
 TOTAL=$(( (N + B - 1) / B ))
@@ -216,7 +216,7 @@ D=files.example.com S=<server-ip> B=14 P=16 sh -c '
 os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="client-proxy-$os-$a"
-q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\" \n"); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
+q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d '"\n '); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
 m=$(q "client-$A.$D") || exit 1
 NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
 TOTAL=$(( (N + B - 1) / B ))
@@ -370,3 +370,4 @@ curl --socks5-hostname --proxy-user "gdns2tcp:change-me" \
 | `-poll-max` | `200ms` | Maximum interval after consecutive idle responses |
 | `-max-conn` | `32` | Maximum concurrent local tunnels (1–512) |
 | `-retries` | `3` | DNS query attempts before failing (apoll only — `axchg` uses fresh nonces, so no retry) |
+| `-target-dial-timeout` | `1s` | TCP dial timeout when the agent connects to the host the operator's SOCKS5 CONNECT requested. Lower values speed up port-scan workflows (filtered ports release their cid faster); raise for legitimately slow upstreams |

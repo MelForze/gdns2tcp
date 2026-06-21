@@ -26,7 +26,12 @@ const (
 	// reverseTTL is the per-cid idle timeout. Operator's TCP socket sets this
 	// indirectly: if the operator vanishes, the per-cid buffers drain and the
 	// cleanup goroutine reaps them after this window.
-	reverseTTL = 5 * time.Minute
+	//
+	// 30 minutes covers typical long-running interactive sessions (vim, top,
+	// watch, log tails) that sit idle between bursts of input. Shorter would
+	// kill SSH sessions mid-session; longer would let dead cids sit around
+	// chewing memory on busy servers.
+	reverseTTL = 30 * time.Minute
 
 	// reverseMaxBufBytes caps each direction's queued bytes per cid. Past this
 	// the producing side blocks: SOCKS5 reader pauses when operator→agent is
@@ -50,11 +55,10 @@ const (
 // bytes.Buffer instances back each direction.
 //
 // awriteWindow caps how far ahead the agent's awrite seq is allowed to run
-// past the next-expected one. With axchgWorkers=16 and the cross-tunnel
-// batcher (Шаг B) adding up to ~axchgmMaxBatch worker stalls per cid in
-// multi-tunnel scenarios, we size at 64 to absorb both the steady-state
-// pipeline and one round of retries without false "ERR seq" rejects.
-const awriteWindow = 64
+// past the next-expected one. With axchgWorkers=16 on the agent side, the
+// server needs at least equal headroom or the agent stalls; 32 absorbs one
+// round of retries too.
+const awriteWindow = 32
 
 type reverseConn struct {
 	target      string // "host:port" — agent dials this
@@ -70,7 +74,6 @@ type reverseConn struct {
 	opToAgent   bytes.Buffer
 	agentToOp   bytes.Buffer
 	opCond      *sync.Cond
-	agentCond   *sync.Cond
 	seqAgentIn  uint64 // last contiguously written awrite seq
 	seqOpToA    uint64 // next aread seq to issue
 	oooWrite    map[uint64][]byte
@@ -94,9 +97,28 @@ type reverseConn struct {
 	readWaiters []chan struct{}
 }
 
-// signalReadersLocked wakes every currently parked aread/axchg. Caller
-// must hold rc.mu. Safe to call when readWaiters is empty.
-func (rc *reverseConn) signalReadersLocked() {
+// signalOneReaderLocked wakes a single parked aread/axchg — the one that
+// has been waiting the longest (FIFO). The remaining waiters stay parked.
+// Used when new operator bytes arrive: only one worker needs to wake up,
+// drain the chunk, and ship it; the rest would just see EMPTY on a
+// pure-read axchg, wasting one DNS round-trip each.
+//
+// Caller must hold rc.mu. Safe to call when readWaiters is empty.
+func (rc *reverseConn) signalOneReaderLocked() {
+	if len(rc.readWaiters) == 0 {
+		return
+	}
+	ch := rc.readWaiters[0]
+	rc.readWaiters = rc.readWaiters[1:]
+	close(ch)
+}
+
+// closeAllReadersLocked wakes every currently parked aread/axchg at once.
+// Used on tunnel teardown (reverseCloseConn) so every worker observes
+// CLOSED and exits — none should keep parking on a dead cid.
+//
+// Caller must hold rc.mu. Safe to call when readWaiters is empty.
+func (rc *reverseConn) closeAllReadersLocked() {
 	for _, w := range rc.readWaiters {
 		close(w)
 	}
@@ -104,47 +126,64 @@ func (rc *reverseConn) signalReadersLocked() {
 }
 
 // drainContiguousWritesLocked pulls every in-order chunk out of oooWrite
-// starting at seqAgentIn+1 and returns them as a net.Buffers, plus the
-// last seq number consumed. Caller must hold rc.mu. The chunks are deleted
-// from oooWrite, but rc.seqAgentIn is NOT advanced — that's the caller's
-// job after a successful writev. This split keeps parallel awrite calls
-// from racing past us into the operator socket while we're mid-syscall.
+// starting at seqAgentIn+1, advances rc.seqAgentIn to the last consumed
+// seq, and returns the chunks as a net.Buffers. Caller must hold rc.mu.
+//
+// Advancing under rc.mu — together with writeMu serialising the actual
+// writev — is what closes the duplicate-seq race: a concurrent awrite for
+// any seq ≤ rc.seqAgentIn now correctly fast-paths to "ACK seq" instead of
+// re-storing into oooWrite and re-delivering the same bytes to the
+// operator socket. The writev itself runs unlocked from rc.mu, so other
+// callers can keep filling oooWrite in the meantime, but writeMu keeps
+// their writev's serialised behind ours — preserving stream order.
 //
 // Picking the batch upfront (rather than write-one-then-relock) collapses
 // N operator.Write syscalls into a single writev, which on bulk inbound
 // traffic was the dominant CPU cost on the server side.
-func (rc *reverseConn) drainContiguousWritesLocked(maxBatch int) (net.Buffers, uint64) {
+func (rc *reverseConn) drainContiguousWritesLocked(maxBatch int) net.Buffers {
 	if rc.oooWrite == nil {
-		return nil, 0
+		return nil
 	}
 	var batch net.Buffers
-	lastSeq := rc.seqAgentIn
 	for {
 		if maxBatch > 0 && len(batch) >= maxBatch {
 			break
 		}
-		next := lastSeq + 1
+		next := rc.seqAgentIn + 1
 		data, ok := rc.oooWrite[next]
 		if !ok {
 			break
 		}
 		delete(rc.oooWrite, next)
 		batch = append(batch, data)
-		lastSeq = next
+		rc.seqAgentIn = next
 	}
-	return batch, lastSeq
+	return batch
 }
 
-// commitOperatorWrite runs the actual writev outside rc.mu so concurrent
-// awrites can keep filling oooWrite, but serialises the syscall itself via
-// writeMu. Returns the new seqAgentIn that the caller should commit under
-// rc.mu, plus any error. On error the caller is expected to tear the
-// tunnel down — partial writev means the operator's byte stream is now
-// out of sync.
-func (rc *reverseConn) commitOperatorWrite(batch net.Buffers) (int64, error) {
-	rc.writeMu.Lock()
-	defer rc.writeMu.Unlock()
-	return batch.WriteTo(rc.operator)
+// commitOperatorWrite runs the actual writev on the operator socket. Caller
+// must already hold rc.writeMu (acquired before releasing rc.mu — see the
+// drain-then-write pattern in applyAxchgWrite and proxyAgentWrite). The
+// rc.mu → rc.writeMu locking order keeps two concurrent drains from
+// reordering bytes on the operator socket: whoever grabbed writeMu first
+// also drained first, so their writev runs first.
+//
+// A short write (n < total bytes) means the operator stream is now
+// truncated relative to seqAgentIn and unrecoverable; we surface it as an
+// error so the caller tears the tunnel down.
+func (rc *reverseConn) commitOperatorWrite(batch net.Buffers) error {
+	want := int64(0)
+	for _, b := range batch {
+		want += int64(len(b))
+	}
+	n, err := batch.WriteTo(rc.operator)
+	if err != nil {
+		return err
+	}
+	if n != want {
+		return fmt.Errorf("short writev: wrote %d of %d", n, want)
+	}
+	return nil
 }
 
 // drainBatchSize caps how many chunks a single writev can carry. The cap
@@ -519,7 +558,6 @@ func (s *Server) reverseEnqueueOpen(target string, op net.Conn) (string, *revers
 		expires:    time.Now().Add(reverseTTL),
 	}
 	rc.opCond = sync.NewCond(&rc.mu)
-	rc.agentCond = sync.NewCond(&rc.mu)
 	s.reverse.conns[cid] = rc
 	s.reverse.pending = append(s.reverse.pending, rc)
 	s.reverse.pendCids[rc] = cid
@@ -544,7 +582,10 @@ func (s *Server) reversePumpOperator(cid string, rc *reverseConn) {
 			}
 			rc.opToAgent.Write(buf[:n])
 			rc.expires = time.Now().Add(reverseTTL)
-			rc.signalReadersLocked() // Шаг C: wake any parked long-poll
+			// Шаг C+fairness: wake one parked worker — they drain the
+			// chunk; waking all 16 would spawn 15 wasted DNS round-trips
+			// since only one can take the data.
+			rc.signalOneReaderLocked()
 			rc.mu.Unlock()
 		}
 		if err != nil {
@@ -567,8 +608,7 @@ func (s *Server) reverseCloseConn(cid string, rc *reverseConn, reason string) {
 	rc.agentClosed = true
 	_ = rc.operator.Close()
 	rc.opCond.Broadcast()
-	rc.agentCond.Broadcast()
-	rc.signalReadersLocked() // Шаг C: unblock any parked long-poll
+	rc.closeAllReadersLocked() // Шаг C: unblock every parked long-poll
 	rc.mu.Unlock()
 	s.logger.Printf("reverse close cid=%s (%s)", cid, reason)
 }
@@ -676,16 +716,16 @@ func (s *Server) proxyAgentRead(args []string, now time.Time) []string {
 	if take > maxRead-1 {
 		take = maxRead - 1
 	}
-	raw := gproxy.GetBuf(take)
-	_, _ = rc.opToAgent.Read(raw)
+	rawBuf := gproxy.GetBuf(take)
+	_, _ = rc.opToAgent.Read(*rawBuf)
 	rc.seqOpToA++
 	seq := rc.seqOpToA
 	rc.expires = now.Add(reverseTTL)
 	rc.opCond.Broadcast() // wake operator pump if it was blocked
 	rc.mu.Unlock()
 
-	plaintext := rc.compressor.Encode(raw)
-	gproxy.PutBuf(raw)
+	plaintext := rc.compressor.Encode(*rawBuf)
+	gproxy.PutBuf(rawBuf)
 	ct := gproxy.SealChunk(rc.aead, gproxy.DirServerToClient, seq, plaintext)
 	b64 := base64.StdEncoding.EncodeToString(ct)
 	out := []string{"DATA " + strconv.FormatUint(seq, 10)}
@@ -775,19 +815,21 @@ func (s *Server) proxyAgentWrite(args []string, now time.Time) []string {
 	}
 	rc.oooWrite[seq] = decompressed
 	for {
-		batch, lastSeq := rc.drainContiguousWritesLocked(drainBatchSize)
+		batch := rc.drainContiguousWritesLocked(drainBatchSize)
 		if len(batch) == 0 {
 			break
 		}
+		// Acquire writeMu before releasing rc.mu so the writev order
+		// matches the drain order (rc.mu → writeMu hierarchy).
+		rc.writeMu.Lock()
 		rc.mu.Unlock()
-		if _, err := rc.commitOperatorWrite(batch); err != nil {
+		err := rc.commitOperatorWrite(batch)
+		rc.writeMu.Unlock()
+		if err != nil {
 			s.reverseCloseConn(cid, rc, "operator write: "+err.Error())
 			return []string{"ERR write"}
 		}
 		rc.mu.Lock()
-		if lastSeq > rc.seqAgentIn {
-			rc.seqAgentIn = lastSeq
-		}
 	}
 	rc.expires = now.Add(reverseTTL)
 	rc.mu.Unlock()
@@ -974,20 +1016,22 @@ func (s *Server) applyAxchgWrite(rc *reverseConn, seq uint64, dataLabels []strin
 	}
 	rc.oooWrite[seq] = decompressed
 	for {
-		batch, lastSeq := rc.drainContiguousWritesLocked(drainBatchSize)
+		batch := rc.drainContiguousWritesLocked(drainBatchSize)
 		if len(batch) == 0 {
 			break
 		}
+		// Acquire writeMu before releasing rc.mu so the writev order
+		// matches the drain order (rc.mu → writeMu hierarchy).
+		rc.writeMu.Lock()
 		rc.mu.Unlock()
-		if _, err := rc.commitOperatorWrite(batch); err != nil {
+		err := rc.commitOperatorWrite(batch)
+		rc.writeMu.Unlock()
+		if err != nil {
 			cidLookup := s.cidForReverseConn(rc)
 			s.reverseCloseConn(cidLookup, rc, "operator write: "+err.Error())
 			return "ERR write"
 		}
 		rc.mu.Lock()
-		if lastSeq > rc.seqAgentIn {
-			rc.seqAgentIn = lastSeq
-		}
 	}
 	rc.expires = now.Add(reverseTTL)
 	rc.mu.Unlock()
@@ -1027,16 +1071,16 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	if take > maxRead-1 {
 		take = maxRead - 1
 	}
-	raw := gproxy.GetBuf(take)
-	_, _ = rc.opToAgent.Read(raw)
+	rawBuf := gproxy.GetBuf(take)
+	_, _ = rc.opToAgent.Read(*rawBuf)
 	rc.seqOpToA++
 	seq := rc.seqOpToA
 	rc.expires = now.Add(reverseTTL)
 	rc.opCond.Broadcast()
 	rc.mu.Unlock()
 
-	plaintext := rc.compressor.Encode(raw)
-	gproxy.PutBuf(raw) // raw was copied into compressor's output; release now
+	plaintext := rc.compressor.Encode(*rawBuf)
+	gproxy.PutBuf(rawBuf) // raw was copied into compressor's output; release now
 	ct := gproxy.SealChunk(rc.aead, gproxy.DirServerToClient, seq, plaintext)
 	b64 := base64.StdEncoding.EncodeToString(ct)
 	out := []string{"DATA " + strconv.FormatUint(seq, 10)}
@@ -1055,83 +1099,6 @@ func (s *Server) cidForReverseConn(rc *reverseConn) string {
 		}
 	}
 	return "?"
-}
-
-// axchgmMaxBatch caps how many cids a single multi-cid request can carry.
-// Eight is the upper bound at which a 4-chunk-per-cid UDP query still fits
-// in 253 chars; the agent's batcher waits at most 2 ms to fill a batch.
-const axchgmMaxBatch = 8
-
-// axchgm: write-only batch across multiple cids. The wire takes N records,
-// each shaped (cid, seq, K, chunk×K, smac), and the response carries one
-// "ACK <seq>" (or "ERR ...") per record in the same order.
-//
-// Wire (request):
-//
-//	N . cid1.seq1.K1.chunks1.smac1 . cid2.seq2.K2.chunks2.smac2 . ... . axchgm . <domain>
-//
-// Each smac_i is per-cid: SessionMAC(sessionKey_i, "axchgm", seq_i). The
-// agent's batcher only fires this command when its per-tunnel queue would
-// otherwise block, so the read-piggyback path stays the default for the
-// common single-tunnel case.
-func (s *Server) proxyAgentExchangeMulti(args []string, now time.Time) []string {
-	if !s.allowProxy || s.reverse == nil {
-		return []string{proxyDisabledResponse}
-	}
-	if len(args) < 5 {
-		return []string{"ERR malformed"}
-	}
-	n, err := strconv.Atoi(args[0])
-	if err != nil || n < 1 || n > axchgmMaxBatch {
-		return []string{"ERR bad batch"}
-	}
-
-	out := make([]string, 0, n)
-	cur := 1
-	for i := 0; i < n; i++ {
-		if cur+3 > len(args) {
-			return []string{"ERR malformed"}
-		}
-		cid := strings.ToLower(args[cur])
-		seq, perr := strconv.ParseUint(args[cur+1], 10, 64)
-		if perr != nil {
-			return []string{"ERR bad seq"}
-		}
-		k, kerr := strconv.Atoi(args[cur+2])
-		if kerr != nil || k < 0 || cur+3+k >= len(args) {
-			return []string{"ERR malformed"}
-		}
-		chunks := args[cur+3 : cur+3+k]
-		smac := args[cur+3+k]
-		cur += 4 + k
-
-		if !gproxy.ValidCID(cid) {
-			out = append(out, "ERR bad cid")
-			continue
-		}
-		s.reverse.mu.Lock()
-		rc, ok := s.reverse.conns[cid]
-		s.reverse.mu.Unlock()
-		if !ok {
-			out = append(out, "ERR unknown cid")
-			continue
-		}
-		if !protocol.VerifySessionMAC(rc.sessionKey, "axchgm", seq, smac) {
-			out = append(out, proxyAuthFailResponse)
-			continue
-		}
-		if len(chunks) == 0 {
-			out = append(out, "ERR malformed")
-			continue
-		}
-		status := s.applyAxchgWrite(rc, seq, chunks, now)
-		out = append(out, status)
-	}
-
-	if cur != len(args) {
-		return []string{"ERR malformed"}
-	}
-	return out
 }
 
 // --- Cleanup & shutdown ----------------------------------------------------
@@ -1156,7 +1123,6 @@ func (s *Server) proxyCleanupExpiredLocked(now time.Time) {
 			rc.agentClosed = true
 			_ = rc.operator.Close()
 			rc.opCond.Broadcast()
-			rc.agentCond.Broadcast()
 			rc.mu.Unlock()
 			s.logger.Printf("reverse expired cid=%s (idle past %s)", cid, reverseTTL)
 		}

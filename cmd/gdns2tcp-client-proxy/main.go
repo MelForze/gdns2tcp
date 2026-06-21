@@ -30,15 +30,16 @@ import (
 const defaultDNSPort = "53"
 
 type config struct {
-	domain    string
-	pass      string
-	dnsServer string
-	dnsPort   string
-	tcp       bool
-	pollMin   time.Duration
-	pollMax   time.Duration
-	maxConn   int
-	retries   int
+	domain        string
+	pass          string
+	dnsServer     string
+	dnsPort       string
+	tcp           bool
+	pollMin       time.Duration
+	pollMax       time.Duration
+	maxConn       int
+	retries       int
+	targetTimeout time.Duration
 }
 
 func main() {
@@ -67,10 +68,10 @@ func run() error {
 	resolver := newTxtResolver(cfg)
 	fmt.Printf("polling %s for tunnel requests (max %d concurrent)\n", cfg.domain, cfg.maxConn)
 
-	var live int64
+	var live atomic.Int64
 	delay := cfg.pollMin
 	for {
-		if int(atomic.LoadInt64(&live)) >= cfg.maxConn {
+		if int(live.Load()) >= cfg.maxConn {
 			time.Sleep(cfg.pollMax)
 			continue
 		}
@@ -89,9 +90,9 @@ func run() error {
 			continue
 		}
 		delay = cfg.pollMin
-		atomic.AddInt64(&live, 1)
+		live.Add(1)
 		go func(cid, target string) {
-			defer atomic.AddInt64(&live, -1)
+			defer live.Add(-1)
 			handleTunnel(cfg, resolver, cid, target)
 		}(cid, target)
 	}
@@ -108,6 +109,7 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.pollMax, "poll-max", 200*time.Millisecond, "maximum apoll/aread interval after consecutive idle responses")
 	flag.IntVar(&cfg.maxConn, "max-conn", 32, "maximum concurrent local tunnels (1-512)")
 	flag.IntVar(&cfg.retries, "retries", 3, "DNS query attempts before failing")
+	flag.DurationVar(&cfg.targetTimeout, "target-dial-timeout", 1*time.Second, "TCP dial timeout when the agent connects to the host the operator's SOCKS5 CONNECT asks for. Lower values speed up port-scan workloads through the tunnel (filtered ports release their cid sooner); raise if you legitimately tunnel to slow upstreams")
 	flag.Parse()
 
 	cfg.domain = strings.TrimSuffix(strings.TrimSpace(cfg.domain), ".")
@@ -123,6 +125,9 @@ func parseFlags() config {
 	}
 	if cfg.retries < 1 {
 		cfg.retries = 1
+	}
+	if cfg.targetTimeout <= 0 {
+		cfg.targetTimeout = 1 * time.Second
 	}
 	return cfg
 }
@@ -207,7 +212,7 @@ func (ts *tunnelSession) nextNonce() uint64 {
 // handleTunnel dials the target locally and bridges bytes through the DNS
 // tunnel until either side closes.
 func handleTunnel(cfg config, resolver *txtResolver, cid, target string) {
-	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	dialer := net.Dialer{Timeout: cfg.targetTimeout, KeepAlive: 30 * time.Second}
 	upstream, err := dialer.Dial("tcp", target)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dial %s for cid=%s: %v\n", target, cid, err)
@@ -330,9 +335,7 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 				exchangeStart := time.Now()
 				if haveJob {
 					res, err = agentExchange(cfg, resolver, ts, cid, job.seq, job.data)
-					if job.release != nil {
-						job.release()
-					}
+					gproxy.PutBuf(job.bufPtr)
 				} else {
 					res, err = agentExchange(cfg, resolver, ts, cid, 0, nil)
 				}
@@ -385,16 +388,6 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 		}
 		_ = upstream.SetReadDeadline(time.Unix(1, 0))
 	}()
-	// Шаг B: register this tunnel with the batcher so other concurrently
-	// active tunnels can co-batch their writes through axchgm. We don't
-	// spill our own jobs into the batcher — per-cid in-flight would blow
-	// past the server's awriteWindow and the batcher's cross-cid wire
-	// budget. The integration point is the cross-tunnel scheduler in
-	// runMultiCidScheduler (see registerTunnel below).
-	batcher := getMultiCidBatcher(cfg, resolver)
-	batcher.registerTunnel(cid, ts, writeJobs, done)
-	defer batcher.unregisterTunnel(cid)
-
 	go func() {
 		bufSize := int(ts.bufSize.Load())
 		if bufSize < 1 {
@@ -402,57 +395,28 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 		}
 		var seq uint64
 		for {
-			buf := gproxy.GetBuf(bufSize)
-			n, err := upstream.Read(buf)
+			bufPtr := gproxy.GetBuf(bufSize)
+			n, err := upstream.Read(*bufPtr)
 			if n > 0 {
 				seq++
-				// Capture the original full slice so PutBuf can route it
-				// back to its size class — the truncated buf[:n] would lose
-				// the cap information.
-				full := buf
 				job := awriteJob{
-					seq:     seq,
-					data:    buf[:n],
-					release: func() { gproxy.PutBuf(full) },
+					seq:    seq,
+					data:   (*bufPtr)[:n],
+					bufPtr: bufPtr,
 				}
-				// Шаг B: when there's no peer tunnel, stick to the
-				// per-tunnel queue — single-cid spill would just race the
-				// axchgWorkers and fight for the seqAgentIn window. With
-				// 2+ tunnels we offer the job to the batcher's bus as a
-				// non-blocking secondary path; whichever channel takes it
-				// first wins.
-				batcher.mu.Lock()
-				canBatch := len(batcher.tunnels) >= 2
-				batcher.mu.Unlock()
-				if canBatch {
-					select {
-					case writeJobs <- job:
-					case batcher.bus <- batchedJob{
-						cid: cid, ts: ts, seq: seq,
-						data: job.data, release: job.release,
-					}:
-					case <-done:
-						job.release()
-						return
-					case <-internalStop:
-						job.release()
-						return
-					}
-				} else {
-					select {
-					case writeJobs <- job:
-					case <-done:
-						job.release()
-						return
-					case <-internalStop:
-						job.release()
-						return
-					}
+				select {
+				case writeJobs <- job:
+				case <-done:
+					gproxy.PutBuf(bufPtr)
+					return
+				case <-internalStop:
+					gproxy.PutBuf(bufPtr)
+					return
 				}
 			} else {
 				// Read returned (0, err) — buf was untouched, return it
 				// straight to the pool so it doesn't escape the GC.
-				gproxy.PutBuf(buf)
+				gproxy.PutBuf(bufPtr)
 			}
 			if err != nil {
 				// Cancellation paths share the same deadline-poke trick;
@@ -535,402 +499,10 @@ func drainExchange(ch <-chan exchangeResult) {
 	}
 }
 
-// pumpOperatorToUpstream is retained only for tests that exercise the
-// agent-side aread path directly; the live tunnel now runs through
-// runBidirectionalTunnel + axchg.
-const areadPipeline = 8
-
-// pendingCap bounds the reorder buffer in pumpOperatorToUpstream.
-const pendingCap = areadPipeline * 4
-
-type areadResult struct {
-	data   []byte
-	seq    uint64
-	closed bool
-	wait   bool
-	err    error
-}
-
-func pumpOperatorToUpstream(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, upstream net.Conn, done <-chan struct{}) {
-	results := make(chan areadResult, areadPipeline)
-	stop := make(chan struct{})
-	var stopOnce sync.Once
-	cancel := func() { stopOnce.Do(func() { close(stop) }) }
-	defer cancel()
-
-	var wg sync.WaitGroup
-	for range areadPipeline {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			delay := cfg.pollMin
-			for {
-				select {
-				case <-done:
-					return
-				case <-stop:
-					return
-				default:
-				}
-				data, seq, closed, wait, err := agentRead(cfg, resolver, ts, cid)
-				select {
-				case results <- areadResult{data: data, seq: seq, closed: closed, wait: wait, err: err}:
-				case <-done:
-					return
-				case <-stop:
-					return
-				}
-				if err != nil || closed {
-					return
-				}
-				if len(data) == 0 {
-					if wait {
-						time.Sleep(cfg.pollMin)
-						delay = cfg.pollMin
-					} else {
-						time.Sleep(delay)
-						delay *= 2
-						if delay > cfg.pollMax {
-							delay = cfg.pollMax
-						}
-					}
-				} else {
-					delay = cfg.pollMin
-				}
-			}
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	nextSeq := uint64(1)
-	pending := make(map[uint64][]byte, pendingCap)
-	for r := range results {
-		if r.err != nil {
-			fmt.Fprintf(os.Stderr, "aread cid=%s: %v\n", cid, r.err)
-			cancel()
-			drain(results)
-			return
-		}
-		if r.closed {
-			cancel()
-			drain(results)
-			// Flush whatever contiguous prefix is buffered before exiting.
-			for {
-				data, ok := pending[nextSeq]
-				if !ok {
-					break
-				}
-				delete(pending, nextSeq)
-				if _, err := upstream.Write(data); err != nil {
-					return
-				}
-				nextSeq++
-			}
-			return
-		}
-		if len(r.data) == 0 {
-			continue
-		}
-		if r.seq < nextSeq {
-			// Duplicate (shouldn't happen since the server increments seq
-			// under a single lock, but cheap to defend against).
-			continue
-		}
-		pending[r.seq] = r.data
-		if len(pending) > pendingCap {
-			fmt.Fprintf(os.Stderr, "aread cid=%s: reorder buffer overflow (lost seq %d?), closing\n", cid, nextSeq)
-			cancel()
-			drain(results)
-			return
-		}
-		for {
-			data, ok := pending[nextSeq]
-			if !ok {
-				break
-			}
-			delete(pending, nextSeq)
-			if _, err := upstream.Write(data); err != nil {
-				cancel()
-				drain(results)
-				return
-			}
-			nextSeq++
-		}
-	}
-}
-
-// drain empties a results channel so blocked senders can finish and the wg
-// closer goroutine can complete its work after cancel.
-func drain(ch <-chan areadResult) {
-	for range ch {
-	}
-}
-
-// --- Шаг B: multi-cid axchgm batcher --------------------------------------
-//
-// One process-wide singleton owns a bus that per-tunnel upstream-readers
-// fall back to whenever their own writeJobs channel is full. The batcher
-// coalesces up to axchgmMaxBatch jobs from any cids waiting on the bus into
-// a single axchgm DNS round-trip.
-//
-// Per-tunnel pure-read axchg keeps the read-piggyback latency win for
-// interactive traffic; the batcher only fires when there's genuine
-// write-side overflow, typically a many-tab browser session.
-
-const (
-	// axchgmMaxBatch matches the server cap in internal/dnsserver/proxy.go.
-	axchgmMaxBatch = 8
-	// batchCollectWindow is how long a worker waits to top up a batch
-	// before sending. Trades a tiny tail-latency cost (≤ window) against
-	// the DNS-RTT savings from coalescing.
-	batchCollectWindow = 2 * time.Millisecond
-)
-
-type batchedJob struct {
-	cid     string
-	ts      *tunnelSession
-	seq     uint64
-	data    []byte
-	release func() // matches awriteJob.release: returns buf to its pool
-}
-
-type multiCidBatcher struct {
-	cfg      config
-	resolver *txtResolver
-	bus      chan batchedJob
-	stop     chan struct{}
-
-	mu      sync.Mutex
-	tunnels map[string]*batcherTunnel // cid → registered tunnel
-}
-
-// batcherTunnel records what the scheduler needs to know about a live
-// tunnel so it can opportunistically batch its writes with peers'.
-type batcherTunnel struct {
-	ts        *tunnelSession
-	writeJobs chan awriteJob
-	done      <-chan struct{}
-}
-
-// registerTunnel makes a tunnel visible to the cross-tunnel scheduler. The
-// scheduler itself does not poke into writeJobs (that would race with the
-// per-tunnel workers); registration just builds the set the scheduler
-// consults when other tunnels publish via b.bus.
-func (b *multiCidBatcher) registerTunnel(cid string, ts *tunnelSession, writeJobs chan awriteJob, done <-chan struct{}) {
-	b.mu.Lock()
-	if b.tunnels == nil {
-		b.tunnels = make(map[string]*batcherTunnel)
-	}
-	b.tunnels[cid] = &batcherTunnel{ts: ts, writeJobs: writeJobs, done: done}
-	b.mu.Unlock()
-}
-
-func (b *multiCidBatcher) unregisterTunnel(cid string) {
-	b.mu.Lock()
-	delete(b.tunnels, cid)
-	b.mu.Unlock()
-}
-
-// getMultiCidBatcher returns the per-resolver batcher, initializing it on
-// the first call for that resolver. Per-resolver (rather than per-process)
-// scoping lets unit tests spin up fresh agents against fresh DNS servers
-// without inheriting workers bound to a previous run's now-closed pool.
-func getMultiCidBatcher(cfg config, resolver *txtResolver) *multiCidBatcher {
-	resolver.batcherOnce.Do(func() {
-		resolver.batcher = &multiCidBatcher{
-			cfg:      cfg,
-			resolver: resolver,
-			bus:      make(chan batchedJob, 64),
-			stop:     make(chan struct{}),
-		}
-		for range axchgmMaxBatch {
-			go resolver.batcher.runWorker()
-		}
-	})
-	return resolver.batcher
-}
-
-// Stop terminates the batcher's workers. Safe to call once; subsequent
-// calls panic on close-of-closed-channel. Mainly for test cleanup so
-// goroutines don't leak across test runs and bang on closed DNS pools.
-func (b *multiCidBatcher) Stop() {
-	close(b.stop)
-}
-
-func (b *multiCidBatcher) runWorker() {
-	// Once the underlying DNS pool starts refusing connections (test cleanup
-	// or production server gone), exit instead of flooding stderr. A handful
-	// of failures is the normal cost of a transient blip; >consecutiveBatchFailExit
-	// means the resolver is dead.
-	const consecutiveBatchFailExit = 4
-	failures := 0
-	for {
-		var first batchedJob
-		select {
-		case <-b.stop:
-			return
-		case first = <-b.bus:
-		}
-		batch := []batchedJob{first}
-		timer := time.NewTimer(batchCollectWindow)
-	collect:
-		for len(batch) < axchgmMaxBatch {
-			select {
-			case j := <-b.bus:
-				batch = append(batch, j)
-			case <-timer.C:
-				break collect
-			}
-		}
-		timer.Stop()
-		if len(batch) == 1 {
-			// Single job — fall back to plain axchg to keep the read
-			// piggyback. Discard the read result; per-tunnel pure-reads
-			// will pick it up on the next poll.
-			_, err := agentExchange(b.cfg, b.resolver, first.ts, first.cid, first.seq, first.data)
-			if first.release != nil {
-				first.release()
-			}
-			if err != nil {
-				failures++
-				if failures <= consecutiveBatchFailExit {
-					fmt.Fprintf(os.Stderr, "axchgm-fallback cid=%s: %v\n", first.cid, err)
-				}
-				if failures >= consecutiveBatchFailExit {
-					return
-				}
-			} else {
-				failures = 0
-			}
-			continue
-		}
-		if err := b.runBatch(batch); err != nil {
-			failures++
-			if failures >= consecutiveBatchFailExit {
-				for _, j := range batch {
-					if j.release != nil {
-						j.release()
-					}
-				}
-				return
-			}
-		} else {
-			failures = 0
-		}
-		for _, j := range batch {
-			if j.release != nil {
-				j.release()
-			}
-		}
-	}
-}
-
-func (b *multiCidBatcher) runBatch(batch []batchedJob) error {
-	args := make([]string, 0, 2+len(batch)*5)
-	args = append(args, strconv.Itoa(len(batch)))
-	for _, j := range batch {
-		compressed := j.ts.compressor.Encode(j.data)
-		ct := gproxy.SealChunk(j.ts.aead, gproxy.DirClientToServer, j.seq, compressed)
-		enc := strings.ToLower(b32.EncodeToString(ct))
-		chunks := codec.ChunkString(enc, 63)
-		args = append(args,
-			j.cid,
-			strconv.FormatUint(j.seq, 10),
-			strconv.Itoa(len(chunks)),
-		)
-		args = append(args, chunks...)
-		args = append(args, protocol.SessionMAC(j.ts.sessionKey, "axchgm", j.seq))
-	}
-	name := protocol.JoinName(b.cfg.domain, "axchgm", args)
-	segs, err := b.resolver.queryStringsNoRetry(name)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "axchgm batch (n=%d): %v\n", len(batch), err)
-		return err
-	}
-	for i, seg := range segs {
-		if i >= len(batch) {
-			break
-		}
-		if !strings.HasPrefix(seg, "ACK ") {
-			fmt.Fprintf(os.Stderr, "axchgm cid=%s seq=%d: %s\n", batch[i].cid, batch[i].seq, seg)
-		}
-	}
-	return nil
-}
-
-const awritePipeline = 16
-
 type awriteJob struct {
-	seq     uint64
-	data    []byte
-	release func() // returns the underlying buffer to the pool; may be nil
-}
-
-// pumpUpstreamToOperator reads from upstream and pushes through awrite with
-// up to awritePipeline parallel in-flight DNS queries.
-func pumpUpstreamToOperator(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, upstream net.Conn, done <-chan struct{}) {
-	bufSize := maxAwritePlaintextBytes(cfg.domain, cfg.tcp)
-	jobs := make(chan awriteJob, awritePipeline)
-	errc := make(chan error, awritePipeline)
-
-	var wgWriters sync.WaitGroup
-	for range awritePipeline {
-		wgWriters.Add(1)
-		go func() {
-			defer wgWriters.Done()
-			for j := range jobs {
-				if err := agentWrite(cfg, resolver, ts, cid, j.seq, j.data); err != nil {
-					errc <- err
-					return
-				}
-			}
-		}()
-	}
-
-	var seq uint64
-	for {
-		select {
-		case <-done:
-			close(jobs)
-			wgWriters.Wait()
-			return
-		case err := <-errc:
-			close(jobs)
-			wgWriters.Wait()
-			fmt.Fprintf(os.Stderr, "awrite cid=%s: %v\n", cid, err)
-			return
-		default:
-		}
-		_ = upstream.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		buf := make([]byte, bufSize)
-		n, err := upstream.Read(buf)
-		if n > 0 {
-			seq++
-			select {
-			case jobs <- awriteJob{seq: seq, data: buf[:n]}:
-			case err := <-errc:
-				close(jobs)
-				wgWriters.Wait()
-				fmt.Fprintf(os.Stderr, "awrite cid=%s: %v\n", cid, err)
-				return
-			case <-done:
-				close(jobs)
-				wgWriters.Wait()
-				return
-			}
-		}
-		if err != nil {
-			if isTimeout(err) {
-				continue
-			}
-			close(jobs)
-			wgWriters.Wait()
-			return
-		}
-	}
+	seq    uint64
+	data   []byte
+	bufPtr *[]byte // pooled buffer backing `data`; PutBuf releases after use
 }
 
 // maxAwritePlaintextBytes returns the largest raw byte count we can place in

@@ -18,53 +18,55 @@ func TestBufPoolSizeClasses(t *testing.T) {
 		{bufSizeBulk + 1, bufSizeBulk + 1}, // bypass — raw alloc
 	}
 	for _, c := range cases {
-		got := GetBuf(c.req)
+		gotPtr := GetBuf(c.req)
+		got := *gotPtr
 		if len(got) != c.req {
 			t.Fatalf("GetBuf(%d) len=%d want %d", c.req, len(got), c.req)
 		}
 		if cap(got) != c.wantCap {
 			t.Fatalf("GetBuf(%d) cap=%d want %d", c.req, cap(got), c.wantCap)
 		}
-		PutBuf(got)
+		PutBuf(gotPtr)
 	}
 }
 
-// TestBufPoolReuse pins that two consecutive Get(same-class) returns the
-// same underlying array. This is the whole point of the pool — without it
-// the GC pressure reduction doesn't happen.
+// TestBufPoolReuse pins that consecutive Put → Get of the same size class
+// returns the same underlying array. Without this, the pool isn't actually
+// pooling and the GC pressure win evaporates.
 func TestBufPoolReuse(t *testing.T) {
-	a := GetBuf(1024)
-	a[0] = 0xAB
-	PutBuf(a)
-	b := GetBuf(1024)
-	defer PutBuf(b)
-	if &a[:1][0] != &b[:1][0] {
+	ap := GetBuf(1024)
+	(*ap)[0] = 0xAB
+	PutBuf(ap)
+	bp := GetBuf(1024)
+	defer PutBuf(bp)
+	if &(*ap)[0] != &(*bp)[0] {
 		t.Skip("pool re-issued a different buffer (allowed but unhelpful)")
 	}
-	if b[0] != 0xAB {
+	if (*bp)[0] != 0xAB {
 		t.Fatal("pool returned a different array than the one just put back")
 	}
 }
 
 func TestBufPoolNilSafety(t *testing.T) {
 	PutBuf(nil)
-	if got := GetBuf(0); got != nil {
-		t.Fatalf("GetBuf(0) = %v, want nil", got)
+	bp := GetBuf(0)
+	if bp == nil || len(*bp) != 0 {
+		t.Fatalf("GetBuf(0) = %v, want non-nil empty", bp)
 	}
 }
 
 func BenchmarkGetPutSmall(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		buf := GetBuf(1024)
-		PutBuf(buf)
+		bp := GetBuf(1024)
+		PutBuf(bp)
 	}
 }
 
 func BenchmarkGetPutLarge(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		buf := GetBuf(12000)
-		PutBuf(buf)
+		bp := GetBuf(12000)
+		PutBuf(bp)
 	}
 }

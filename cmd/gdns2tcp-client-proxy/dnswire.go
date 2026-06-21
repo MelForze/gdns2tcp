@@ -338,7 +338,7 @@ type tcpConnEntry struct {
 type tcpPool struct {
 	addr  string
 	conns []*tcpConnEntry
-	next  uint64 // atomic round-robin cursor
+	next  atomic.Uint64 // round-robin cursor across p.conns
 	dial  func(addr string, timeout time.Duration) (net.Conn, error)
 }
 
@@ -501,7 +501,7 @@ func (p *tcpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
 	if len(p.conns) == 0 {
 		return nil, errors.New("tcp pool empty")
 	}
-	first := int(atomic.AddUint64(&p.next, 1)-1) % len(p.conns)
+	first := int(p.next.Add(1)-1) % len(p.conns)
 	resp, err := p.conns[first].exchange(q, timeout)
 	if err == nil {
 		return resp, nil

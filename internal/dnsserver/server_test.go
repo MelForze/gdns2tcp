@@ -2139,113 +2139,70 @@ func TestSocks5NoAuthSelectBadVersion(t *testing.T) {
 	}
 }
 
-// TestProxyAgentExchangeMultiBasic covers a 2-cid axchgm batch: both writes
-// must land on the right operator socket in the right order.
-func TestProxyAgentExchangeMultiBasic(t *testing.T) {
+// TestSignalOneReaderWakesExactlyOne pins the long-poll fairness fix:
+// when N workers are parked on awaitReadData and operator writes a single
+// chunk, exactly one worker wakes up. The rest stay parked so they don't
+// fire wasted DNS round-trips. Without the fix all N would wake up,
+// drain into N concurrent axchgs, and N-1 of them would see EMPTY.
+func TestSignalOneReaderWakesExactlyOne(t *testing.T) {
 	s := proxyTestServer(t)
-	op1, opRemote1 := net.Pipe()
-	op2, opRemote2 := net.Pipe()
-	t.Cleanup(func() { _ = op1.Close(); _ = opRemote1.Close(); _ = op2.Close(); _ = opRemote2.Close() })
-	cid1, rc1, err := s.reverseEnqueueOpen("127.0.0.1:80", op1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cid2, rc2, err := s.reverseEnqueueOpen("127.0.0.1:81", op2)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	_, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.reverse.mu.Lock()
-	s.reverse.pending = nil
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
 	s.reverse.mu.Unlock()
 
-	// Drain operator pipes async so applyAxchgWrite's synchronous Write
-	// doesn't deadlock.
-	got1Ch := make(chan string, 1)
-	got2Ch := make(chan string, 1)
-	for _, drain := range []struct {
-		pipe net.Conn
-		out  chan string
-	}{{opRemote1, got1Ch}, {opRemote2, got2Ch}} {
-		drain := drain
-		go func() {
-			buf := make([]byte, 64)
-			_ = drain.pipe.SetReadDeadline(time.Now().Add(2 * time.Second))
-			n, _ := drain.pipe.Read(buf)
-			drain.out <- string(buf[:n])
-		}()
+	const N = 8
+	woke := make(chan int, N)
+	var wg sync.WaitGroup
+	for i := range N {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			// Long-poll window must outlast our signal+grace period.
+			if rc.awaitReadData(2 * time.Second) {
+				woke <- id
+			}
+		}(i)
 	}
 
-	seal := func(rc *reverseConn, seq uint64, data []byte) string {
-		ct := gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, seq, rc.compressor.Encode(data))
-		return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(ct))
+	// Give the goroutines time to park.
+	time.Sleep(50 * time.Millisecond)
+	rc.mu.Lock()
+	if got := len(rc.readWaiters); got != N {
+		rc.mu.Unlock()
+		t.Fatalf("expected %d parked waiters, got %d", N, got)
 	}
-	enc1 := seal(rc1, 1, []byte("hello-cid1"))
-	enc2 := seal(rc2, 1, []byte("hello-cid2"))
-	smac1 := protocol.SessionMAC(rc1.sessionKey, "axchgm", 1)
-	smac2 := protocol.SessionMAC(rc2.sessionKey, "axchgm", 1)
+	// Simulate "operator bytes arrived" — wake one.
+	rc.signalOneReaderLocked()
+	rc.mu.Unlock()
 
-	args := []string{"2",
-		cid1, "1", "1", enc1, smac1,
-		cid2, "1", "1", enc2, smac2,
+	// Exactly one wake should fire within a tight window. The remaining
+	// N-1 stay parked until their individual timeout (2s above).
+	select {
+	case <-woke:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("no worker woke after signalOneReaderLocked")
 	}
-	resp := s.proxyAgentExchangeMulti(args, time.Now().UTC())
-	if len(resp) != 2 || resp[0] != "ACK 1" || resp[1] != "ACK 1" {
-		t.Fatalf("expected [ACK 1, ACK 1], got %v", resp)
-	}
-	if got := <-got1Ch; got != "hello-cid1" {
-		t.Fatalf("cid1 op got %q", got)
-	}
-	if got := <-got2Ch; got != "hello-cid2" {
-		t.Fatalf("cid2 op got %q", got)
-	}
-}
 
-// TestProxyAgentExchangeMultiAuthMix: one good cid, one with a tampered MAC.
-// The good record applies, the bad one returns an Authentication failed line.
-func TestProxyAgentExchangeMultiAuthMix(t *testing.T) {
-	s := proxyTestServer(t)
-	op1, opRemote1 := net.Pipe()
-	op2, _ := net.Pipe()
-	t.Cleanup(func() { _ = op1.Close(); _ = opRemote1.Close(); _ = op2.Close() })
-	cid1, rc1, err := s.reverseEnqueueOpen("127.0.0.1:80", op1)
-	if err != nil {
-		t.Fatal(err)
+	// Confirm no second wake within the window — pin the "exactly one"
+	// semantics.
+	select {
+	case extra := <-woke:
+		t.Fatalf("expected exactly one wake, second worker (id=%d) also woke", extra)
+	case <-time.After(150 * time.Millisecond):
 	}
-	cid2, rc2, err := s.reverseEnqueueOpen("127.0.0.1:81", op2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.reverse.mu.Lock()
-	s.reverse.pending = nil
-	s.reverse.mu.Unlock()
 
-	go func() {
-		buf := make([]byte, 64)
-		_ = opRemote1.SetReadDeadline(time.Now().Add(2 * time.Second))
-		_, _ = opRemote1.Read(buf)
-	}()
-
-	enc1 := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
-		gproxy.SealChunk(rc1.aead, gproxy.DirClientToServer, 1, rc1.compressor.Encode([]byte("ok"))),
-	))
-	enc2 := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
-		gproxy.SealChunk(rc2.aead, gproxy.DirClientToServer, 1, rc2.compressor.Encode([]byte("no"))),
-	))
-	smac1 := protocol.SessionMAC(rc1.sessionKey, "axchgm", 1)
-	args := []string{"2",
-		cid1, "1", "1", enc1, smac1,
-		cid2, "1", "1", enc2, "aaaaaaaa", // bogus MAC
-	}
-	resp := s.proxyAgentExchangeMulti(args, time.Now().UTC())
-	if len(resp) != 2 {
-		t.Fatalf("expected 2 status lines, got %v", resp)
-	}
-	if resp[0] != "ACK 1" {
-		t.Fatalf("record 0: %q", resp[0])
-	}
-	if resp[1] != authFailedResponse {
-		t.Fatalf("record 1 should auth-fail, got %q", resp[1])
-	}
+	// Cleanup: close the tunnel to unblock the remaining parked workers
+	// (they'll wake via closeAllReadersLocked).
+	s.reverseCloseConn(s.cidForReverseConn(rc), rc, "test cleanup")
+	wg.Wait()
 }
 
 // TestProxyAgentExchangePureRead covers the simplest axchg path: pure read,
@@ -2422,6 +2379,77 @@ func TestProxyAgentWriteWindowedSeq(t *testing.T) {
 	}
 }
 
+// TestProxyAgentWriteDuplicateSeqNoDoubleDelivery pins the dup-write race
+// fix. Two concurrent awrite calls deliver the same seq with identical
+// ciphertext (verbatim packet replay scenario). The operator socket must
+// see the payload exactly once: the first write goes through; the second
+// finds seqAgentIn already advanced under rc.mu and fast-paths to ACK
+// without re-storing the chunk into oooWrite.
+func TestProxyAgentWriteDuplicateSeqNoDoubleDelivery(t *testing.T) {
+	s := proxyTestServer(t)
+	op, opRemote := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = opRemote.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	// Drain operator pipe so the synchronous writev inside the handler
+	// doesn't deadlock. Collect every byte that lands; we'll assert
+	// length at the end.
+	gotCh := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_ = opRemote.SetReadDeadline(time.Now().Add(2 * time.Second))
+		total := []byte{}
+		for {
+			n, err := opRemote.Read(buf)
+			if n > 0 {
+				total = append(total, buf[:n]...)
+			}
+			if err != nil {
+				break
+			}
+			if len(total) >= 5 {
+				// "first" is 5 bytes; give one extra read window to
+				// catch any spurious duplicate.
+				_ = opRemote.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			}
+		}
+		gotCh <- total
+	}()
+
+	enc := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
+		gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, 1, rc.compressor.Encode([]byte("first"))),
+	))
+	args := sessionAwriteArgs(cid, rc.sessionKey, 1, []string{enc})
+	now := time.Now().UTC()
+
+	// Fire two identical awrites in parallel. With the seqAgentIn advance
+	// race fixed, exactly one wins; the other sees seq <= seqAgentIn and
+	// returns OK without touching the operator socket.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for range 2 {
+		go func() {
+			defer wg.Done()
+			_ = s.proxyAgentWrite(args, now)
+		}()
+	}
+	wg.Wait()
+
+	_ = op.Close() // unblock the reader goroutine via EOF
+	got := <-gotCh
+	if string(got) != "first" {
+		t.Fatalf("operator got %q (len=%d); expected exactly one delivery of \"first\"", string(got), len(got))
+	}
+}
+
 // TestProxyAgentWriteWindowDeep exercises the OOO window with a longer
 // out-of-order burst (seqs 5,4,3,2,1) to pin the post-bump awriteWindow=32
 // behaviour: all five must land in order on the operator's socket once the
@@ -2492,8 +2520,8 @@ func TestProxyAgentWriteWindowExhaustion(t *testing.T) {
 	s.reverse.mu.Unlock()
 
 	// seq = window + 1 is the first illegal one: seqAgentIn is 0, the cutoff
-	// is `seqAgentIn + awriteWindow` (= 64 post-Шаг-B), so 65 must trip.
-	overSeq := uint64(65)
+	// is `seqAgentIn + awriteWindow` (= 32), so 33 must trip the rejection.
+	overSeq := uint64(33)
 	enc := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
 		gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, overSeq, rc.compressor.Encode([]byte("x"))),
 	))

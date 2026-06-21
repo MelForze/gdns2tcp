@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -18,13 +17,6 @@ type txtResolver struct {
 	timeout time.Duration
 	pool    *udpPool
 	tcpPool *tcpPool
-
-	// batcher is lazy-initialised the first time runBidirectionalTunnel
-	// calls getMultiCidBatcher with this resolver. Lifecycle is tied to
-	// the resolver so tests can spin up fresh agents without leaking
-	// goroutines bound to a previous run's DNS server.
-	batcherOnce sync.Once
-	batcher     *multiCidBatcher
 }
 
 func newTxtResolver(cfg config) *txtResolver {

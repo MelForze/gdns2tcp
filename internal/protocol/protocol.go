@@ -51,7 +51,12 @@ func VerifyAuth(secret, domain, command string, args []string, timestamp, token 
 		return false
 	}
 	current := now.UTC().Unix() / 60
-	if minute < current-1 || minute > current+1 {
+	// ±5-minute window absorbs typical NTP drift between agent and server
+	// (the previous ±1 fired any time a VPS clock skewed past 60 seconds —
+	// a common cause of "Authentication failed." spam on apoll). Replay
+	// is still bounded: per-cid session-MAC uses session-bound seq/nonce,
+	// and apoll itself doesn't mutate state — only hands out queued cids.
+	if minute < current-5 || minute > current+5 {
 		return false
 	}
 	expected := AuthToken(secret, domain, command, timestamp, args)

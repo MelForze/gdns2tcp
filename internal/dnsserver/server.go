@@ -263,8 +263,6 @@ func (s *Server) handleTXT(name, client string) []string {
 		return s.proxyAgentClose(args, now)
 	case "axchg":
 		return s.proxyAgentExchange(args, now)
-	case "axchgm":
-		return s.proxyAgentExchangeMulti(args, now)
 	case "uinit":
 		return s.uploadInit(args, now)
 	case "u":
