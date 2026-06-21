@@ -22,18 +22,18 @@ func TestAuthVerifyCurrentAndPreviousMinute(t *testing.T) {
 		t.Fatal("previous-minute token did not verify")
 	}
 
-	// Within the ±5-minute NTP-drift tolerance: should verify.
-	skewTS := CurrentTimestamp(now.Add(-4 * time.Minute))
+	// Within the ±VerifyAuthWindowMinutes (=15) NTP-drift tolerance: must verify.
+	skewTS := CurrentTimestamp(now.Add(-14 * time.Minute))
 	skewToken := AuthToken("secret", "example.test", "d", skewTS, args)
 	if !VerifyAuth("secret", "example.test", "d", args, skewTS, skewToken, now) {
-		t.Fatal("4-minute-old token did not verify (within ±5-minute window)")
+		t.Fatal("14-minute-old token did not verify (within ±15-minute window)")
 	}
 
-	// Beyond the ±5-minute window: must be rejected.
-	oldTS := CurrentTimestamp(now.Add(-6 * time.Minute))
+	// Beyond the window: must be rejected.
+	oldTS := CurrentTimestamp(now.Add(-16 * time.Minute))
 	oldToken := AuthToken("secret", "example.test", "d", oldTS, args)
 	if VerifyAuth("secret", "example.test", "d", args, oldTS, oldToken, now) {
-		t.Fatal("6-minute-old token verified (past ±5-minute window)")
+		t.Fatal("16-minute-old token verified (past ±15-minute window)")
 	}
 
 	futureTS := CurrentTimestamp(now.Add(time.Minute))
@@ -42,10 +42,10 @@ func TestAuthVerifyCurrentAndPreviousMinute(t *testing.T) {
 		t.Fatal("next-minute token not verified (clock skew tolerance)")
 	}
 
-	tooFutureTS := CurrentTimestamp(now.Add(6 * time.Minute))
+	tooFutureTS := CurrentTimestamp(now.Add(16 * time.Minute))
 	tooFutureToken := AuthToken("secret", "example.test", "d", tooFutureTS, args)
 	if VerifyAuth("secret", "example.test", "d", args, tooFutureTS, tooFutureToken, now) {
-		t.Fatal("6-minute-future token should be rejected")
+		t.Fatal("16-minute-future token should be rejected")
 	}
 }
 

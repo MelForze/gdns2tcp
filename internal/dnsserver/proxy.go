@@ -55,10 +55,11 @@ const (
 // bytes.Buffer instances back each direction.
 //
 // awriteWindow caps how far ahead the agent's awrite seq is allowed to run
-// past the next-expected one. With axchgWorkers=16 on the agent side, the
-// server needs at least equal headroom or the agent stalls; 32 absorbs one
-// round of retries too.
-const awriteWindow = 32
+// past the next-expected one. With axchgWorkers=16 on the agent side and
+// axchgRetries=3 multiplying each in-flight seq's lifetime under packet
+// loss, 64 gives enough headroom for bulk-download bursts to absorb
+// transient WAN hiccups without tripping "ERR seq".
+const awriteWindow = 64
 
 type reverseConn struct {
 	target      string // "host:port" — agent dials this
@@ -289,6 +290,14 @@ type reverseState struct {
 	agentReady   chan struct{}
 	agentReadyMu sync.Mutex // protects single close of agentReady
 	knownAgents  map[string]time.Time
+
+	// authFailLogMu + lastAuthFailLog rate-limit the diagnostic line we
+	// emit on apoll authentication failures. A misconfigured agent (wrong
+	// secret or huge clock drift) loops at ~1 apoll/sec; without rate
+	// limiting we'd flood the server log. One line per source IP per minute
+	// is enough for a human admin to notice.
+	authFailLogMu  sync.Mutex
+	lastAuthFailLog map[string]time.Time
 }
 
 func newReverseState(maxBufCap, maxConns int, watchdog time.Duration, logger interface {
@@ -312,8 +321,49 @@ func newReverseState(maxBufCap, maxConns int, watchdog time.Duration, logger int
 		logger:         logger,
 		shutdownCh:     make(chan struct{}),
 		agentReady:     make(chan struct{}),
-		knownAgents:    make(map[string]time.Time),
+		knownAgents:     make(map[string]time.Time),
+		lastAuthFailLog: make(map[string]time.Time),
 	}
+}
+
+// logApollAuthFail emits one diagnostic line per source-IP per minute when
+// an apoll fails authentication. The line tells the admin whether the
+// failure is clock drift (then "fix NTP") or a real MAC mismatch (then
+// "wrong -secret/-pass"). Without this distinction operators tend to
+// re-check the secret first — a 5-minute debugging detour — when the real
+// issue is the VPS clock has drifted.
+func (r *reverseState) logApollAuthFail(client, timestamp string, now time.Time, logger interface {
+	Printf(format string, v ...interface{})
+}) {
+	r.authFailLogMu.Lock()
+	last := r.lastAuthFailLog[client]
+	if now.Sub(last) < time.Minute {
+		r.authFailLogMu.Unlock()
+		return
+	}
+	r.lastAuthFailLog[client] = now
+	r.authFailLogMu.Unlock()
+
+	drift, ok := protocol.AuthDriftMinutes(timestamp, now)
+	if !ok {
+		logger.Printf("apoll auth fail from %s: malformed timestamp (agent corrupted query or wire-format mismatch)", client)
+		return
+	}
+	absDrift := drift
+	if absDrift < 0 {
+		absDrift = -absDrift
+	}
+	if absDrift > protocol.VerifyAuthWindowMinutes {
+		side := "agent clock is behind"
+		if drift < 0 {
+			side = "agent clock is ahead"
+		}
+		logger.Printf("apoll auth fail from %s: clock drift %+d min (window ±%d) — %s; run `sudo chronyc -a makestep` / `sudo ntpdate -u pool.ntp.org` on the side that's wrong",
+			client, drift, protocol.VerifyAuthWindowMinutes, side)
+		return
+	}
+	logger.Printf("apoll auth fail from %s: timestamp within ±%d min window so clocks are fine — check that agent's -pass matches server's -secret exactly",
+		client, protocol.VerifyAuthWindowMinutes)
 }
 
 // noteAgent records a poll from an agent IP. Returns true on the first poll
@@ -628,6 +678,7 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 	}
 	payload, ts, mac, ok := splitAuthenticatedArgs(args)
 	if !ok || !protocol.VerifyAuth(s.secret, s.authDomain, "apoll", payload, ts, mac, now) {
+		s.reverse.logApollAuthFail(client, ts, now, s.logger)
 		return []string{proxyAuthFailResponse}
 	}
 	if s.reverse.noteAgent(client) {

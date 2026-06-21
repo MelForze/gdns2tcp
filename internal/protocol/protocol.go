@@ -42,6 +42,14 @@ func AuthToken(secret, domain, command, timestamp string, args []string) string 
 	return strings.ToLower(base32NoPadding.EncodeToString(sum[:16]))
 }
 
+// VerifyAuthWindowMinutes is the clock-drift tolerance VerifyAuth accepts
+// on either side of the server's current minute. Set wide because the
+// usual failure mode is a VPS without NTP that drifts by 5–10 minutes;
+// replay is bounded for the only mutating endpoint (apoll), since apoll
+// just hands out the next queued cid and per-cid state is gated by the
+// independent session-MAC chain.
+const VerifyAuthWindowMinutes = 15
+
 func VerifyAuth(secret, domain, command string, args []string, timestamp, token string, now time.Time) bool {
 	if strings.TrimSpace(secret) == "" || strings.TrimSpace(timestamp) == "" || strings.TrimSpace(token) == "" {
 		return false
@@ -51,16 +59,26 @@ func VerifyAuth(secret, domain, command string, args []string, timestamp, token 
 		return false
 	}
 	current := now.UTC().Unix() / 60
-	// ±5-minute window absorbs typical NTP drift between agent and server
-	// (the previous ±1 fired any time a VPS clock skewed past 60 seconds —
-	// a common cause of "Authentication failed." spam on apoll). Replay
-	// is still bounded: per-cid session-MAC uses session-bound seq/nonce,
-	// and apoll itself doesn't mutate state — only hands out queued cids.
-	if minute < current-5 || minute > current+5 {
+	if minute < current-VerifyAuthWindowMinutes || minute > current+VerifyAuthWindowMinutes {
 		return false
 	}
 	expected := AuthToken(secret, domain, command, timestamp, args)
 	return hmac.Equal([]byte(expected), []byte(strings.ToLower(token)))
+}
+
+// AuthDriftMinutes returns how far the client's timestamp is from the
+// server's now, in minutes (positive if client clock is behind, negative
+// if ahead). Used by server handlers for diagnostic logging when auth
+// fails — admin can immediately tell whether the failure is clock drift
+// (-d=12 → run ntpdate) or actual MAC mismatch (-d=0 → wrong secret).
+//
+// Returns (drift, ok). ok=false if timestamp is unparseable.
+func AuthDriftMinutes(timestamp string, now time.Time) (int64, bool) {
+	minute, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return now.UTC().Unix()/60 - minute, true
 }
 
 func NewSID() (string, error) {

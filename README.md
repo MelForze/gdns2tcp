@@ -61,11 +61,12 @@ with the host running gdns2tcp. Pick one snippet below.
 `clb-` endpoint and runs 16 batches in parallel via background jobs:
 
 ```sh
-D=files.example.com S=<server-ip> B=14 P=16 sh -c '
+D=files.example.com S=<server-ip> B=14 P=16 sh <<'EOF'
 os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="$os-$a"
-q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d '"\n '); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
+NL=$(printf '\n')
+q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\"$NL "); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
 m=$(q "client-$A.$D") || exit 1
 NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
 TOTAL=$(( (N + B - 1) / B ))
@@ -86,7 +87,7 @@ base64 -d < "$F" > "$NAME" 2>/dev/null || base64 -D < "$F" > "$NAME"
 rm "$F"
 printf "%s  %s\n" "$SHA" "$NAME" | shasum -a 256 -c - || { rm -f "$NAME"; exit 1; }
 chmod +x "$NAME"; echo "saved ./$NAME"
-'
+EOF
 ```
 
 **Windows PowerShell** — requires `nslookup`. Uses TCP (`-vc`) so the larger
@@ -212,11 +213,12 @@ amd64/arm64, macOS amd64/arm64, Windows amd64/arm64 `.exe`).
 **Linux / macOS** — auto-detects OS+arch:
 
 ```sh
-D=files.example.com S=<server-ip> B=14 P=16 sh -c '
+D=files.example.com S=<server-ip> B=14 P=16 sh <<'EOF'
 os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="client-proxy-$os-$a"
-q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d '"\n '); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
+NL=$(printf '\n')
+q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\"$NL "); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
 m=$(q "client-$A.$D") || exit 1
 NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
 TOTAL=$(( (N + B - 1) / B ))
@@ -237,7 +239,7 @@ base64 -d < "$F" > "$NAME" 2>/dev/null || base64 -D < "$F" > "$NAME"
 rm "$F"
 printf "%s  %s\n" "$SHA" "$NAME" | shasum -a 256 -c - || { rm -f "$NAME"; exit 1; }
 chmod +x "$NAME"; echo "saved ./$NAME"
-'
+EOF
 ```
 
 **Windows PowerShell** — pulls `client-proxy-windows-amd64.exe` (or `arm64`):

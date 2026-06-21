@@ -268,6 +268,15 @@ func handleTunnel(cfg config, resolver *txtResolver, cid, target string) {
 // axchg command lets a single round-trip carry both.
 const axchgWorkers = 16
 
+// axchgRetries is how many times a worker retries a single axchg round-trip
+// before tearing down the tunnel. 1–5% UDP loss is normal on residential
+// and cellular WAN; without retries, a bulk download trips
+// `connection closed` mid-stream the first time a packet drops. Each retry
+// uses a fresh nonce internally — the server doesn't conflate retries with
+// replays. Safe for write-bearing exchanges because the server fast-paths
+// duplicate seqs (seq ≤ seqAgentIn → ACK without re-applying).
+const axchgRetries = 3
+
 // readReorderCap bounds the per-cid reorder buffer for op→upstream chunks.
 // Same idea as pendingCap in the old pumpOperatorToUpstream: protect against
 // a permanently-missing seq leaking memory. Matched to axchgWorkers × 4 so a
@@ -333,14 +342,33 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 					err error
 				)
 				exchangeStart := time.Now()
+				// Retry up to axchgRetries times on transient DNS failures
+				// (1–5% UDP packet loss is normal on WAN, especially on
+				// cellular and residential ISPs). Each attempt picks a fresh
+				// nonce internally, so the server's anti-replay window doesn't
+				// confuse retries with malicious replays. For write-bearing
+				// requests this is safe: the server fast-paths duplicate seqs
+				// (seq <= seqAgentIn → ACK without re-applying).
+				for attempt := 0; attempt < axchgRetries; attempt++ {
+					if haveJob {
+						res, err = agentExchange(cfg, resolver, ts, cid, job.seq, job.data)
+					} else {
+						res, err = agentExchange(cfg, resolver, ts, cid, 0, nil)
+					}
+					if err == nil {
+						break
+					}
+					if attempt < axchgRetries-1 {
+						// Light backoff so a server hiccup doesn't get
+						// hammered by 16 workers retrying in lockstep.
+						time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
+					}
+				}
 				if haveJob {
-					res, err = agentExchange(cfg, resolver, ts, cid, job.seq, job.data)
 					gproxy.PutBuf(job.bufPtr)
-				} else {
-					res, err = agentExchange(cfg, resolver, ts, cid, 0, nil)
 				}
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "axchg cid=%s: %v\n", cid, err)
+					fmt.Fprintf(os.Stderr, "axchg cid=%s (%d attempts): %v\n", cid, axchgRetries, err)
 					stopAll()
 					return
 				}

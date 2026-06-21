@@ -1567,6 +1567,98 @@ func TestReverseApollOnEmpty(t *testing.T) {
 	}
 }
 
+// TestApollAuthFailLoggingClockDrift pins that an apoll with a timestamp
+// outside the ±VerifyAuthWindowMinutes window logs a clock-drift diagnostic
+// (with sign + direction hint), not a "wrong secret" line. This is the path
+// admins hit when the VPS clock has skewed past the tolerance; an unhelpful
+// "auth fail" message would send them down the "did I typo the secret?"
+// rabbit hole instead of running ntpdate.
+func TestApollAuthFailLoggingClockDrift(t *testing.T) {
+	var logBuf syncBuf
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.Logger = log.New(&logBuf, "", 0)
+	})
+
+	// Forge an apoll with a timestamp 30 minutes in the past — well outside
+	// the ±15-minute window. The MAC will be invalid (we computed it for
+	// the wrong minute), but that's fine: we exercise the drift-detection
+	// path which fires before the MAC compare.
+	now := time.Now().UTC()
+	staleTS := protocol.CurrentTimestamp(now.Add(-30 * time.Minute))
+	staleToken := protocol.AuthToken(testSecret, s.authDomain, "apoll", staleTS, nil)
+	got := s.handleTXT(protocol.JoinName(testDomain, "apoll", []string{staleTS, staleToken}), "203.0.113.42")
+	if len(got) != 1 || got[0] != authFailedResponse {
+		t.Fatalf("expected auth-fail response, got %v", got)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "203.0.113.42") {
+		t.Fatalf("auth-fail log missing client IP: %q", out)
+	}
+	if !strings.Contains(out, "clock drift") {
+		t.Fatalf("auth-fail log missing clock drift hint: %q", out)
+	}
+	if !strings.Contains(out, "ntpdate") && !strings.Contains(out, "chrony") {
+		t.Fatalf("auth-fail log missing NTP fix hint: %q", out)
+	}
+}
+
+// TestApollAuthFailLoggingBadSecret: timestamp inside the window but MAC
+// wrong → log says "clocks are fine, check -pass" instead of clock-drift.
+func TestApollAuthFailLoggingBadSecret(t *testing.T) {
+	var logBuf syncBuf
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.Logger = log.New(&logBuf, "", 0)
+	})
+
+	now := time.Now().UTC()
+	ts := protocol.CurrentTimestamp(now)
+	wrongToken := protocol.AuthToken("WRONG_SECRET", s.authDomain, "apoll", ts, nil)
+	got := s.handleTXT(protocol.JoinName(testDomain, "apoll", []string{ts, wrongToken}), "203.0.113.43")
+	if len(got) != 1 || got[0] != authFailedResponse {
+		t.Fatalf("expected auth-fail response, got %v", got)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "203.0.113.43") {
+		t.Fatalf("auth-fail log missing client IP: %q", out)
+	}
+	if !strings.Contains(out, "clocks are fine") {
+		t.Fatalf("auth-fail log should hint at -pass mismatch, got: %q", out)
+	}
+	if strings.Contains(out, "clock drift") {
+		t.Fatalf("auth-fail log should NOT cry clock drift (timestamp is current), got: %q", out)
+	}
+}
+
+// TestApollAuthFailLogRateLimit confirms repeated fails from the same IP
+// produce one line per minute, not one per request. A misconfigured agent
+// loops at ~1 apoll/sec; without rate-limiting that's 60 identical lines/min.
+func TestApollAuthFailLogRateLimit(t *testing.T) {
+	var logBuf syncBuf
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.Logger = log.New(&logBuf, "", 0)
+	})
+
+	now := time.Now().UTC()
+	staleTS := protocol.CurrentTimestamp(now.Add(-30 * time.Minute))
+	staleToken := protocol.AuthToken(testSecret, s.authDomain, "apoll", staleTS, nil)
+	name := protocol.JoinName(testDomain, "apoll", []string{staleTS, staleToken})
+
+	// Hit the server 10× in quick succession from the same client IP.
+	for range 10 {
+		_ = s.handleTXT(name, "203.0.113.99")
+	}
+
+	lines := strings.Count(logBuf.String(), "203.0.113.99")
+	if lines != 1 {
+		t.Fatalf("expected exactly 1 log line per IP per minute, got %d", lines)
+	}
+}
+
 // TestReverseEndToEndEcho exercises the full reverse loop:
 //   1. operator connects via TCP SOCKS5 to the server (with -secret as password)
 //   2. server enqueues the target and replies with SOCKS5 success
@@ -2520,8 +2612,8 @@ func TestProxyAgentWriteWindowExhaustion(t *testing.T) {
 	s.reverse.mu.Unlock()
 
 	// seq = window + 1 is the first illegal one: seqAgentIn is 0, the cutoff
-	// is `seqAgentIn + awriteWindow` (= 32), so 33 must trip the rejection.
-	overSeq := uint64(33)
+	// is `seqAgentIn + awriteWindow` (= 64), so 65 must trip the rejection.
+	overSeq := uint64(65)
 	enc := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
 		gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, overSeq, rc.compressor.Encode([]byte("x"))),
 	))
