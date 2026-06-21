@@ -42,7 +42,7 @@ make build      # → ./gdns2tcp and ./gdns2tcp-client
 ### 2. Run the server
 
 ```sh
-sudo mkdir -p ./data && sudo ./servers/gdns2tcp-server-linux-amd64 -domain files.example.com -secret "change-me" -listen 0.0.0.0 -port 53 -data-dir ./data
+sudo ./servers/gdns2tcp-server-linux-amd64 -domain files.example.com -secret "change-me"
 ```
 
 The server listens on **both UDP and TCP** at `0.0.0.0:53` and serves
@@ -166,6 +166,137 @@ intermediate resolvers truncate large UDP responses or block UDP/53.
 
 ---
 
+## Reverse SOCKS5 — browse the agent's network
+
+The reverse mode turns gdns2tcp into a way to **see what the agent sees**: an
+internal-network machine runs `gdns2tcp-client-proxy` (the *agent*), polls
+the public server through DNS, and dials upstream services locally. Your
+host connects to `socks5://server:9050` as a normal SOCKS5 proxy — no DNS
+client involved — and traffic emerges from the agent's vantage point.
+
+```
+operator ── TCP/SOCKS5 ──> server:9050 ── DNS tunnel ──> agent ──> upstream
+(your host)                (rendezvous)                  (inside)   (target net)
+```
+
+The server holds plaintext bytes only briefly (just queueing for the next
+agent poll); the agent↔server DNS traffic is encrypted with AES-256-GCM
+keyed by `(secret, cid)`. Multiple concurrent SOCKS5 sessions are
+multiplexed via 16-hex `cid` per tunnel.
+
+### Enable on the server
+
+Add `-allow-proxy` to your server invocation. Off by default:
+
+```sh
+sudo ./servers/gdns2tcp-server-linux-amd64 -domain files.example.com -secret "change-me" -allow-proxy
+```
+
+This starts a TCP SOCKS5 listener on **`0.0.0.0:9050`**. SOCKS5
+**username/password authentication is required** (RFC 1929): username =
+`gdns2tcp`, password = the `-secret` value, so the open port is not
+actually usable without the secret.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-allow-proxy` | `false` | enable reverse SOCKS5 + agent endpoints |
+| `-socks-listen` | `0.0.0.0:9050` | TCP address for the operator-facing SOCKS5 listener |
+| `-proxy-max-conn` | `64` | global cap on concurrent tunnel connections |
+| `-proxy-buf-bytes` | `1048576` | per-tunnel buffer cap in each direction |
+
+### Fetch the agent binary over DNS
+
+The agent is distributed under `client-proxy-<os>-<arch>` aliases (Linux
+amd64/arm64, macOS amd64/arm64, Windows amd64/arm64 `.exe`).
+
+**Linux / macOS** — auto-detects OS+arch:
+
+```sh
+D=files.example.com S=<server-ip> B=14 P=16 sh -c '
+os=$(uname -s | tr A-Z a-z); a=$(uname -m)
+case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
+A="client-proxy-$os-$a"
+q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\" \n"); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
+m=$(q "client-$A.$D") || exit 1
+NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
+TOTAL=$(( (N + B - 1) / B ))
+T=$(mktemp -d); i=0; k=0
+while [ $i -lt $N ]; do
+    c=$B; [ $((i + c)) -gt $N ] && c=$((N - i))
+    (q "$i.$c.clb-$A.$D" > "$T/$k" || touch "$T/.err") &
+    i=$((i + c)); k=$((k + 1))
+    [ $((k % P)) -eq 0 ] && { wait; printf "\rfetched %d/%d batches" "$k" "$TOTAL" >&2; }
+done
+wait
+printf "\rfetched %d/%d batches\n" "$k" "$TOTAL" >&2
+[ -f "$T/.err" ] && { rm -rf "$T"; echo "fetch failed" >&2; exit 1; }
+F=$(mktemp); j=0
+while [ $j -lt $k ]; do cat "$T/$j" >> "$F"; j=$((j + 1)); done
+rm -rf "$T"
+base64 -d < "$F" > "$NAME" 2>/dev/null || base64 -D < "$F" > "$NAME"
+rm "$F"
+printf "%s  %s\n" "$SHA" "$NAME" | shasum -a 256 -c - || { rm -f "$NAME"; exit 1; }
+chmod +x "$NAME"; echo "saved ./$NAME"
+'
+```
+
+**Windows PowerShell** — pulls `client-proxy-windows-amd64.exe` (or `arm64`):
+
+```powershell
+$D="files.example.com"; $S="<server-ip>"; $B=14
+$ARCH = if ([System.Environment]::Is64BitOperatingSystem) { "amd64" } else { "arm64" }
+$A = "client-proxy-windows-$ARCH"
+function q($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
+  $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
+  if($m.Count){ return (($m | %{ $_.Groups[1].Value }) -join "") }
+  Start-Sleep -Milliseconds 400 }; throw "no TXT for $n" }
+$man=q "client-$A.$D"; $p=$man.Split('|')
+$name=$p[0]; $n=[int]$p[1]; $sha=$p[2].ToLower()
+$total = [int][Math]::Ceiling($n / $B)
+$b64=''; $i=0; $j=0
+while ($i -lt $n) {
+    $c = [Math]::Min($B, $n - $i)
+    $b64 += q "$i.$c.clb-$A.$D"
+    $i += $c; $j++
+    Write-Progress -Activity "Fetching agent" -Status "$j of $total batches" -PercentComplete ([Math]::Min(100, [Math]::Round($j * 100 / $total, 1)))
+}
+Write-Progress -Activity "Fetching agent" -Completed
+$out=Join-Path (Get-Location) $name
+[IO.File]::WriteAllBytes($out, [Convert]::FromBase64String($b64))
+if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){
+    Remove-Item $out -Force; throw "sha256 mismatch" }
+"Saved $out"
+```
+
+### Run the agent (on the internal-network machine)
+
+```sh
+# Linux / macOS
+./gdns2tcp-client-proxy-linux-amd64 -domain files.example.com -pass "change-me"
+```
+
+```powershell
+# Windows
+.\gdns2tcp-client-proxy-windows-amd64.exe -domain files.example.com -pass "change-me"
+```
+
+The agent has no flags for the SOCKS5 port — it doesn't listen at all. It
+just polls the server and dials whatever target the operator's SOCKS5
+session asks for.
+
+### Use the tunnel
+
+Point any SOCKS5 client at `<server-ip>:9050` (user `gdns2tcp`,
+password `<-secret>`); browsers and ssh's `ProxyCommand=ncat --proxy`
+both work the same way.
+
+```sh
+curl --socks5-hostname --proxy-user "gdns2tcp:change-me" \
+     socks5h://<server-ip>:9050 https://internal-service.corp/
+```
+
+---
+
 ## Reference
 
 ### Server flags
@@ -174,13 +305,17 @@ intermediate resolvers truncate large UDP responses or block UDP/53.
 |---|---|---|
 | `-domain` | *(required)* | Authoritative domain, e.g. `files.example.com` |
 | `-secret` | *(required)* | Shared secret for HMAC auth and payload encryption |
-| `-listen` | *(required)* | Listen address, e.g. `0.0.0.0` |
+| `-listen` | `0.0.0.0` | Listen address (all interfaces by default) |
 | `-port` | `53` | Listen port (UDP and TCP both bound) |
 | `-data-dir` | `.` | Directory for uploaded/downloaded files |
 | `-clients-dir` | `clients` | Directory of client artifacts served over DNS |
 | `-max-upload-bytes` | 33 MiB | Maximum protected upload payload accepted |
 | `-max-download-bytes` | 33 MiB | Maximum source file size for downloads |
 | `-disable-list` | `false` | Disable the `list` (catalog) command |
+| `-allow-proxy` | `false` | Enable reverse SOCKS5 listener + agent DNS endpoints |
+| `-socks-listen` | `0.0.0.0:9050` | TCP address for the operator-facing SOCKS5 listener |
+| `-proxy-max-conn` | `64` | Maximum concurrent tunnel connections |
+| `-proxy-buf-bytes` | 1 MiB | Per-tunnel buffer cap in each direction |
 
 ### Go client flags
 
@@ -203,23 +338,35 @@ intermediate resolvers truncate large UDP responses or block UDP/53.
 
 ### PowerShell client parameters
 
-Mirror the Go flags with PascalCase names: `-Domain`, `-Mode`, `-Pass`,
-`-DnsServer`, `-DnsPort`, `-Tcp`, `-InFile`, `-OutFile`, `-Filename`,
-`-ChunkSize`, `-Retries`, `-RetryDelaySeconds`, `-LogPath`,
-`-MaxDownloadBytes`, `-Parallelism`, `-BatchSize`.
+| Parameter | Default | Description |
+|---|---|---|
+| `-Domain` | *(required)* | Server's authoritative domain |
+| `-Mode` | *(required)* | `test`, `list`, `upload`, or `download` |
+| `-Pass` | *(required for list/upload/download)* | Shared secret (must match server) |
+| `-DnsServer` | resolves `-Domain` | DNS server IP |
+| `-DnsPort` | `53` | DNS server port |
+| `-Tcp` | `false` | Use DNS over TCP instead of UDP |
+| `-InFile` | — | Local file to upload (`-Mode upload`) |
+| `-OutFile` | — | Local destination for download (`-Mode download`) |
+| `-Filename` | — | Remote filename to download (`-Mode download`) |
+| `-ChunkSize` | `180` | Maximum encoded upload chunk size |
+| `-Retries` | `3` | DNS query attempts before failing |
+| `-RetryDelaySeconds` | `2` | Sleep between retry attempts |
+| `-LogPath` | — | Optional log file path |
+| `-Parallelism` | `32` | Concurrent DNS queries during download (1–64) |
+| `-BatchSize` | `14` | Chunks per DNS response when downloading (1–32) |
+| `-MaxDownloadBytes` | 32 MiB | Maximum decompressed download size |
 
-### DNS endpoints
+### Agent flags (`gdns2tcp-client-proxy`)
 
-Client manifests return `filename|chunk_count|sha256`:
-
-```
-client-<alias>.<domain>          manifest
-<idx>.cl-<alias>.<domain>        one chunk per query (legacy / fallback)
-<from>.<count>.clb-<alias>.<domain>   up to 14 chunks per query (preferred)
-```
-
-`<alias>` is one of `win`, `linux-amd64`, `linux-arm64`, `darwin-amd64`,
-`darwin-arm64`. These endpoints are unauthenticated by design so a new host
-can bootstrap a client without already knowing the secret. The transfer
-endpoints (`uinit`/`u` for upload, `dinit`/`d`/`db` for download, `c` for
-catalog) all require the HMAC token derived from `-secret`.
+| Flag | Default | Description |
+|---|---|---|
+| `-domain` | *(required)* | Server's authoritative domain |
+| `-pass` | *(required)* | Shared secret (must match server) |
+| `-dns-server` | resolves `-domain` | DNS server IP |
+| `-dns-port` | `53` | DNS server port |
+| `-tcp` | `false` | Use DNS over TCP instead of UDP |
+| `-poll-min` | `20ms` | Minimum `apoll`/`axchg` interval when active |
+| `-poll-max` | `200ms` | Maximum interval after consecutive idle responses |
+| `-max-conn` | `32` | Maximum concurrent local tunnels (1–512) |
+| `-retries` | `3` | DNS query attempts before failing (apoll only — `axchg` uses fresh nonces, so no retry) |

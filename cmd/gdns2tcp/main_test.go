@@ -32,14 +32,6 @@ func TestRunMissingDomain(t *testing.T) {
 	}
 }
 
-func TestRunMissingListen(t *testing.T) {
-	resetFlagCommandLine(t, "-domain=files.test", "-secret=s")
-	err := run()
-	if err == nil || !strings.Contains(err.Error(), "listen address is required") {
-		t.Fatalf("error=%v, want 'listen address is required'", err)
-	}
-}
-
 func TestRunMissingSecret(t *testing.T) {
 	resetFlagCommandLine(t, "-domain=files.test", "-listen=127.0.0.1")
 	err := run()
@@ -109,5 +101,20 @@ func TestRunListenAndServeFails(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("run() did not return within 5 s; listen address may have been accepted")
+	}
+}
+
+// TestResolveInterfaceIPv4 covers both branches of the helper: an unknown
+// interface bubbles up the OS error, a real loopback interface (which has no
+// non-loopback IPv4) hits the "no usable address" branch.
+func TestResolveInterfaceIPv4(t *testing.T) {
+	if _, err := resolveInterfaceIPv4("no-such-interface-xyzzy"); err == nil {
+		t.Fatal("expected error for unknown interface")
+	}
+	if _, err := resolveInterfaceIPv4("lo0"); err == nil {
+		// "lo0" exists on macOS, "lo" on Linux — try both shapes.
+		t.Log("lo0 unexpectedly produced a usable IPv4; that's fine if the test box has aliases")
+	} else if _, err := resolveInterfaceIPv4("lo"); err == nil {
+		t.Log("lo unexpectedly produced a usable IPv4; that's fine if the test box has aliases")
 	}
 }

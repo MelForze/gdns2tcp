@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"gdns2tcp/internal/protocol"
 )
@@ -324,6 +325,45 @@ func discoverChunkCount(t *testing.T, resolver txtResolver, domain, pass, filena
 		t.Fatalf("dinit response not a chunk count: %q", resp)
 	}
 	return n
+}
+
+// TestFormatBPS pins the three branches of the human-readable rate
+// formatter — B/s, KB/s, MB/s — so the progress-bar text stays stable.
+func TestFormatBPS(t *testing.T) {
+	cases := []struct {
+		bps  float64
+		want string
+	}{
+		{0, "0 B/s"},
+		{500, "500 B/s"},
+		{1024, "1.0 KB/s"},
+		{1536, "1.5 KB/s"},
+		{1024 * 1024, "1.0 MB/s"},
+		{2.5 * 1024 * 1024, "2.5 MB/s"},
+	}
+	for _, c := range cases {
+		if got := formatBPS(c.bps); got != c.want {
+			t.Errorf("formatBPS(%v) = %q want %q", c.bps, got, c.want)
+		}
+	}
+}
+
+// TestFormatETA covers all three branches: hours, minutes, seconds.
+func TestFormatETA(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "0s"},
+		{5 * time.Second, "5s"},
+		{90 * time.Second, "1m30s"},
+		{2*time.Hour + 5*time.Minute, "2h05m"},
+	}
+	for _, c := range cases {
+		if got := formatETA(c.d); got != c.want {
+			t.Errorf("formatETA(%v) = %q want %q", c.d, got, c.want)
+		}
+	}
 }
 
 // jsonRoundtrip is a sanity sentinel that catches drift between the on-disk

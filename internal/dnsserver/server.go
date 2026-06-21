@@ -49,7 +49,12 @@ type Config struct {
 	AllowList        bool
 	MaxUploadBytes   int64
 	MaxDownloadBytes int64
-	Logger           *log.Logger
+	AllowProxy          bool
+	SocksNoAuth         bool
+	ProxyMaxConn        int
+	ProxyBufBytes       int
+	ProxyWatchdogWindow time.Duration
+	Logger              *log.Logger
 }
 
 type ClientArtifactConfig struct {
@@ -66,6 +71,8 @@ type Server struct {
 	allowList        bool
 	maxUploadBytes   int64
 	maxDownloadBytes int64
+	allowProxy       bool
+	socksNoAuth      bool
 	logger           *log.Logger
 
 	mu        sync.Mutex
@@ -76,6 +83,7 @@ type Server struct {
 	downloadCacheOrder []string // FIFO insertion order for bounded eviction
 	clientArtifacts    map[string]clientArtifact
 	clientTransfers map[string]clientTransfer
+	reverse         *reverseState
 }
 
 type clientArtifact struct {
@@ -154,6 +162,8 @@ func New(cfg Config) (*Server, error) {
 		allowList:        cfg.AllowList,
 		maxUploadBytes:   cfg.MaxUploadBytes,
 		maxDownloadBytes: cfg.MaxDownloadBytes,
+		allowProxy:       cfg.AllowProxy,
+		socksNoAuth:      cfg.SocksNoAuth,
 		logger:           logger,
 		downloads:        make(map[string]downloadState),
 		uploads:          make(map[string]uploadState),
@@ -161,12 +171,21 @@ func New(cfg Config) (*Server, error) {
 		clientArtifacts:  make(map[string]clientArtifact),
 		clientTransfers:  make(map[string]clientTransfer),
 	}
+	if cfg.AllowProxy {
+		server.reverse = newReverseState(cfg.ProxyBufBytes, cfg.ProxyMaxConn, cfg.ProxyWatchdogWindow, logger)
+	}
 	for _, artifact := range cfg.ClientArtifacts {
 		if err := server.prepareClientArtifact(artifact); err != nil {
 			return nil, err
 		}
 	}
 	return server, nil
+}
+
+// Shutdown closes the SOCKS5 listener (if any) and tears down every live
+// proxy tunnel. Idempotent. Returns immediately if proxy is disabled.
+func (s *Server) Shutdown() {
+	s.proxyShutdown()
 }
 
 func (s *Server) Domain() string {
@@ -234,6 +253,18 @@ func (s *Server) handleTXT(name, client string) []string {
 		return s.downloadChunk(args, now)
 	case "db":
 		return s.downloadBatch(args, now)
+	case "apoll":
+		return s.proxyAgentPoll(args, now, client)
+	case "aread":
+		return s.proxyAgentRead(args, now)
+	case "awrite":
+		return s.proxyAgentWrite(args, now)
+	case "aclose":
+		return s.proxyAgentClose(args, now)
+	case "axchg":
+		return s.proxyAgentExchange(args, now)
+	case "axchgm":
+		return s.proxyAgentExchangeMulti(args, now)
 	case "uinit":
 		return s.uploadInit(args, now)
 	case "u":
@@ -819,6 +850,7 @@ func (s *Server) cleanupExpiredLocked(now time.Time) {
 		delete(s.downloads, sid)
 		s.logger.Printf("expired download %q (%s)", state.filename, sid)
 	}
+	s.proxyCleanupExpiredLocked(now)
 }
 
 func (s *Server) safePathFromFilenameLabels(labels []string) (string, string, error) {

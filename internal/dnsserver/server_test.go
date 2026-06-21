@@ -3,6 +3,8 @@ package dnsserver
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base32"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -13,12 +15,15 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"gdns2tcp/internal/codec"
 	secure "gdns2tcp/internal/crypto"
 	"gdns2tcp/internal/protocol"
+	gproxy "gdns2tcp/internal/proxy"
 
 	"github.com/miekg/dns"
 )
@@ -55,6 +60,47 @@ func signedName(command string, args []string) string {
 	labels := append([]string{}, args...)
 	labels = append(labels, ts, token)
 	return protocol.JoinName(testDomain, command, labels)
+}
+
+// sessionAreadArgs builds the [cid, nonce, ("tcp")?, smac] args slice that
+// proxyAgentRead expects after the session-MAC cutover. The MAC is keyed
+// by (cmd, nonce) so each request is replay-protected by the server's
+// per-cid sliding window.
+func sessionAreadArgs(cid string, key [32]byte, nonce uint64, tcp bool) []string {
+	args := []string{cid, strconv.FormatUint(nonce, 10)}
+	if tcp {
+		args = append(args, "tcp")
+	}
+	return append(args, protocol.SessionMAC(key, "aread", nonce))
+}
+
+// sessionAwriteArgs builds the awrite args slice. The MAC binds to (awrite,
+// seq); seq doubles as the per-cid awrite ordering key.
+func sessionAwriteArgs(cid string, key [32]byte, seq uint64, dataLabels []string) []string {
+	args := make([]string, 0, 3+len(dataLabels))
+	args = append(args, cid, strconv.FormatUint(seq, 10))
+	args = append(args, dataLabels...)
+	return append(args, protocol.SessionMAC(key, "awrite", seq))
+}
+
+func sessionAcloseArgs(cid string, key [32]byte, nonce uint64) []string {
+	return []string{
+		cid,
+		strconv.FormatUint(nonce, 10),
+		protocol.SessionMAC(key, "aclose", nonce),
+	}
+}
+
+func sessionAreadName(cid string, key [32]byte, nonce uint64, tcp bool) string {
+	return protocol.JoinName(testDomain, "aread", sessionAreadArgs(cid, key, nonce, tcp))
+}
+
+func sessionAwriteName(cid string, key [32]byte, seq uint64, dataLabels []string) string {
+	return protocol.JoinName(testDomain, "awrite", sessionAwriteArgs(cid, key, seq, dataLabels))
+}
+
+func sessionAcloseName(cid string, key [32]byte, nonce uint64) string {
+	return protocol.JoinName(testDomain, "aclose", sessionAcloseArgs(cid, key, nonce))
 }
 
 func filenameLabels(t *testing.T, name string) []string {
@@ -1411,5 +1457,1068 @@ func TestClientBatchUnknownAlias(t *testing.T) {
 	got := s.clientBatch("nonexistent", []string{"0", "4"}, "127.0.0.1")
 	if len(got) != 1 || got[0] != "Client artifact is not configured." {
 		t.Fatalf("expected not-configured response, got %v", got)
+	}
+}
+
+// ----- Proxy tests -----
+
+// proxyTestServer builds a Server with AllowProxy=true and the test secret.
+func proxyTestServer(t *testing.T) *Server {
+	t.Helper()
+	return newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.ProxyMaxConn = 4
+		cfg.ProxyBufBytes = 64 * 1024
+	})
+}
+
+// echoTCPServer spins up a TCP echo server on a free port and returns its
+// address. Calls t.Cleanup to close the listener.
+func echoTCPServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 4096)
+				for {
+					n, err := conn.Read(buf)
+					if n > 0 {
+						_, _ = conn.Write(buf[:n])
+					}
+					if err != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestReverseDisabledByDefault: with AllowProxy=false, all four agent endpoints
+// short-circuit with the disabled message before any state lookup.
+func TestReverseDisabledByDefault(t *testing.T) {
+	s := newTestServer(t) // AllowProxy stays false
+	for _, cmd := range []string{"apoll", "aread", "awrite", "aclose"} {
+		got := s.handleTXT(signedName(cmd, []string{"0123456789abcdef"}), "127.0.0.1")
+		if len(got) != 1 || got[0] != "Proxy is disabled." {
+			t.Fatalf("%s should be disabled, got %v", cmd, got)
+		}
+	}
+}
+
+// TestReverseAgentAuthFail: requests with a bogus authenticator are rejected.
+// apoll still uses per-minute HMAC; aread/awrite/aclose use the per-cid
+// session MAC. A handler-level cid lookup runs before the MAC check, so we
+// register a real cid first to reach the auth path on the read commands.
+func TestReverseAgentAuthFail(t *testing.T) {
+	s := proxyTestServer(t)
+
+	// apoll — unsigned name has no ts/token labels, AuthToken verification
+	// rejects.
+	unsignedApoll := protocol.JoinName(testDomain, "apoll", []string{"0123456789abcdef"})
+	if got := s.handleTXT(unsignedApoll, "127.0.0.1"); len(got) != 1 || got[0] != authFailedResponse {
+		t.Fatalf("apoll unsigned should auth-fail, got %v", got)
+	}
+
+	// Register a real cid so the session-MAC-bearing commands can resolve it.
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	cid, _, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const badMAC = "aaaaaaaa"
+	cases := []struct {
+		cmd  string
+		args []string
+	}{
+		{"aread", []string{cid, "1", badMAC}},
+		{"awrite", []string{cid, "1", "deadbeef", badMAC}},
+		{"aclose", []string{cid, "1", badMAC}},
+	}
+	for _, c := range cases {
+		name := protocol.JoinName(testDomain, c.cmd, c.args)
+		got := s.handleTXT(name, "127.0.0.1")
+		if len(got) != 1 || got[0] != authFailedResponse {
+			t.Fatalf("%s with bad MAC should auth-fail, got %v", c.cmd, got)
+		}
+	}
+}
+
+// TestReverseApollOnEmpty: with no pending tunnels the apoll handler returns
+// EMPTY, exercising the no-state path.
+func TestReverseApollOnEmpty(t *testing.T) {
+	s := proxyTestServer(t)
+	got := s.handleTXT(signedName("apoll", nil), "127.0.0.1")
+	if len(got) != 1 || got[0] != "EMPTY" {
+		t.Fatalf("expected EMPTY on idle apoll, got %v", got)
+	}
+}
+
+// TestReverseEndToEndEcho exercises the full reverse loop:
+//   1. operator connects via TCP SOCKS5 to the server (with -secret as password)
+//   2. server enqueues the target and replies with SOCKS5 success
+//   3. test acts as the agent: polls apoll, dials the echo server, pumps bytes
+//      back via awrite while pumping operator's bytes forward via aread
+//   4. operator sends a payload, expects it echoed
+func TestReverseEndToEndEcho(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration")
+	}
+
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.ProxyMaxConn = 4
+		cfg.ProxyBufBytes = 64 * 1024
+	})
+	upstream := echoTCPServer(t)
+
+	// Start the server's SOCKS5 listener on a random port.
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = socksLn.Close() })
+	s.reverse.mu.Lock()
+	s.reverse.socksLn = socksLn
+	s.reverse.mu.Unlock()
+	go func() {
+		for {
+			c, err := socksLn.Accept()
+			if err != nil {
+				return
+			}
+			go s.handleSOCKS5Operator(c)
+		}
+	}()
+
+	// Spin up the simulated agent goroutine. It long-polls apoll, services any
+	// OPEN by dialing upstream + bridging bytes via aread/awrite.
+	agentDone := make(chan struct{})
+	go func() {
+		defer close(agentDone)
+		for {
+			select {
+			case <-agentDone:
+				return
+			default:
+			}
+			resp := s.handleTXT(signedName("apoll", nil), "127.0.0.1")
+			if len(resp) == 0 || resp[0] == "EMPTY" {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			parts := strings.SplitN(resp[0], " ", 3)
+			if len(parts) != 3 || parts[0] != "OPEN" {
+				return
+			}
+			cid := parts[1]
+			rawTarget, _ := base32.StdEncoding.WithPadding(base32.NoPadding).
+				DecodeString(strings.ToUpper(parts[2]))
+			sessionKey := protocol.DeriveSessionKey(testSecret, cid)
+			upConn, err := net.Dial("tcp", string(rawTarget))
+			if err != nil {
+				_ = s.handleTXT(sessionAcloseName(cid, sessionKey, 1), "127.0.0.1")
+				return
+			}
+			aead, _ := gproxy.SessionAEAD(testSecret, cid)
+			go agentTunnelLoop(t, s, cid, sessionKey, aead, upConn)
+		}
+	}()
+
+	// Operator: dial SOCKS5, authenticate, request CONNECT to the upstream.
+	host, portStr, _ := net.SplitHostPort(upstream)
+	upPort, _ := strconv.Atoi(portStr)
+	op, err := net.Dial("tcp", socksLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer op.Close()
+
+	// SOCKS5 user/pass handshake.
+	if _, err := op.Write([]byte{0x05, 0x01, 0x02}); err != nil {
+		t.Fatal(err)
+	}
+	mr := make([]byte, 2)
+	if _, err := io.ReadFull(op, mr); err != nil {
+		t.Fatal(err)
+	}
+	if mr[1] != 0x02 {
+		t.Fatalf("expected method 02, got %v", mr)
+	}
+	auth := []byte{0x01, byte(len("gdns2tcp"))}
+	auth = append(auth, []byte("gdns2tcp")...)
+	auth = append(auth, byte(len(testSecret)))
+	auth = append(auth, []byte(testSecret)...)
+	if _, err := op.Write(auth); err != nil {
+		t.Fatal(err)
+	}
+	authStatus := make([]byte, 2)
+	if _, err := io.ReadFull(op, authStatus); err != nil {
+		t.Fatal(err)
+	}
+	if authStatus[1] != 0x00 {
+		t.Fatalf("auth failed: %v", authStatus)
+	}
+
+	// CONNECT request.
+	req := []byte{0x05, 0x01, 0x00, 0x01}
+	for _, b := range net.ParseIP(host).To4() {
+		req = append(req, b)
+	}
+	req = append(req, byte(upPort>>8), byte(upPort))
+	if _, err := op.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	rep := make([]byte, 10)
+	if _, err := io.ReadFull(op, rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep[1] != 0x00 {
+		t.Fatalf("connect failed: %v", rep)
+	}
+
+	// Send a payload through the tunnel; expect it back.
+	payload := []byte("hello-reverse-tunnel")
+	if _, err := op.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = op.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(op, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("echo mismatch: got %q want %q", got, payload)
+	}
+}
+
+// agentTunnelLoop simulates an agent's per-cid pumps: aread (op→agent) drains
+// into upstream TCP, and upstream→op direction is pushed via awrite.
+func agentTunnelLoop(t *testing.T, s *Server, cid string, sessionKey [32]byte, aead interface{}, up net.Conn) {
+	t.Helper()
+	compressor, err := gproxy.GetCompressor()
+	if err != nil {
+		t.Errorf("GetCompressor: %v", err)
+		return
+	}
+	var nonceCtr atomic.Uint64
+	// Inbound (op→agent → upstream) pump.
+	go func() {
+		for {
+			n := nonceCtr.Add(1)
+			resp := s.handleTXT(sessionAreadName(cid, sessionKey, n, false), "127.0.0.1")
+			if len(resp) == 0 {
+				return
+			}
+			head := resp[0]
+			if head == "EMPTY" || head == "WAIT" {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			if head == "CLOSED" {
+				_ = up.Close()
+				return
+			}
+			if !strings.HasPrefix(head, "DATA ") {
+				return
+			}
+			seq, _ := strconv.ParseUint(strings.TrimPrefix(head, "DATA "), 10, 64)
+			b64 := strings.Join(resp[1:], "")
+			ct, _ := base64.StdEncoding.DecodeString(b64)
+			plaintext, err := gproxy.OpenChunk(aead.(gproxyAEAD), gproxy.DirServerToClient, seq, ct)
+			if err != nil {
+				return
+			}
+			decompressed, err := compressor.Decode(plaintext)
+			if err != nil {
+				return
+			}
+			if _, err := up.Write(decompressed); err != nil {
+				return
+			}
+		}
+	}()
+	// Outbound (upstream → agent → op) pump.
+	buf := make([]byte, 4096)
+	var seq uint64
+	for {
+		n, err := up.Read(buf)
+		if n > 0 {
+			seq++
+			ct := gproxy.SealChunk(aead.(gproxyAEAD), gproxy.DirClientToServer, seq, compressor.Encode(buf[:n]))
+			enc := base32.StdEncoding.WithPadding(base32.NoPadding)
+			labels := codec.ChunkString(strings.ToLower(enc.EncodeToString(ct)), 63)
+			r := s.handleTXT(sessionAwriteName(cid, sessionKey, seq, labels), "127.0.0.1")
+			if len(r) != 1 || r[0] != "OK" {
+				return
+			}
+		}
+		if err != nil {
+			nonce := nonceCtr.Add(1)
+			_ = s.handleTXT(sessionAcloseName(cid, sessionKey, nonce), "127.0.0.1")
+			return
+		}
+	}
+}
+
+// gproxyAEAD is the cipher.AEAD subset the test pump needs. Avoiding a
+// crypto/cipher import here keeps the test signal-to-noise low.
+type gproxyAEAD interface {
+	NonceSize() int
+	Overhead() int
+	Seal(dst, nonce, plaintext, ad []byte) []byte
+	Open(dst, nonce, ciphertext, ad []byte) ([]byte, error)
+}
+
+// TestReverseAwriteUnknownCid covers the early-out path in awrite.
+func TestReverseAwriteUnknownCid(t *testing.T) {
+	s := proxyTestServer(t)
+	got := s.handleTXT(signedName("awrite", []string{"0000000000000000", "1", "aa"}), "127.0.0.1")
+	if len(got) != 1 || got[0] != "ERR unknown cid" {
+		t.Fatalf("expected unknown-cid, got %v", got)
+	}
+}
+
+// TestReverseAcloseIdempotent: closing twice is fine.
+func TestReverseAcloseIdempotent(t *testing.T) {
+	s := proxyTestServer(t)
+	got := s.handleTXT(signedName("aclose", []string{"0000000000000000"}), "127.0.0.1")
+	if len(got) != 1 || got[0] != "OK" {
+		t.Fatalf("aclose on unknown cid: %v", got)
+	}
+}
+
+// TestSOCKS5ReadConnectATYPVariants verifies the parser handles IPv4, IPv6
+// and domain ATYP forms equivalently.
+func TestSOCKS5ReadConnectATYPVariants(t *testing.T) {
+	build := func(atyp byte, addr []byte, port uint16) []byte {
+		req := []byte{0x05, 0x01, 0x00, atyp}
+		if atyp == 0x03 {
+			req = append(req, byte(len(addr)))
+		}
+		req = append(req, addr...)
+		req = append(req, byte(port>>8), byte(port&0xFF))
+		return req
+	}
+	cases := []struct {
+		name string
+		req  []byte
+		want string
+	}{
+		{"ipv4", build(0x01, []byte{10, 0, 0, 1}, 443), "10.0.0.1:443"},
+		{"domain", build(0x03, []byte("example.com"), 80), "example.com:80"},
+		{"ipv6", build(0x04, net.ParseIP("2001:db8::1").To16(), 8080), "[2001:db8::1]:8080"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r, w := net.Pipe()
+			go func() {
+				_, _ = w.Write(c.req)
+				_ = w.Close()
+			}()
+			got, err := socks5ReadConnect(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != c.want {
+				t.Fatalf("got %q want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestServeSOCKS5DisabledErrors when AllowProxy is off.
+func TestServeSOCKS5DisabledErrors(t *testing.T) {
+	s := newTestServer(t) // AllowProxy stays false
+	if err := s.ServeSOCKS5("127.0.0.1:0"); err == nil {
+		t.Fatal("expected error when proxy is disabled")
+	}
+}
+
+// TestServeSOCKS5BadAddress surfaces the listen failure cleanly.
+func TestServeSOCKS5BadAddress(t *testing.T) {
+	s := proxyTestServer(t)
+	if err := s.ServeSOCKS5("not-an-address"); err == nil {
+		t.Fatal("expected listen error for malformed address")
+	}
+}
+
+// TestServeSOCKS5FirstAcceptWatchdog: when nobody connects to the SOCKS5
+// listener within the watchdog window AND the bind is non-loopback, the
+// server logs a one-shot firewall-diagnostic hint.
+func TestServeSOCKS5FirstAcceptWatchdog(t *testing.T) {
+	window := 80 * time.Millisecond
+
+	// Bind to 127.0.0.1:0 so we get an ephemeral port deterministically, then
+	// rewrite the host to a non-loopback that maps to a real interface on the
+	// test box (so the watchdog isn't suppressed by the loopback short-circuit).
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	_ = probe.Close()
+
+	host := pickNonLoopbackIPv4(t)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+
+	var logBuf syncBuf
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.ProxyMaxConn = 2
+		cfg.ProxyBufBytes = 4 * 1024
+		cfg.ProxyWatchdogWindow = window
+		cfg.Logger = log.New(&logBuf, "", 0)
+	})
+	// Pre-arm the agentReady channel so ServeSOCKS5 proceeds to bind.
+	s.reverse.noteAgent("127.0.0.1:0")
+
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- s.ServeSOCKS5(addr) }()
+	t.Cleanup(func() { s.proxyShutdown(); <-serveErrCh })
+
+	// Window + slack. The watchdog logs once and returns.
+	time.Sleep(window + 300*time.Millisecond)
+
+	out := logBuf.String()
+	if !strings.Contains(out, "WARNING: no SOCKS5 connections") {
+		t.Fatalf("expected watchdog warning in logs, got:\n%s", out)
+	}
+	if !strings.Contains(out, "iptables") {
+		t.Fatalf("expected firewall-hint guidance in logs, got:\n%s", out)
+	}
+}
+
+// TestServeSOCKS5WatchdogSilentOnLoopback: when the bind host is 127.0.0.1
+// the watchdog is suppressed (loopback can't be firewall-blocked).
+func TestServeSOCKS5WatchdogSilentOnLoopback(t *testing.T) {
+	window := 50 * time.Millisecond
+
+	var logBuf syncBuf
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.ProxyMaxConn = 2
+		cfg.ProxyBufBytes = 4 * 1024
+		cfg.ProxyWatchdogWindow = window
+		cfg.Logger = log.New(&logBuf, "", 0)
+	})
+	s.reverse.noteAgent("127.0.0.1:0")
+
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- s.ServeSOCKS5("127.0.0.1:0") }()
+	t.Cleanup(func() { s.proxyShutdown(); <-serveErrCh })
+
+	time.Sleep(window + 200*time.Millisecond)
+	if strings.Contains(logBuf.String(), "WARNING: no SOCKS5 connections") {
+		t.Fatalf("watchdog should be silent on loopback bind, got:\n%s", logBuf.String())
+	}
+}
+
+// TestServeSOCKS5WatchdogSilentAfterAccept: once at least one Accept fires,
+// the watchdog must NOT warn, even when bind is non-loopback.
+func TestServeSOCKS5WatchdogSilentAfterAccept(t *testing.T) {
+	window := 200 * time.Millisecond
+
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	_ = probe.Close()
+	host := pickNonLoopbackIPv4(t)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+
+	var logBuf syncBuf
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.ProxyMaxConn = 2
+		cfg.ProxyBufBytes = 4 * 1024
+		cfg.ProxyWatchdogWindow = window
+		cfg.Logger = log.New(&logBuf, "", 0)
+	})
+	s.reverse.noteAgent("127.0.0.1:0")
+
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- s.ServeSOCKS5(addr) }()
+	t.Cleanup(func() { s.proxyShutdown(); <-serveErrCh })
+
+	// Wait a tick for the listener to be up, then make a probe Accept happen.
+	time.Sleep(40 * time.Millisecond)
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("probe dial: %v", err)
+	}
+	_ = c.Close()
+
+	time.Sleep(window + 200*time.Millisecond)
+	if strings.Contains(logBuf.String(), "WARNING: no SOCKS5 connections") {
+		t.Fatalf("watchdog should not warn after Accept fired, got:\n%s", logBuf.String())
+	}
+}
+
+// TestInterfaceNameForIPv4 covers the success + miss branches of the
+// helper that decorates the watchdog warning with an interface name.
+func TestInterfaceNameForIPv4(t *testing.T) {
+	// Miss: a malformed string returns "".
+	if got := interfaceNameForIPv4("not-an-ip"); got != "" {
+		t.Fatalf("expected miss on bad input, got %q", got)
+	}
+	// Miss: an IPv6 input returns "" (To4 is nil).
+	if got := interfaceNameForIPv4("::1"); got != "" {
+		t.Fatalf("expected miss on IPv6 input, got %q", got)
+	}
+	// Miss: an IPv4 nobody is bound to.
+	if got := interfaceNameForIPv4("203.0.113.42"); got != "" {
+		t.Fatalf("expected miss on unbound IPv4, got %q", got)
+	}
+	// Success: the IP of a real non-loopback interface on this host. Skip if
+	// the box has none (rare; e.g. a sandboxed CI runner).
+	host := pickNonLoopbackIPv4(t)
+	got := interfaceNameForIPv4(host)
+	if got == "" {
+		t.Fatalf("expected interface name for own IP %q, got empty", host)
+	}
+}
+
+// syncBuf is a tiny mutex-wrapped writer used to capture server logs across
+// goroutines without tripping -race on bytes.Buffer.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// pickNonLoopbackIPv4 finds an IPv4 bound to a non-loopback interface, or
+// skips the test if none is available (e.g. an isolated CI runner).
+func pickNonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Skipf("net.Interfaces: %v", err)
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if v4 := ipnet.IP.To4(); v4 != nil && !v4.IsLoopback() {
+				return v4.String()
+			}
+		}
+	}
+	t.Skip("no non-loopback IPv4 interface available")
+	return ""
+}
+
+// TestReverseCleanupExpiredLocked: backdates a cid's expires field and asks
+// the GC to walk; the conn should disappear.
+func TestReverseCleanupExpiredLocked(t *testing.T) {
+	s := proxyTestServer(t)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.mu.Lock()
+	rc.expires = time.Now().Add(-time.Hour)
+	rc.mu.Unlock()
+	s.proxyCleanupExpiredLocked(time.Now())
+	s.reverse.mu.Lock()
+	_, exists := s.reverse.conns[cid]
+	s.reverse.mu.Unlock()
+	if exists {
+		t.Fatal("cleanup left an idle-expired cid in the map")
+	}
+}
+
+// TestReverseSocks5AuthRejectsBadPassword exercises the user/pass auth path
+// when the password mismatches.
+func TestReverseSocks5AuthRejectsBadPassword(t *testing.T) {
+	s := proxyTestServer(t)
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = socksLn.Close() })
+	go func() {
+		c, err := socksLn.Accept()
+		if err != nil {
+			return
+		}
+		s.handleSOCKS5Operator(c)
+	}()
+
+	conn, err := net.Dial("tcp", socksLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = conn.Write([]byte{0x05, 0x01, 0x02}) // user/pass method
+	mr := make([]byte, 2)
+	_, _ = io.ReadFull(conn, mr)
+	// Submit wrong password.
+	_, _ = conn.Write([]byte{0x01, byte(len("gdns2tcp"))})
+	_, _ = conn.Write([]byte("gdns2tcp"))
+	_, _ = conn.Write([]byte{0x05, 'w', 'r', 'o', 'n', 'g'})
+	status := make([]byte, 2)
+	if _, err := io.ReadFull(conn, status); err != nil {
+		t.Fatal(err)
+	}
+	if status[1] == 0x00 {
+		t.Fatal("server accepted wrong password")
+	}
+}
+
+func TestSocks5NoAuthSelect(t *testing.T) {
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	go func() {
+		_, _ = b.Write([]byte{0x05, 0x01, 0x00})
+		resp := make([]byte, 2)
+		_, _ = io.ReadFull(b, resp)
+	}()
+	if err := socks5NoAuthSelect(a); err != nil {
+		t.Fatalf("no-auth select: %v", err)
+	}
+}
+
+func TestSocks5NoAuthSelectRejectsNoMethod(t *testing.T) {
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	go func() {
+		_, _ = b.Write([]byte{0x05, 0x01, 0x02})
+		resp := make([]byte, 2)
+		_, _ = io.ReadFull(b, resp)
+	}()
+	if err := socks5NoAuthSelect(a); err == nil {
+		t.Fatal("expected error when no-auth method not offered")
+	}
+}
+
+func TestSocks5NoAuthSelectBadVersion(t *testing.T) {
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	go func() {
+		_, _ = b.Write([]byte{0x04, 0x01, 0x00})
+	}()
+	if err := socks5NoAuthSelect(a); err == nil {
+		t.Fatal("expected error for SOCKS4 version")
+	}
+}
+
+// TestProxyAgentExchangeMultiBasic covers a 2-cid axchgm batch: both writes
+// must land on the right operator socket in the right order.
+func TestProxyAgentExchangeMultiBasic(t *testing.T) {
+	s := proxyTestServer(t)
+	op1, opRemote1 := net.Pipe()
+	op2, opRemote2 := net.Pipe()
+	t.Cleanup(func() { _ = op1.Close(); _ = opRemote1.Close(); _ = op2.Close(); _ = opRemote2.Close() })
+	cid1, rc1, err := s.reverseEnqueueOpen("127.0.0.1:80", op1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cid2, rc2, err := s.reverseEnqueueOpen("127.0.0.1:81", op2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	s.reverse.pending = nil
+	s.reverse.mu.Unlock()
+
+	// Drain operator pipes async so applyAxchgWrite's synchronous Write
+	// doesn't deadlock.
+	got1Ch := make(chan string, 1)
+	got2Ch := make(chan string, 1)
+	for _, drain := range []struct {
+		pipe net.Conn
+		out  chan string
+	}{{opRemote1, got1Ch}, {opRemote2, got2Ch}} {
+		drain := drain
+		go func() {
+			buf := make([]byte, 64)
+			_ = drain.pipe.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, _ := drain.pipe.Read(buf)
+			drain.out <- string(buf[:n])
+		}()
+	}
+
+	seal := func(rc *reverseConn, seq uint64, data []byte) string {
+		ct := gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, seq, rc.compressor.Encode(data))
+		return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(ct))
+	}
+	enc1 := seal(rc1, 1, []byte("hello-cid1"))
+	enc2 := seal(rc2, 1, []byte("hello-cid2"))
+	smac1 := protocol.SessionMAC(rc1.sessionKey, "axchgm", 1)
+	smac2 := protocol.SessionMAC(rc2.sessionKey, "axchgm", 1)
+
+	args := []string{"2",
+		cid1, "1", "1", enc1, smac1,
+		cid2, "1", "1", enc2, smac2,
+	}
+	resp := s.proxyAgentExchangeMulti(args, time.Now().UTC())
+	if len(resp) != 2 || resp[0] != "ACK 1" || resp[1] != "ACK 1" {
+		t.Fatalf("expected [ACK 1, ACK 1], got %v", resp)
+	}
+	if got := <-got1Ch; got != "hello-cid1" {
+		t.Fatalf("cid1 op got %q", got)
+	}
+	if got := <-got2Ch; got != "hello-cid2" {
+		t.Fatalf("cid2 op got %q", got)
+	}
+}
+
+// TestProxyAgentExchangeMultiAuthMix: one good cid, one with a tampered MAC.
+// The good record applies, the bad one returns an Authentication failed line.
+func TestProxyAgentExchangeMultiAuthMix(t *testing.T) {
+	s := proxyTestServer(t)
+	op1, opRemote1 := net.Pipe()
+	op2, _ := net.Pipe()
+	t.Cleanup(func() { _ = op1.Close(); _ = opRemote1.Close(); _ = op2.Close() })
+	cid1, rc1, err := s.reverseEnqueueOpen("127.0.0.1:80", op1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cid2, rc2, err := s.reverseEnqueueOpen("127.0.0.1:81", op2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	s.reverse.pending = nil
+	s.reverse.mu.Unlock()
+
+	go func() {
+		buf := make([]byte, 64)
+		_ = opRemote1.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _ = opRemote1.Read(buf)
+	}()
+
+	enc1 := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
+		gproxy.SealChunk(rc1.aead, gproxy.DirClientToServer, 1, rc1.compressor.Encode([]byte("ok"))),
+	))
+	enc2 := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
+		gproxy.SealChunk(rc2.aead, gproxy.DirClientToServer, 1, rc2.compressor.Encode([]byte("no"))),
+	))
+	smac1 := protocol.SessionMAC(rc1.sessionKey, "axchgm", 1)
+	args := []string{"2",
+		cid1, "1", "1", enc1, smac1,
+		cid2, "1", "1", enc2, "aaaaaaaa", // bogus MAC
+	}
+	resp := s.proxyAgentExchangeMulti(args, time.Now().UTC())
+	if len(resp) != 2 {
+		t.Fatalf("expected 2 status lines, got %v", resp)
+	}
+	if resp[0] != "ACK 1" {
+		t.Fatalf("record 0: %q", resp[0])
+	}
+	if resp[1] != authFailedResponse {
+		t.Fatalf("record 1 should auth-fail, got %q", resp[1])
+	}
+}
+
+// TestProxyAgentExchangePureRead covers the simplest axchg path: pure read,
+// no write. The server should return ACK 0 + EMPTY.
+func TestProxyAgentExchangePureRead(t *testing.T) {
+	s := proxyTestServer(t)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	nonce := uint64(1)
+	smac := protocol.SessionMAC(rc.sessionKey, "axchg", nonce)
+	args := []string{cid, "0", strconv.FormatUint(nonce, 10), smac}
+	resp := s.proxyAgentExchange(args, time.Now().UTC())
+	if len(resp) < 2 || resp[0] != "ACK 0" || resp[1] != "EMPTY" {
+		t.Fatalf("expected [ACK 0, EMPTY], got %v", resp)
+	}
+}
+
+// TestProxyAgentExchangeWriteAndRead exercises the full duplex code path:
+// one chunk going upstream→operator, one chunk coming op→upstream. Both
+// directions must complete in a single DNS round-trip's worth of args.
+func TestProxyAgentExchangeWriteAndRead(t *testing.T) {
+	s := proxyTestServer(t)
+	op, opRemote := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = opRemote.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	// Seed op→agent buffer so the read side has something to return.
+	rc.mu.Lock()
+	rc.opToAgent.Write([]byte("op-side-bytes"))
+	rc.mu.Unlock()
+
+	// Write-side chunk: seal "agent-bytes" as seq=1.
+	seal := func(seq uint64, data []byte) string {
+		ct := gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, seq, rc.compressor.Encode(data))
+		return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(ct))
+	}
+	enc1 := seal(1, []byte("agent-bytes"))
+
+	// applyAxchgWrite synchronously calls operator.Write, so the pipe reader
+	// has to drain on a goroutine — otherwise proxyAgentExchange blocks
+	// forever on net.Pipe's "wait for reader" semantics.
+	gotCh := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 32)
+		_ = opRemote.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _ := opRemote.Read(buf)
+		gotCh <- string(buf[:n])
+	}()
+
+	nonce := uint64(1)
+	smac := protocol.SessionMAC(rc.sessionKey, "axchg", nonce)
+	args := []string{cid, "1", enc1, strconv.FormatUint(nonce, 10), smac}
+	resp := s.proxyAgentExchange(args, time.Now().UTC())
+	if len(resp) < 2 {
+		t.Fatalf("expected at least 2 segs, got %v", resp)
+	}
+	if resp[0] != "ACK 1" {
+		t.Fatalf("expected ACK 1, got %v", resp)
+	}
+	if !strings.HasPrefix(resp[1], "DATA ") {
+		t.Fatalf("expected DATA, got %v", resp[1:])
+	}
+
+	if got := <-gotCh; got != "agent-bytes" {
+		t.Fatalf("operator got %q want %q", got, "agent-bytes")
+	}
+}
+
+func TestProxyAgentReadWAIT(t *testing.T) {
+	s := proxyTestServer(t)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	now := time.Now().UTC()
+	resp := s.proxyAgentRead(sessionAreadArgs(cid, rc.sessionKey, 1, false), now)
+	if len(resp) == 0 || resp[0] != "WAIT" {
+		t.Fatalf("expected WAIT, got %v", resp)
+	}
+}
+
+func TestProxyAgentReadTCPHint(t *testing.T) {
+	s := proxyTestServer(t)
+	op, opRemote := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = opRemote.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	rc.mu.Lock()
+	rc.opToAgent.Write(bytes.Repeat([]byte("x"), 4000))
+	rc.mu.Unlock()
+
+	now := time.Now().UTC()
+	resp := s.proxyAgentRead(sessionAreadArgs(cid, rc.sessionKey, 1, true), now)
+	if len(resp) < 2 || !strings.HasPrefix(resp[0], "DATA ") {
+		t.Fatalf("expected DATA, got %v", resp)
+	}
+}
+
+func TestProxyAgentWriteWindowedSeq(t *testing.T) {
+	s := proxyTestServer(t)
+	op, opRemote := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = opRemote.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	seal := func(seq uint64, data []byte) string {
+		ct := gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, seq, rc.compressor.Encode(data))
+		return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(ct))
+	}
+
+	now := time.Now().UTC()
+	enc2 := seal(2, []byte("second"))
+	resp2 := s.proxyAgentWrite(sessionAwriteArgs(cid, rc.sessionKey, 2, []string{enc2}), now)
+	if resp2[0] != "OK" {
+		t.Fatalf("seq 2 out-of-order: got %v", resp2)
+	}
+
+	enc1 := seal(1, []byte("first"))
+	go func() {
+		_ = s.proxyAgentWrite(sessionAwriteArgs(cid, rc.sessionKey, 1, []string{enc1}), now)
+	}()
+
+	buf := make([]byte, 20)
+	n, _ := opRemote.Read(buf)
+	got := string(buf[:n])
+	if got != "first" {
+		t.Fatalf("expected 'first', got %q", got)
+	}
+	n, _ = opRemote.Read(buf)
+	got = string(buf[:n])
+	if got != "second" {
+		t.Fatalf("expected 'second', got %q", got)
+	}
+}
+
+// TestProxyAgentWriteWindowDeep exercises the OOO window with a longer
+// out-of-order burst (seqs 5,4,3,2,1) to pin the post-bump awriteWindow=32
+// behaviour: all five must land in order on the operator's socket once the
+// head of the window arrives.
+func TestProxyAgentWriteWindowDeep(t *testing.T) {
+	s := proxyTestServer(t)
+	op, opRemote := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = opRemote.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	seal := func(seq uint64, data []byte) string {
+		ct := gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, seq, rc.compressor.Encode(data))
+		return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(ct))
+	}
+
+	now := time.Now().UTC()
+	chunks := []string{"", "first", "second", "third", "fourth", "fifth"}
+
+	// Push seq 5..2 first; each is buffered in oooWrite because seqAgentIn=0.
+	for _, seq := range []uint64{5, 4, 3, 2} {
+		enc := seal(seq, []byte(chunks[seq]))
+		resp := s.proxyAgentWrite(sessionAwriteArgs(cid, rc.sessionKey, seq, []string{enc}), now)
+		if resp[0] != "OK" {
+			t.Fatalf("seq %d should be queued, got %v", seq, resp)
+		}
+	}
+
+	// Submit seq 1 in the background; the handler drains all five in order.
+	enc1 := seal(1, []byte(chunks[1]))
+	go func() { _ = s.proxyAgentWrite(sessionAwriteArgs(cid, rc.sessionKey, 1, []string{enc1}), now) }()
+
+	for _, want := range chunks[1:] {
+		buf := make([]byte, 32)
+		_ = opRemote.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := opRemote.Read(buf)
+		if err != nil {
+			t.Fatalf("read %q: %v", want, err)
+		}
+		if got := string(buf[:n]); got != want {
+			t.Fatalf("expected %q, got %q", want, got)
+		}
+	}
+}
+
+// TestProxyAgentWriteWindowExhaustion: a seq past `awriteWindow + seqAgentIn`
+// must be rejected with `ERR seq`. Pins the upper bound now that the window
+// has grown to 32 — beyond it, the server still pushes back.
+func TestProxyAgentWriteWindowExhaustion(t *testing.T) {
+	s := proxyTestServer(t)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	// seq = window + 1 is the first illegal one: seqAgentIn is 0, the cutoff
+	// is `seqAgentIn + awriteWindow` (= 64 post-Шаг-B), so 65 must trip.
+	overSeq := uint64(65)
+	enc := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
+		gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, overSeq, rc.compressor.Encode([]byte("x"))),
+	))
+	now := time.Now().UTC()
+	resp := s.proxyAgentWrite(sessionAwriteArgs(cid, rc.sessionKey, overSeq, []string{enc}), now)
+	if len(resp) != 1 || resp[0] != "ERR seq" {
+		t.Fatalf("expected ERR seq for seq=%d > window, got %v", overSeq, resp)
+	}
+}
+
+// TestReverseShutdown closes every live cid + the SOCKS5 listener so the
+// outer process can exit cleanly.
+func TestReverseShutdown(t *testing.T) {
+	s := proxyTestServer(t)
+	// Enqueue one tunnel directly so there is state to clean up.
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	_, _, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.proxyShutdown()
+	s.reverse.mu.Lock()
+	defer s.reverse.mu.Unlock()
+	if len(s.reverse.conns) != 0 {
+		t.Fatalf("shutdown left %d conns", len(s.reverse.conns))
 	}
 }
