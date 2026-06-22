@@ -3,8 +3,10 @@ package dnsserver
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -1404,30 +1406,46 @@ func newClientArtifactServer(t *testing.T) (*Server, int) {
 
 // TestClientBatchEqualsPerChunk: clb-<alias> returns the same chunks (in
 // order) as a sequence of cl-<alias> queries — for both an interior batch and
-// the last partial batch at the end of the artifact.
+// the last partial batch at the end of the artifact. The first character
+// string is the per-batch SHA-256 digest of the concatenated chunks; the
+// bootstrap script uses it to verify each batch before accepting it.
 func TestClientBatchEqualsPerChunk(t *testing.T) {
 	s, total := newClientArtifactServer(t)
 
 	from, batchSize := 4, 9
 	batch := s.clientBatch("win", []string{strconv.Itoa(from), strconv.Itoa(batchSize)}, "127.0.0.1")
-	if len(batch) != batchSize {
-		t.Fatalf("interior batch returned %d strings, want %d", len(batch), batchSize)
+	if len(batch) != batchSize+1 {
+		t.Fatalf("interior batch returned %d strings, want %d (sha + %d chunks)", len(batch), batchSize+1, batchSize)
+	}
+	if !strings.HasPrefix(batch[0], "s:") {
+		t.Fatalf("interior batch missing s:<sha> prefix; got %q", batch[0])
+	}
+	expectedSum := sha256.Sum256([]byte(strings.Join(batch[1:], "")))
+	if batch[0] != "s:"+hex.EncodeToString(expectedSum[:]) {
+		t.Fatalf("interior batch sha mismatch: got %q, want s:%x", batch[0], expectedSum)
 	}
 	for i := 0; i < batchSize; i++ {
 		got := s.clientChunk("win", []string{strconv.Itoa(from + i)}, "127.0.0.1")
-		if len(got) != 1 || got[0] != batch[i] {
-			t.Fatalf("chunk %d: batch=%q want %q", from+i, batch[i], got)
+		if len(got) != 1 || got[0] != batch[i+1] {
+			t.Fatalf("chunk %d: batch=%q want %q", from+i, batch[i+1], got)
 		}
 	}
 
 	tail := s.clientBatch("win", []string{strconv.Itoa(total - 3), "16"}, "127.0.0.1")
-	if len(tail) != 3 {
-		t.Fatalf("partial batch returned %d strings, want 3", len(tail))
+	if len(tail) != 4 {
+		t.Fatalf("partial batch returned %d strings, want 4 (sha + 3 chunks)", len(tail))
+	}
+	if !strings.HasPrefix(tail[0], "s:") {
+		t.Fatalf("tail batch missing s:<sha> prefix; got %q", tail[0])
+	}
+	tailSum := sha256.Sum256([]byte(strings.Join(tail[1:], "")))
+	if tail[0] != "s:"+hex.EncodeToString(tailSum[:]) {
+		t.Fatalf("tail batch sha mismatch: got %q, want s:%x", tail[0], tailSum)
 	}
 	for i := 0; i < 3; i++ {
 		got := s.clientChunk("win", []string{strconv.Itoa(total - 3 + i)}, "127.0.0.1")
-		if len(got) != 1 || got[0] != tail[i] {
-			t.Fatalf("tail chunk %d: batch=%q want %q", total-3+i, tail[i], got)
+		if len(got) != 1 || got[0] != tail[i+1] {
+			t.Fatalf("tail chunk %d: batch=%q want %q", total-3+i, tail[i+1], got)
 		}
 	}
 }

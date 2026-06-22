@@ -66,14 +66,37 @@ os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="$os-$a"
 NL=$(printf '\n')
-q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\"$NL "); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
-m=$(q "client-$A.$D") || exit 1
+# +tcp avoids UDP truncation / packet loss. qm fetches the manifest record
+# (no per-batch SHA, just `filename|N|sha256`). qb fetches a clb-* batch
+# and verifies the server-provided per-batch SHA before accepting it;
+# transient corruption is caught immediately, not after thousands of
+# batches have been downloaded.
+qm(){ for i in 1 2 3 4 5; do
+        o=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d "\"$NL ")
+        [ -n "$o" ] && { printf %s "$o"; return; }
+        sleep 0.4
+    done
+    echo "no TXT for $1" >&2; return 1
+}
+qb(){ for i in 1 2 3 4 5; do
+        raw=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d \" | tr "$NL" ' ')
+        s=$(printf %s "$raw" | awk '{print $1}')
+        d=$(printf %s "$raw" | awk '{for(i=2;i<=NF;i++) printf "%s",$i}')
+        if [ -n "$s" ] && [ -n "$d" ] && [ "${s%${s#s:}}" = "s:" ]; then
+            actual=$(printf %s "$d" | sha256sum | awk '{print $1}')
+            if [ "${s#s:}" = "$actual" ]; then printf %s "$d"; return; fi
+        fi
+        sleep 0.4
+    done
+    echo "batch verify failed for $1" >&2; return 1
+}
+m=$(qm "client-$A.$D") || exit 1
 NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
 TOTAL=$(( (N + B - 1) / B ))
 T=$(mktemp -d); i=0; k=0
 while [ $i -lt $N ]; do
     c=$B; [ $((i + c)) -gt $N ] && c=$((N - i))
-    (q "$i.$c.clb-$A.$D" > "$T/$k" || touch "$T/.err") &
+    (qb "$i.$c.clb-$A.$D" > "$T/$k" || touch "$T/.err") &
     i=$((i + c)); k=$((k + 1))
     [ $((k % P)) -eq 0 ] && { wait; printf "\rfetched %d/%d batches" "$k" "$TOTAL" >&2; }
 done
@@ -95,17 +118,30 @@ batched responses are not capped by Windows' default 512-byte UDP DNS buffer:
 
 ```powershell
 $D="files.example.com"; $S="<server-ip>"; $B=14
-function q($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
+# qm fetches the manifest (no per-batch SHA, just `name|N|sha`).
+# qb fetches a clb-* batch and verifies the server-provided per-batch SHA
+# before accepting it — single-batch corruption is caught immediately.
+function qm($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
   $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
   if($m.Count){ return (($m | %{ $_.Groups[1].Value }) -join "") }
   Start-Sleep -Milliseconds 400 }; throw "no TXT for $n" }
-$man=q "client-win.$D"; $p=$man.Split('|')
+function qb($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
+  $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
+  if($m.Count -ge 2 -and $m[0].Groups[1].Value.StartsWith("s:")){
+    $expected = $m[0].Groups[1].Value.Substring(2).ToLower()
+    $data = ($m | Select-Object -Skip 1 | %{ $_.Groups[1].Value }) -join ""
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($data)
+    $actual = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | %{ "{0:x2}" -f $_ })
+    if($expected -eq $actual){ return $data }
+  }
+  Start-Sleep -Milliseconds 400 }; throw "batch verify failed for $n" }
+$man=qm "client-win.$D"; $p=$man.Split('|')
 $name=$p[0]; $n=[int]$p[1]; $sha=$p[2].ToLower()
 $total = [int][Math]::Ceiling($n / $B)
 $b64=''; $i=0; $j=0
 while ($i -lt $n) {
     $c = [Math]::Min($B, $n - $i)
-    $b64 += q "$i.$c.clb-win.$D"
+    $b64 += qb "$i.$c.clb-win.$D"
     $i += $c; $j++
     Write-Progress -Activity "Fetching client" -Status "$j of $total batches" -PercentComplete ([Math]::Min(100, [Math]::Round($j * 100 / $total, 1)))
 }
@@ -218,14 +254,37 @@ os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="client-proxy-$os-$a"
 NL=$(printf '\n')
-q(){ for i in 1 2 3 4 5; do o=$(dig +short +time=5 +tries=1 @$S "$1" TXT | tr -d "\"$NL "); [ -n "$o" ] && { printf %s "$o"; return; }; sleep 0.4; done; echo "no TXT for $1" >&2; return 1; }
-m=$(q "client-$A.$D") || exit 1
+# +tcp avoids UDP truncation / packet loss. qm fetches the manifest record
+# (no per-batch SHA, just `filename|N|sha256`). qb fetches a clb-* batch
+# and verifies the server-provided per-batch SHA before accepting it;
+# transient corruption is caught immediately, not after thousands of
+# batches have been downloaded.
+qm(){ for i in 1 2 3 4 5; do
+        o=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d "\"$NL ")
+        [ -n "$o" ] && { printf %s "$o"; return; }
+        sleep 0.4
+    done
+    echo "no TXT for $1" >&2; return 1
+}
+qb(){ for i in 1 2 3 4 5; do
+        raw=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d \" | tr "$NL" ' ')
+        s=$(printf %s "$raw" | awk '{print $1}')
+        d=$(printf %s "$raw" | awk '{for(i=2;i<=NF;i++) printf "%s",$i}')
+        if [ -n "$s" ] && [ -n "$d" ] && [ "${s%${s#s:}}" = "s:" ]; then
+            actual=$(printf %s "$d" | sha256sum | awk '{print $1}')
+            if [ "${s#s:}" = "$actual" ]; then printf %s "$d"; return; fi
+        fi
+        sleep 0.4
+    done
+    echo "batch verify failed for $1" >&2; return 1
+}
+m=$(qm "client-$A.$D") || exit 1
 NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
 TOTAL=$(( (N + B - 1) / B ))
 T=$(mktemp -d); i=0; k=0
 while [ $i -lt $N ]; do
     c=$B; [ $((i + c)) -gt $N ] && c=$((N - i))
-    (q "$i.$c.clb-$A.$D" > "$T/$k" || touch "$T/.err") &
+    (qb "$i.$c.clb-$A.$D" > "$T/$k" || touch "$T/.err") &
     i=$((i + c)); k=$((k + 1))
     [ $((k % P)) -eq 0 ] && { wait; printf "\rfetched %d/%d batches" "$k" "$TOTAL" >&2; }
 done
@@ -248,17 +307,29 @@ EOF
 $D="files.example.com"; $S="<server-ip>"; $B=14
 $ARCH = if ([System.Environment]::Is64BitOperatingSystem) { "amd64" } else { "arm64" }
 $A = "client-proxy-windows-$ARCH"
-function q($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
+# qm fetches the manifest (no per-batch SHA). qb fetches a clb-* batch
+# and verifies the server-provided per-batch SHA before accepting it.
+function qm($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
   $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
   if($m.Count){ return (($m | %{ $_.Groups[1].Value }) -join "") }
   Start-Sleep -Milliseconds 400 }; throw "no TXT for $n" }
-$man=q "client-$A.$D"; $p=$man.Split('|')
+function qb($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
+  $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
+  if($m.Count -ge 2 -and $m[0].Groups[1].Value.StartsWith("s:")){
+    $expected = $m[0].Groups[1].Value.Substring(2).ToLower()
+    $data = ($m | Select-Object -Skip 1 | %{ $_.Groups[1].Value }) -join ""
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($data)
+    $actual = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | %{ "{0:x2}" -f $_ })
+    if($expected -eq $actual){ return $data }
+  }
+  Start-Sleep -Milliseconds 400 }; throw "batch verify failed for $n" }
+$man=qm "client-$A.$D"; $p=$man.Split('|')
 $name=$p[0]; $n=[int]$p[1]; $sha=$p[2].ToLower()
 $total = [int][Math]::Ceiling($n / $B)
 $b64=''; $i=0; $j=0
 while ($i -lt $n) {
     $c = [Math]::Min($B, $n - $i)
-    $b64 += q "$i.$c.clb-$A.$D"
+    $b64 += qb "$i.$c.clb-$A.$D"
     $i += $c; $j++
     Write-Progress -Activity "Fetching agent" -Status "$j of $total batches" -PercentComplete ([Math]::Min(100, [Math]::Round($j * 100 / $total, 1)))
 }

@@ -761,6 +761,13 @@ func (s *Server) clientChunk(alias string, args []string, client string) []strin
 // character-strings, which the bootstrap script concatenates as-is. Like
 // clientChunk it is unauthenticated by design (the artifact endpoints are how
 // a fresh host obtains a client before it has the shared secret).
+//
+// The first character-string in the response is a per-batch SHA-256 digest
+// of the concatenated base64 chunks, prefixed with `s:`. The bootstrap
+// script verifies this digest before accepting the batch; that lets a
+// single UDP-truncated or middlebox-mangled batch be detected and retried
+// immediately, instead of surfacing as a final-file SHA mismatch only
+// after thousands of batches have already been downloaded.
 func (s *Server) clientBatch(alias string, args []string, client string) []string {
 	artifact, ok := s.clientArtifacts[alias]
 	if !ok || len(artifact.chunks) == 0 {
@@ -790,7 +797,12 @@ func (s *Server) clientBatch(alias string, args []string, client string) []strin
 		s.logClientArtifactProgress(client, alias, artifact, i)
 	}
 	s.mu.Unlock()
-	return append([]string(nil), artifact.chunks[from:end]...)
+	chunks := artifact.chunks[from:end]
+	sum := sha256.Sum256([]byte(strings.Join(chunks, "")))
+	out := make([]string, 0, len(chunks)+1)
+	out = append(out, "s:"+hex.EncodeToString(sum[:]))
+	out = append(out, chunks...)
+	return out
 }
 
 func (s *Server) logClientArtifactProgress(client, alias string, artifact clientArtifact, index int) {
