@@ -297,6 +297,43 @@ curl --socks5-hostname --proxy-user "gdns2tcp:change-me" \
      socks5h://<server-ip>:9050 https://internal-service.corp/
 ```
 
+### Throughput limits
+
+The proxy is fundamentally throughput-limited by the DNS wire format. Each
+`awrite` chunk goes inside a single DNS query name (RFC 1035 caps QNAME at
+253 chars total), which after the `cid . seq . chunks . smac . cmd .
+domain` overhead leaves ~96 bytes of plaintext per round-trip. This limit
+applies to **both UDP and TCP DNS transports** — the QNAME ceiling is part
+of the DNS message format, not the transport layer.
+
+At 30 ms RTT × 16 parallel workers the theoretical ceiling is ~50 KB/s on
+write-heavy direction (operator→upstream); in practice expect **20–30 KB/s**
+on a typical WAN. Aggregate download speed through the proxy will not
+significantly exceed this regardless of transport.
+
+#### What `-tcp` actually changes
+
+`-tcp` swaps the agent's DNS transport from UDP to TCP. This helps only on
+**responses** (server→agent): `MaxReadBytesTCP=48000` vs `MaxReadBytes=5600`
+on UDP. That lifts the **read-heavy direction** (upstream→operator pulls,
+e.g. file uploads through the proxy) by ~8×.
+
+| Direction | Bottleneck | UDP | TCP |
+|---|---|---|---|
+| operator→upstream (write to remote via proxy) | response size | 30 KB/s | **~240 KB/s** |
+| upstream→operator (response body, download) | QNAME 253-char limit | 30 KB/s | 30 KB/s (same) |
+| interactive (SSH keystrokes) | RTT, not throughput | ~RTT | ~RTT |
+| port-scan | many small queries | better (UDP mux) | worse (TCP HoL) |
+
+**Rule of thumb:**
+- Bulk **upload** through the proxy → `-tcp` helps a lot.
+- Bulk **download** through the proxy → roughly the same on either transport (QNAME-bound).
+- SSH, REPL, port-scan → UDP is the right default.
+
+If you need real bulk download speed through this tunnel, the DNS protocol
+isn't the right transport for that workload — that's the cost of using DNS
+as the only allowed channel.
+
 ---
 
 ## Reference

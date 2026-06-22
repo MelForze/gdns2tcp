@@ -2,7 +2,6 @@ package dnsserver
 
 import (
 	"bytes"
-	"context"
 	"crypto/cipher"
 	"encoding/base32"
 	"encoding/base64"
@@ -73,7 +72,6 @@ type reverseConn struct {
 	// held only across the syscall — drain itself runs under rc.mu.
 	writeMu sync.Mutex
 	opToAgent   bytes.Buffer
-	agentToOp   bytes.Buffer
 	opCond      *sync.Cond
 	seqAgentIn  uint64 // last contiguously written awrite seq
 	seqOpToA    uint64 // next aread seq to issue
@@ -218,8 +216,8 @@ func (rc *reverseConn) awaitReadData(window time.Duration) bool {
 	case <-ch:
 		return true
 	case <-timer.C:
-		// Best-effort de-registration; if signalReadersLocked already
-		// fired we'll harmlessly remove a closed channel.
+		// Best-effort de-registration; if a signal already fired we'll
+		// harmlessly remove a closed channel.
 		rc.mu.Lock()
 		for i, w := range rc.readWaiters {
 			if w == ch {
@@ -1369,5 +1367,3 @@ func tuneTCPConn(c net.Conn) {
 	_ = tc.SetKeepAlivePeriod(30 * time.Second)
 }
 
-// Suppress unused import warning when reverseListenContext is removed.
-var _ = context.Background

@@ -13,7 +13,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"strconv"
@@ -541,10 +540,15 @@ type awriteJob struct {
 //
 // Post session-MAC cutover: the old (ts=8, token=26) labels are gone, freeing
 // 26 query chars ≈ +16 bytes plaintext. UDP awrite went from ~76 to ~92.
+//
+// IMPORTANT: the same per-query plaintext budget applies to UDP and TCP. The
+// DNS QNAME 253-char ceiling (RFC 1035) is a wire-format constraint of the
+// DNS message itself, not of the transport. The `tcp` parameter is kept for
+// readability of call sites but doesn't change the result. -tcp helps only
+// on the *response* side (MaxReadBytesTCP allows much larger TXT records);
+// query-name capacity is identical.
 func maxAwritePlaintextBytes(domain string, tcp bool) int {
-	if tcp {
-		return 4000
-	}
+	_ = tcp
 	const (
 		dnsNameMax  = 253
 		cidLabel    = 16
@@ -608,85 +612,6 @@ func agentPoll(cfg config, resolver *txtResolver) (cid, target string, err error
 		return "", "", fmt.Errorf("decode target: %w", err)
 	}
 	return cid, string(rawTarget), nil
-}
-
-// agentRead asks the server for the next op→agent chunk for cid. The returned
-// seq is server-assigned and monotonic per-cid; pumpOperatorToUpstream uses
-// it to reorder concurrent in-flight reads before writing to upstream.
-//
-// Wire: cid . nonce . ["tcp"] . smac . aread . domain
-func agentRead(cfg config, resolver *txtResolver, ts *tunnelSession, cid string) (data []byte, seq uint64, closed bool, wait bool, err error) {
-	nonce := ts.nextNonce()
-	args := []string{cid, strconv.FormatUint(nonce, 10)}
-	if cfg.tcp {
-		args = append(args, "tcp")
-	}
-	args = append(args, protocol.SessionMAC(ts.sessionKey, "aread", nonce))
-	name := protocol.JoinName(cfg.domain, "aread", args)
-	segs, err := resolver.queryStrings(name)
-	if err != nil {
-		return nil, 0, false, false, err
-	}
-	if len(segs) == 0 {
-		return nil, 0, false, false, errors.New("empty aread response")
-	}
-	head := segs[0]
-	switch {
-	case head == "EMPTY":
-		return nil, 0, false, false, nil
-	case head == "WAIT":
-		return nil, 0, false, true, nil
-	case head == "CLOSED":
-		return nil, 0, true, false, nil
-	case strings.HasPrefix(head, "ERR "):
-		return nil, 0, false, false, errors.New(head)
-	case strings.HasPrefix(head, "DATA "):
-		parsedSeq, perr := strconv.ParseUint(strings.TrimPrefix(head, "DATA "), 10, 64)
-		if perr != nil {
-			return nil, 0, false, false, fmt.Errorf("malformed DATA seq: %w", perr)
-		}
-		b64 := strings.Join(segs[1:], "")
-		ct, err := base64.StdEncoding.DecodeString(b64)
-		if err != nil {
-			return nil, 0, false, false, fmt.Errorf("decode aread payload: %w", err)
-		}
-		pt, err := gproxy.OpenChunk(ts.aead, gproxy.DirServerToClient, parsedSeq, ct)
-		if err != nil {
-			return nil, 0, false, false, fmt.Errorf("decrypt aread payload: %w", err)
-		}
-		decompressed, err := ts.compressor.Decode(pt)
-		if err != nil {
-			return nil, 0, false, false, fmt.Errorf("decompress aread payload: %w", err)
-		}
-		return decompressed, parsedSeq, false, false, nil
-	default:
-		return nil, 0, false, false, fmt.Errorf("unexpected aread head: %q", head)
-	}
-}
-
-// agentWrite ships a single seq's worth of upstream→operator bytes. The MAC
-// is bound to (cmd, seq), so replay protection is inherent in the server's
-// seqAgentIn tracking and no extra nonce label is needed.
-//
-// Wire: cid . seq . chunk1 . chunk2 ... . smac . awrite . domain
-func agentWrite(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, seq uint64, plaintext []byte) error {
-	compressed := ts.compressor.Encode(plaintext)
-	ct := gproxy.SealChunk(ts.aead, gproxy.DirClientToServer, seq, compressed)
-	enc := strings.ToLower(b32.EncodeToString(ct))
-	dataLabels := codec.ChunkString(enc, 63)
-	args := make([]string, 0, 3+len(dataLabels))
-	args = append(args, cid, strconv.FormatUint(seq, 10))
-	args = append(args, dataLabels...)
-	args = append(args, protocol.SessionMAC(ts.sessionKey, "awrite", seq))
-	name := protocol.JoinName(cfg.domain, "awrite", args)
-	resp, err := resolver.query(name)
-	if err != nil {
-		return err
-	}
-	if resp != "OK" {
-		return fmt.Errorf("awrite: %s", resp)
-	}
-	return nil
 }
 
 // exchangeResult captures what one axchg DNS round-trip yielded: the write
@@ -812,7 +737,3 @@ func authenticatedName(secret, domain, command string, args []string) string {
 	labels = append(labels, ts, token)
 	return protocol.JoinName(domain, command, labels)
 }
-
-// pumpRead is a guard to keep io.Reader imported until tests exercise the
-// timeouts directly.
-var _ = io.EOF

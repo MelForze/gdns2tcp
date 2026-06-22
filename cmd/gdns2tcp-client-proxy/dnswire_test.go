@@ -167,14 +167,19 @@ func TestUDPPoolExchangeShortQuery(t *testing.T) {
 	}
 }
 
-func TestMaxAwritePlaintextBytesTCP(t *testing.T) {
-	got := maxAwritePlaintextBytes("example.com", true)
-	if got != 4000 {
-		t.Fatalf("tcp mode: got %d want 4000", got)
-	}
+// TestMaxAwritePlaintextBytesTransportParity pins the post-bugfix invariant:
+// the DNS QNAME 253-char ceiling is a wire-format constraint, not a
+// transport-level one, so UDP and TCP yield the same per-query plaintext
+// budget. The previous hardcoded `if tcp { return 4000 }` produced query
+// names ~6400 chars long and triggered FORMERR on the server.
+func TestMaxAwritePlaintextBytesTransportParity(t *testing.T) {
+	tcp := maxAwritePlaintextBytes("example.com", true)
 	udp := maxAwritePlaintextBytes("example.com", false)
+	if tcp != udp {
+		t.Fatalf("tcp %d != udp %d — DNS QNAME limit is transport-independent", tcp, udp)
+	}
 	if udp <= 0 || udp >= 200 {
-		t.Fatalf("udp mode: got %d, expected 1-199", udp)
+		t.Fatalf("plaintext budget: got %d, expected 1-199", udp)
 	}
 }
 
