@@ -2612,8 +2612,8 @@ func TestProxyAgentWriteWindowExhaustion(t *testing.T) {
 	s.reverse.mu.Unlock()
 
 	// seq = window + 1 is the first illegal one: seqAgentIn is 0, the cutoff
-	// is `seqAgentIn + awriteWindow` (= 64), so 65 must trip the rejection.
-	overSeq := uint64(65)
+	// is `seqAgentIn + awriteWindow` (= 128), so 129 must trip the rejection.
+	overSeq := uint64(129)
 	enc := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
 		gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, overSeq, rc.compressor.Encode([]byte("x"))),
 	))

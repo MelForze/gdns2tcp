@@ -265,7 +265,13 @@ func handleTunnel(cfg config, resolver *txtResolver, cid, target string) {
 // axchgWorkers controls per-tunnel DNS query parallelism. Each worker can be
 // either pumping an awrite chunk through or pulling a fresh aread chunk; the
 // axchg command lets a single round-trip carry both.
-const axchgWorkers = 16
+//
+// At 32 workers we get ~2× the theoretical bulk-write ceiling (write-heavy
+// traffic like HTTP responses going operator-bound). Going higher saturates
+// the server's per-cid mu and starts adding tail-latency from queue depth;
+// 32 sits comfortably below that knee. Paired with awriteWindow=128 on the
+// server (= 2 × axchgWorkers + queue) so the agent never trips ERR seq.
+const axchgWorkers = 32
 
 // axchgRetries is how many times a worker retries a single axchg round-trip
 // before tearing down the tunnel. 1–5% UDP loss is normal on residential

@@ -54,11 +54,11 @@ const (
 // bytes.Buffer instances back each direction.
 //
 // awriteWindow caps how far ahead the agent's awrite seq is allowed to run
-// past the next-expected one. With axchgWorkers=16 on the agent side and
-// axchgRetries=3 multiplying each in-flight seq's lifetime under packet
-// loss, 64 gives enough headroom for bulk-download bursts to absorb
-// transient WAN hiccups without tripping "ERR seq".
-const awriteWindow = 64
+// past the next-expected one. axchgWorkers=32 on the agent + an in-channel
+// queue of 32 jobs + axchgRetries=3 multiplying each seq's lifetime under
+// packet loss adds up to ~96 worst-case in-flight seqs; 128 leaves a
+// comfortable retry margin so transient WAN hiccups don't trip "ERR seq".
+const awriteWindow = 128
 
 type reverseConn struct {
 	target      string // "host:port" — agent dials this
