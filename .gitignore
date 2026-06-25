@@ -27,4 +27,6 @@ dist/
 /gdns2tcp.exe
 /gdns2tcp-client
 /gdns2tcp-client.exe
+/gdns2tcp-client-proxy
+/gdns2tcp-client-proxy.exe
 servers/

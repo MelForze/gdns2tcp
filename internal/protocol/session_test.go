@@ -8,8 +8,8 @@ import (
 func TestSessionMACRoundtrip(t *testing.T) {
 	key := DeriveSessionKey("k", "0123456789abcdef")
 	mac := SessionMAC(key, "awrite", 42)
-	if len(mac) != 8 {
-		t.Fatalf("MAC length: got %d want 8", len(mac))
+	if len(mac) != 7 {
+		t.Fatalf("MAC length: got %d want 7", len(mac))
 	}
 	if !VerifySessionMAC(key, "awrite", 42, mac) {
 		t.Fatal("roundtrip failed")
@@ -56,7 +56,7 @@ func TestVerifySessionMACRejects(t *testing.T) {
 	if VerifySessionMAC(key, "awrite", 1, "") {
 		t.Fatal("verifier accepted empty MAC")
 	}
-	if VerifySessionMAC(key, "awrite", 1, strings.Repeat("a", 8)) {
+	if VerifySessionMAC(key, "awrite", 1, strings.Repeat("a", 7)) {
 		t.Fatal("verifier accepted random MAC")
 	}
 }

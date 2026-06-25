@@ -13,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"os"
 	"strconv"
@@ -159,49 +160,6 @@ type tunnelSession struct {
 	sessionKey [32]byte
 	compressor *gproxy.Compressor
 	nonce      atomic.Uint64
-
-	// Adaptive sizing (Шаг A). bufSize is the size each upstream.Read aims
-	// for; recalculated from EWMA RTT after every axchg round-trip. Stored
-	// in microseconds for cheaper atomic Int64.
-	tcpMode bool
-	bufSize atomic.Int64
-	rttEWMA atomic.Int64
-}
-
-// updateRTT folds the observed axchg round-trip time into the EWMA and
-// rescales bufSize accordingly. Only TCP mode benefits — UDP awrite is hard-
-// capped by the 253-char DNS name limit and adaptive sizing would just thrash.
-func (ts *tunnelSession) updateRTT(d time.Duration) {
-	newSample := d.Microseconds()
-	if newSample <= 0 {
-		return
-	}
-	old := ts.rttEWMA.Load()
-	// α = 0.2: avg = 0.2 * new + 0.8 * old
-	var avg int64
-	if old == 0 {
-		avg = newSample
-	} else {
-		avg = (newSample + 4*old) / 5
-	}
-	ts.rttEWMA.Store(avg)
-
-	if !ts.tcpMode {
-		return
-	}
-	// Scale bufSize from 4 KB (high RTT) up to 16 KB (LAN). The agent's
-	// TCP-DNS pool has 60 KB headroom inside one query, so we can grow
-	// considerably past the 4 KB starting cap without truncating.
-	var newBuf int64
-	switch {
-	case avg < 5_000: // < 5 ms — LAN
-		newBuf = 16000
-	case avg < 20_000: // < 20 ms — datacenter-to-datacenter
-		newBuf = 8000
-	default:
-		newBuf = 4000
-	}
-	ts.bufSize.Store(newBuf)
 }
 
 func (ts *tunnelSession) nextNonce() uint64 {
@@ -242,36 +200,29 @@ func handleTunnel(cfg config, resolver *txtResolver, cid, target string) {
 		aead:       aead,
 		sessionKey: protocol.DeriveSessionKey(cfg.pass, cid),
 		compressor: compressor,
-		tcpMode:    cfg.tcp,
 	}
-	// Initial bufSize matches the prior hardcoded behaviour; Шаг A's
-	// updateRTT() rescales it on the fly based on observed axchg RTT.
-	initialBuf := maxAwritePlaintextBytes(cfg.domain, cfg.tcp) - 1
-	if initialBuf < 1 {
-		initialBuf = 1
+	// Worst-case budget assumes seq+nonce fit in 32 bits (= 8 hex chars
+	// each). With 96 axchg workers and one seq per chunk, at 100K q/s
+	// the cap is exceeded only after ~12 hours of continuous bulk —
+	// well beyond reverseTTL. Server still parses any uint64 via base
+	// 16, so a wraparound only causes the agent's query to overflow
+	// the 253-char limit (FORMERR + tunnel close), not corruption.
+	worstBuf := maxAxchgWritePlaintextBytes(cfg.domain, cfg.tcp, 8, 8) - 1
+	if worstBuf < 16 {
+		fmt.Fprintf(os.Stderr, "domain %q too long: axchg plaintext budget is %d bytes, need at least 16\n", cfg.domain, worstBuf)
+		_ = agentClose(cfg, resolver, ts, cid)
+		return
 	}
-	ts.bufSize.Store(int64(initialBuf))
 
 	done := make(chan struct{})
 	var once sync.Once
 	stop := func() { once.Do(func() { close(done) }) }
 
-	runBidirectionalTunnel(cfg, resolver, ts, cid, upstream, done, stop)
+	runBidirectionalTunnel(cfg, tuningForCfg(cfg), resolver, ts, cid, upstream, done, stop)
 
 	_ = upstream.Close()
 	_ = agentClose(cfg, resolver, ts, cid)
 }
-
-// axchgWorkers controls per-tunnel DNS query parallelism. Each worker can be
-// either pumping an awrite chunk through or pulling a fresh aread chunk; the
-// axchg command lets a single round-trip carry both.
-//
-// At 32 workers we get ~2× the theoretical bulk-write ceiling (write-heavy
-// traffic like HTTP responses going operator-bound). Going higher saturates
-// the server's per-cid mu and starts adding tail-latency from queue depth;
-// 32 sits comfortably below that knee. Paired with awriteWindow=128 on the
-// server (= 2 × axchgWorkers + queue) so the agent never trips ERR seq.
-const axchgWorkers = 32
 
 // axchgRetries is how many times a worker retries a single axchg round-trip
 // before tearing down the tunnel. 1–5% UDP loss is normal on residential
@@ -282,11 +233,57 @@ const axchgWorkers = 32
 // duplicate seqs (seq ≤ seqAgentIn → ACK without re-applying).
 const axchgRetries = 3
 
-// readReorderCap bounds the per-cid reorder buffer for op→upstream chunks.
-// Same idea as pendingCap in the old pumpOperatorToUpstream: protect against
-// a permanently-missing seq leaking memory. Matched to axchgWorkers × 4 so a
-// burst of out-of-order arrivals can settle.
-const readReorderCap = axchgWorkers * 4
+// errServerSeq is the typed sentinel for the server's "ERR seq" response
+// (agent's awrite seq is too far ahead of the server's drain). Workers
+// match on this with errors.Is to apply backpressure without relying on
+// fragile string equality.
+var errServerSeq = errors.New("ERR seq")
+
+// tunnelTuning groups every per-tunnel knob whose ideal value differs
+// between UDP and TCP DNS transports. Splitting them lets each transport
+// be tuned independently: bumping UDP worker count doesn't push TCP into
+// pool-contention regression, and vice versa.
+type tunnelTuning struct {
+	// workers is the per-tunnel axchg worker goroutine count. Each
+	// worker independently picks a write job from the queue (or issues
+	// a pure-read pull) and runs one DNS round-trip.
+	workers int
+	// reorderCap bounds the per-cid reorder buffer for op→upstream
+	// chunks. Sized as workers × 4 so a burst of out-of-order arrivals
+	// can settle without overflow.
+	reorderCap int
+	// backpressureCap is the wall-clock budget a single worker spends
+	// absorbing "ERR seq" retries before letting the error propagate.
+	// Tuned generously — well short of reverseTTL (30 min) so a stuck
+	// tunnel is torn down before the server's GC reclaims it, but long
+	// enough to ride out goroutine-scheduling skew on the slowest seq.
+	backpressureCap time.Duration
+}
+
+// udpTuning and tcpTuning are the two presets. UDP wins from more
+// workers (per-RT CPU dominates on loopback / LAN, parallelism scales
+// almost linearly). TCP saturates earlier because the DNS-over-TCP pool
+// holds only `tcpPoolConns` sockets and adding workers past that just
+// piles HoL contention onto the same conns.
+var (
+	udpTuning = tunnelTuning{
+		workers:         96,
+		reorderCap:      96 * 4,
+		backpressureCap: 5 * time.Minute,
+	}
+	tcpTuning = tunnelTuning{
+		workers:         32,
+		reorderCap:      32 * 4,
+		backpressureCap: 5 * time.Minute,
+	}
+)
+
+func tuningForCfg(cfg config) tunnelTuning {
+	if cfg.tcp {
+		return tcpTuning
+	}
+	return udpTuning
+}
 
 // runBidirectionalTunnel replaces the prior pair of pumpOperatorToUpstream /
 // pumpUpstreamToOperator goroutines with a single dispatcher backed by the
@@ -296,18 +293,22 @@ const readReorderCap = axchgWorkers * 4
 // Throughput effect: on interactive traffic (SSH, REPL) each keystroke and
 // echo pair fits inside one DNS round-trip instead of two — perceived RTT
 // halves. Bulk traffic gets the full pipeline of N concurrent axchgs.
-func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, upstream net.Conn, done <-chan struct{}, stop func()) {
-	writeJobs := make(chan awriteJob, axchgWorkers)
-	readResults := make(chan exchangeResult, axchgWorkers)
+func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolver, ts *tunnelSession, cid string, upstream net.Conn, done <-chan struct{}, stop func()) {
+	writeJobs := make(chan awriteJob, tuning.workers)
+	readResults := make(chan exchangeResult, tuning.workers)
 	internalStop := make(chan struct{})
 	var stopOnce sync.Once
 	stopAll := func() {
 		stopOnce.Do(func() { close(internalStop) })
 		stop()
 	}
+	// Guarantee `done` closes regardless of which exit path runs. Without
+	// this, the EOF path (close(writeJobs); return) leaves the upstream
+	// deadline-poke goroutine parked on done/internalStop forever.
+	defer stop()
 
 	var workerWG sync.WaitGroup
-	for range axchgWorkers {
+	for range tuning.workers {
 		workerWG.Add(1)
 		go func() {
 			defer workerWG.Done()
@@ -320,7 +321,11 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 					return
 				case <-internalStop:
 					return
-				case job = <-writeJobs:
+				case j, ok := <-writeJobs:
+					if !ok {
+						return
+					}
+					job = j
 					haveJob = true
 				default:
 				}
@@ -336,24 +341,21 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 					case <-internalStop:
 						timer.Stop()
 						return
-					case job = <-writeJobs:
+					case j, ok := <-writeJobs:
 						timer.Stop()
+						if !ok {
+							return
+						}
+						job = j
 						haveJob = true
 					case <-timer.C:
 					}
 				}
 				var (
-					res exchangeResult
-					err error
+					res                exchangeResult
+					err                error
+					backpressureStart  time.Time
 				)
-				exchangeStart := time.Now()
-				// Retry up to axchgRetries times on transient DNS failures
-				// (1–5% UDP packet loss is normal on WAN, especially on
-				// cellular and residential ISPs). Each attempt picks a fresh
-				// nonce internally, so the server's anti-replay window doesn't
-				// confuse retries with malicious replays. For write-bearing
-				// requests this is safe: the server fast-paths duplicate seqs
-				// (seq <= seqAgentIn → ACK without re-applying).
 				for attempt := 0; attempt < axchgRetries; attempt++ {
 					if haveJob {
 						res, err = agentExchange(cfg, resolver, ts, cid, job.seq, job.data)
@@ -363,9 +365,40 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 					if err == nil {
 						break
 					}
+					if haveJob && errors.Is(err, errServerSeq) {
+						if backpressureStart.IsZero() {
+							backpressureStart = time.Now()
+						}
+						if time.Since(backpressureStart) > tuning.backpressureCap {
+							// Server has been refusing this seq for too long;
+							// fall through to the normal error path which
+							// tears the tunnel down.
+						} else {
+							// First few hits use a short sleep so a transient
+							// window-full (server's about to drain) recovers
+							// in ~1 ms instead of ~15 ms. Persistent
+							// backpressure escalates to the wider 5-24 ms
+							// jitter that spaces 32 workers apart.
+							var jitter time.Duration
+							if elapsedMs := time.Since(backpressureStart).Milliseconds(); elapsedMs < 20 {
+								jitter = time.Duration(1+rand.IntN(3)) * time.Millisecond
+							} else {
+								jitter = time.Duration(5+rand.IntN(20)) * time.Millisecond
+							}
+							select {
+							case <-done:
+								gproxy.PutBuf(job.bufPtr)
+								return
+							case <-internalStop:
+								gproxy.PutBuf(job.bufPtr)
+								return
+							case <-time.After(jitter):
+							}
+							attempt--
+							continue
+						}
+					}
 					if attempt < axchgRetries-1 {
-						// Light backoff so a server hiccup doesn't get
-						// hammered by 16 workers retrying in lockstep.
 						time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 					}
 				}
@@ -376,12 +409,6 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 					fmt.Fprintf(os.Stderr, "axchg cid=%s (%d attempts): %v\n", cid, axchgRetries, err)
 					stopAll()
 					return
-				}
-				// Шаг A: feed the EWMA only on data-bearing round-trips.
-				// Pure-read EMPTY responses inflate the average by the
-				// server's idle-poll behaviour, not the network RTT.
-				if haveJob || len(res.readData) > 0 {
-					ts.updateRTT(time.Since(exchangeStart))
 				}
 				select {
 				case readResults <- res:
@@ -413,7 +440,7 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 	//
 	// bufSize reserves one byte of plaintext budget for the compressor's
 	// flag prefix; without it an incompressible chunk would overflow the
-	// awrite name-length cap.
+	// axchg name-length cap.
 	go func() {
 		select {
 		case <-done:
@@ -422,12 +449,18 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 		_ = upstream.SetReadDeadline(time.Unix(1, 0))
 	}()
 	go func() {
-		bufSize := int(ts.bufSize.Load())
-		if bufSize < 1 {
-			bufSize = 1
-		}
 		var seq uint64
 		for {
+			// Dynamic seq width (predicted: next seq we'll assign).
+			// Conservative nonce width = 8 hex chars (32-bit cap, see
+			// worstBuf comment in handleTunnel); any worker can bump
+			// nonce arbitrarily far between our Read and the dispatch,
+			// so we don't shrink below the cap.
+			seqWidth := hexWidth(seq + 1)
+			bufSize := maxAxchgWritePlaintextBytes(cfg.domain, cfg.tcp, seqWidth, 8) - 1
+			if bufSize < 16 {
+				bufSize = 16
+			}
 			bufPtr := gproxy.GetBuf(bufSize)
 			n, err := upstream.Read(*bufPtr)
 			if n > 0 {
@@ -461,14 +494,11 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 					return
 				default:
 				}
-				stopAll()
+				// Upstream EOF (or error). Close writeJobs so workers
+				// finish in-flight chunks instead of being killed mid-
+				// round-trip (which drops the last ~2 KB of the stream).
+				close(writeJobs)
 				return
-			}
-			// Refresh bufSize each loop so Шаг A's RTT-driven scaling can
-			// shrink/grow the reader without restarting the goroutine.
-			bufSize = int(ts.bufSize.Load())
-			if bufSize < 1 {
-				bufSize = 1
 			}
 		}
 	}()
@@ -480,22 +510,12 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 
 	// Read reorder + writer: in-order delivery to upstream.
 	nextSeq := uint64(1)
-	pending := make(map[uint64][]byte, readReorderCap)
+	pending := make(map[uint64][]byte, tuning.reorderCap)
 	for r := range readResults {
 		if r.readClosed {
 			stopAll()
 			drainExchange(readResults)
-			for {
-				data, ok := pending[nextSeq]
-				if !ok {
-					break
-				}
-				delete(pending, nextSeq)
-				if _, err := upstream.Write(data); err != nil {
-					return
-				}
-				nextSeq++
-			}
+			_ = flushContiguous(pending, &nextSeq, upstream)
 			return
 		}
 		if r.readEmpty || len(r.readData) == 0 {
@@ -505,25 +525,43 @@ func runBidirectionalTunnel(cfg config, resolver *txtResolver, ts *tunnelSession
 			continue
 		}
 		pending[r.readSeq] = r.readData
-		if len(pending) > readReorderCap {
+		if len(pending) > tuning.reorderCap {
 			fmt.Fprintf(os.Stderr, "axchg cid=%s: reorder buffer overflow (lost seq %d?), closing\n", cid, nextSeq)
 			stopAll()
 			drainExchange(readResults)
 			return
 		}
-		for {
-			data, ok := pending[nextSeq]
-			if !ok {
-				break
-			}
-			delete(pending, nextSeq)
-			if _, err := upstream.Write(data); err != nil {
-				stopAll()
-				drainExchange(readResults)
-				return
-			}
-			nextSeq++
+		if err := flushContiguous(pending, &nextSeq, upstream); err != nil {
+			stopAll()
+			drainExchange(readResults)
+			return
 		}
+	}
+	// readResults closed → all workers exited (clean teardown path).
+	// Flush any contiguous reads still buffered, then warn if a gap left
+	// data stranded: the operator will see EOF mid-stream rather than
+	// silently-truncated bytes followed by EOF.
+	_ = flushContiguous(pending, &nextSeq, upstream)
+	if len(pending) > 0 {
+		fmt.Fprintf(os.Stderr, "axchg cid=%s: stream truncated at seq %d, %d chunks lost\n", cid, nextSeq, len(pending))
+	}
+}
+
+// flushContiguous writes pending[*nextSeq], pending[*nextSeq+1], ... to
+// upstream until the first gap, advancing *nextSeq as it goes. Returns
+// the first upstream.Write error or nil. The map is mutated in place;
+// any entries beyond the gap remain for the caller to inspect.
+func flushContiguous(pending map[uint64][]byte, nextSeq *uint64, upstream net.Conn) error {
+	for {
+		data, ok := pending[*nextSeq]
+		if !ok {
+			return nil
+		}
+		delete(pending, *nextSeq)
+		if _, err := upstream.Write(data); err != nil {
+			return err
+		}
+		*nextSeq++
 	}
 }
 
@@ -538,42 +576,65 @@ type awriteJob struct {
 	bufPtr *[]byte // pooled buffer backing `data`; PutBuf releases after use
 }
 
-// maxAwritePlaintextBytes returns the largest raw byte count we can place in
-// a single awrite DNS name without exceeding 253 chars. The math accounts for
-// the cid (16) + seq (≤20 digits) + smac (8) + "awrite" (6) + domain + dots
-// between labels, leaving the rest for base32-encoded ciphertext (= raw × 8/5)
-// and subtracts the 16-byte AES-GCM tag from the plaintext budget.
+// maxAxchgWritePlaintextBytes returns the largest raw byte count we can
+// place in a single axchg DNS query name without exceeding 253 printable
+// chars. The layout is:
 //
-// Post session-MAC cutover: the old (ts=8, token=26) labels are gone, freeing
-// 26 query chars ≈ +16 bytes plaintext. UDP awrite went from ~76 to ~92.
+//	cid(16) . writeSeq(seqWidth) . [dataLabels...] . ["tcp"(3)] . readNonce(nonceWidth) . smac(8) . "axchg"(5) . domain
 //
-// IMPORTANT: the same per-query plaintext budget applies to UDP and TCP. The
-// DNS QNAME 253-char ceiling (RFC 1035) is a wire-format constraint of the
-// DNS message itself, not of the transport. The `tcp` parameter is kept for
-// readability of call sites but doesn't change the result. -tcp helps only
-// on the *response* side (MaxReadBytesTCP allows much larger TXT records);
-// query-name capacity is identical.
-func maxAwritePlaintextBytes(domain string, tcp bool) int {
-	_ = tcp
+// seqWidth / nonceWidth let the caller pass the *actual* decimal-digit
+// widths of the seq and nonce to be sent. Passing the worst-case width
+// (20 for uint64 in decimal) is the conservative startup check; passing
+// the predicted next-iteration widths lets the reader reclaim ~10-30
+// chars of overhead that the worst-case reserves but rarely uses,
+// translating to +5-15 plaintext bytes per chunk.
+//
+// The tcp flag adds 4 chars (label + dot) when present.
+//
+// Returns the math-computed budget without clamping; a domain long enough to
+// drive the result toward zero or negative makes axchg infeasible at this
+// transport, and handleTunnel refuses to start in that case. Silently
+// returning a fallback budget here would yield queries that exceed 253 chars
+// and the server would FORMERR every round-trip.
+func maxAxchgWritePlaintextBytes(domain string, tcp bool, seqWidth, nonceWidth int) int {
 	const (
-		dnsNameMax  = 253
-		cidLabel    = 16
-		seqLabelMax = 20
-		smacLabel   = 8
-		cmdLabel    = 6
-		dotsMargin  = 12
+		dnsNameMax = 253
+		cidLabel   = 16
+		smacLabel  = 7 // 4-byte MAC encoded as 7 base32 chars (NoPadding)
+		cmdLabel   = 5 // "axchg"
+		// dotsMargin reserves chars for the dots between labels.
+		// Actual count: 2 (cid,seq) + dataLabels + (1 if tcp) + 3
+		// (nonce, smac, axchg) + 1 (domain) − 1 = 5+dataLabels (UDP)
+		// or 6+dataLabels (TCP). With expanded budgets we top out at
+		// ~4 data labels → 9 dots UDP, 10 TCP. Margin 12 keeps safety.
+		dotsMargin = 12
 	)
-	overhead := cidLabel + seqLabelMax + smacLabel + cmdLabel + len(domain) + dotsMargin
-	available := dnsNameMax - overhead
-	if available < 32 {
-		return 32
+	overhead := cidLabel + seqWidth + nonceWidth + smacLabel + cmdLabel + len(domain) + dotsMargin
+	if tcp {
+		overhead += 4 // "tcp" + dot
 	}
+	available := dnsNameMax - overhead
 	raw := (available * 5) / 8
 	raw -= 16
-	if raw < 16 {
-		raw = 16
-	}
 	return raw
+}
+
+// hexWidth returns the number of hex digits needed to represent n (with
+// n=0 counted as 1 digit). Used by the reader to predict the worst-case
+// width of the next seq/nonce before computing the chunk budget. Hex is
+// chosen over decimal because uint64 fits in 16 hex chars vs 20 decimal
+// — that 8-char savings translates to ~5 bytes more plaintext per chunk
+// at worst-case widths.
+func hexWidth(n uint64) int {
+	if n == 0 {
+		return 1
+	}
+	w := 0
+	for n > 0 {
+		w++
+		n >>= 4
+	}
+	return w
 }
 
 func isTimeout(err error) bool {
@@ -639,7 +700,7 @@ type exchangeResult struct {
 func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, writeSeq uint64, writeData []byte) (exchangeResult, error) {
 	readNonce := ts.nextNonce()
 	args := make([]string, 0, 8)
-	args = append(args, cid, strconv.FormatUint(writeSeq, 10))
+	args = append(args, cid, strconv.FormatUint(writeSeq, 16))
 	if writeSeq > 0 {
 		compressed := ts.compressor.Encode(writeData)
 		ct := gproxy.SealChunk(ts.aead, gproxy.DirClientToServer, writeSeq, compressed)
@@ -649,7 +710,7 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 	if cfg.tcp {
 		args = append(args, "tcp")
 	}
-	args = append(args, strconv.FormatUint(readNonce, 10))
+	args = append(args, strconv.FormatUint(readNonce, 16))
 	args = append(args, protocol.SessionMAC(ts.sessionKey, "axchg", readNonce))
 	name := protocol.JoinName(cfg.domain, "axchg", args)
 
@@ -666,10 +727,12 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 	switch {
 	case head == "CLOSED":
 		return exchangeResult{readClosed: true}, nil
+	case head == "ERR seq":
+		return exchangeResult{}, errServerSeq
 	case strings.HasPrefix(head, "ERR "):
 		return exchangeResult{}, errors.New(head)
 	case strings.HasPrefix(head, "ACK "):
-		acked, perr := strconv.ParseUint(strings.TrimPrefix(head, "ACK "), 10, 64)
+		acked, perr := strconv.ParseUint(strings.TrimPrefix(head, "ACK "), 16, 64)
 		if perr != nil {
 			return exchangeResult{}, fmt.Errorf("malformed ACK: %w", perr)
 		}
@@ -688,7 +751,7 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 			res.readClosed = true
 			return res, nil
 		case strings.HasPrefix(readHead, "DATA "):
-			parsedSeq, perr := strconv.ParseUint(strings.TrimPrefix(readHead, "DATA "), 10, 64)
+			parsedSeq, perr := strconv.ParseUint(strings.TrimPrefix(readHead, "DATA "), 16, 64)
 			if perr != nil {
 				return exchangeResult{}, fmt.Errorf("malformed DATA seq: %w", perr)
 			}
@@ -725,7 +788,7 @@ func agentClose(cfg config, resolver *txtResolver, ts *tunnelSession, cid string
 	nonce := ts.nextNonce()
 	args := []string{
 		cid,
-		strconv.FormatUint(nonce, 10),
+		strconv.FormatUint(nonce, 16),
 		protocol.SessionMAC(ts.sessionKey, "aclose", nonce),
 	}
 	name := protocol.JoinName(cfg.domain, "aclose", args)

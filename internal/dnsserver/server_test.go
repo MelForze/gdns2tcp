@@ -69,7 +69,7 @@ func signedName(command string, args []string) string {
 // by (cmd, nonce) so each request is replay-protected by the server's
 // per-cid sliding window.
 func sessionAreadArgs(cid string, key [32]byte, nonce uint64, tcp bool) []string {
-	args := []string{cid, strconv.FormatUint(nonce, 10)}
+	args := []string{cid, strconv.FormatUint(nonce, 16)}
 	if tcp {
 		args = append(args, "tcp")
 	}
@@ -80,7 +80,7 @@ func sessionAreadArgs(cid string, key [32]byte, nonce uint64, tcp bool) []string
 // seq); seq doubles as the per-cid awrite ordering key.
 func sessionAwriteArgs(cid string, key [32]byte, seq uint64, dataLabels []string) []string {
 	args := make([]string, 0, 3+len(dataLabels))
-	args = append(args, cid, strconv.FormatUint(seq, 10))
+	args = append(args, cid, strconv.FormatUint(seq, 16))
 	args = append(args, dataLabels...)
 	return append(args, protocol.SessionMAC(key, "awrite", seq))
 }
@@ -88,7 +88,7 @@ func sessionAwriteArgs(cid string, key [32]byte, seq uint64, dataLabels []string
 func sessionAcloseArgs(cid string, key [32]byte, nonce uint64) []string {
 	return []string{
 		cid,
-		strconv.FormatUint(nonce, 10),
+		strconv.FormatUint(nonce, 16),
 		protocol.SessionMAC(key, "aclose", nonce),
 	}
 }
@@ -1845,7 +1845,7 @@ func agentTunnelLoop(t *testing.T, s *Server, cid string, sessionKey [32]byte, a
 			if !strings.HasPrefix(head, "DATA ") {
 				return
 			}
-			seq, _ := strconv.ParseUint(strings.TrimPrefix(head, "DATA "), 10, 64)
+			seq, _ := strconv.ParseUint(strings.TrimPrefix(head, "DATA "), 16, 64)
 			b64 := strings.Join(resp[1:], "")
 			ct, _ := base64.StdEncoding.DecodeString(b64)
 			plaintext, err := gproxy.OpenChunk(aead.(gproxyAEAD), gproxy.DirServerToClient, seq, ct)
@@ -2333,9 +2333,9 @@ func TestProxyAgentExchangePureRead(t *testing.T) {
 
 	nonce := uint64(1)
 	smac := protocol.SessionMAC(rc.sessionKey, "axchg", nonce)
-	args := []string{cid, "0", strconv.FormatUint(nonce, 10), smac}
+	args := []string{cid, "0", strconv.FormatUint(nonce, 16), smac}
 	resp := s.proxyAgentExchange(args, time.Now().UTC())
-	if len(resp) < 2 || resp[0] != "ACK 0" || resp[1] != "EMPTY" {
+	if len(resp) < 2 || resp[0] != "ACK 0" || resp[1] != "EMPTY" { // 0 is "0" in both bases
 		t.Fatalf("expected [ACK 0, EMPTY], got %v", resp)
 	}
 }
@@ -2382,7 +2382,7 @@ func TestProxyAgentExchangeWriteAndRead(t *testing.T) {
 
 	nonce := uint64(1)
 	smac := protocol.SessionMAC(rc.sessionKey, "axchg", nonce)
-	args := []string{cid, "1", enc1, strconv.FormatUint(nonce, 10), smac}
+	args := []string{cid, "1", enc1, strconv.FormatUint(nonce, 16), smac}
 	resp := s.proxyAgentExchange(args, time.Now().UTC())
 	if len(resp) < 2 {
 		t.Fatalf("expected at least 2 segs, got %v", resp)
@@ -2630,8 +2630,8 @@ func TestProxyAgentWriteWindowExhaustion(t *testing.T) {
 	s.reverse.mu.Unlock()
 
 	// seq = window + 1 is the first illegal one: seqAgentIn is 0, the cutoff
-	// is `seqAgentIn + awriteWindow` (= 128), so 129 must trip the rejection.
-	overSeq := uint64(129)
+	// is `seqAgentIn + awriteWindow` (= 512), so 513 must trip the rejection.
+	overSeq := uint64(awriteWindow + 1)
 	enc := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(
 		gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, overSeq, rc.compressor.Encode([]byte("x"))),
 	))

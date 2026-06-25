@@ -55,12 +55,32 @@ func GetCompressor() (*Compressor, error) {
 	return sharedCompressor, nil
 }
 
+// encodeScratchPool recycles intermediate slices used by Encode for the
+// zstd output before it's wrapped with the flag byte. Profile showed the
+// previous `EncodeAll(src, nil)` allocation accounted for ~75% of
+// server-side allocations on bulk transfers.
+var encodeScratchPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
+
 // Encode returns src wrapped with a single-byte flag indicating whether
 // the body is raw or zstd-compressed. The pass-through branch fires when
 // zstd's frame overhead would make the payload bigger — which happens on
 // small or already-incompressible inputs.
+//
+// The caller owns the returned slice; it's a fresh allocation each call
+// so it can safely cross goroutine boundaries (e.g. into a response
+// buffer). The internal zstd scratch buffer is pooled.
 func (c *Compressor) Encode(src []byte) []byte {
-	encoded := c.enc.EncodeAll(src, nil)
+	sp := encodeScratchPool.Get().(*[]byte)
+	*sp = (*sp)[:0]
+	encoded := c.enc.EncodeAll(src, *sp)
+	*sp = encoded
+	defer encodeScratchPool.Put(sp)
+
 	if len(encoded) < len(src) {
 		out := make([]byte, 1+len(encoded))
 		out[0] = 0x01

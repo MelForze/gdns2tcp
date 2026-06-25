@@ -66,11 +66,6 @@ os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="$os-$a"
 NL=$(printf '\n')
-# +tcp avoids UDP truncation / packet loss. qm fetches the manifest record
-# (no per-batch SHA, just `filename|N|sha256`). qb fetches a clb-* batch
-# and verifies the server-provided per-batch SHA before accepting it;
-# transient corruption is caught immediately, not after thousands of
-# batches have been downloaded.
 qm(){ for i in 1 2 3 4 5; do
         o=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d "\"$NL ")
         [ -n "$o" ] && { printf %s "$o"; return; }
@@ -118,9 +113,6 @@ batched responses are not capped by Windows' default 512-byte UDP DNS buffer:
 
 ```powershell
 $D="files.example.com"; $S="<server-ip>"; $B=14
-# qm fetches the manifest (no per-batch SHA, just `name|N|sha`).
-# qb fetches a clb-* batch and verifies the server-provided per-batch SHA
-# before accepting it — single-batch corruption is caught immediately.
 function qm($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
   $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
   if($m.Count){ return (($m | %{ $_.Groups[1].Value }) -join "") }
@@ -254,11 +246,6 @@ os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="client-proxy-$os-$a"
 NL=$(printf '\n')
-# +tcp avoids UDP truncation / packet loss. qm fetches the manifest record
-# (no per-batch SHA, just `filename|N|sha256`). qb fetches a clb-* batch
-# and verifies the server-provided per-batch SHA before accepting it;
-# transient corruption is caught immediately, not after thousands of
-# batches have been downloaded.
 qm(){ for i in 1 2 3 4 5; do
         o=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d "\"$NL ")
         [ -n "$o" ] && { printf %s "$o"; return; }
@@ -307,8 +294,6 @@ EOF
 $D="files.example.com"; $S="<server-ip>"; $B=14
 $ARCH = if ([System.Environment]::Is64BitOperatingSystem) { "amd64" } else { "arm64" }
 $A = "client-proxy-windows-$ARCH"
-# qm fetches the manifest (no per-batch SHA). qb fetches a clb-* batch
-# and verifies the server-provided per-batch SHA before accepting it.
 function qm($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
   $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
   if($m.Count){ return (($m | %{ $_.Groups[1].Value }) -join "") }

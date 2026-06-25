@@ -552,3 +552,175 @@ func TestEndToEndReverseSOCKS5BulkStreamReorder(t *testing.T) {
 		}
 	}
 }
+
+// socks5Connect performs the full SOCKS5 handshake (user/pass auth + CONNECT)
+// and returns the ready-to-use connection.
+func socks5Connect(t *testing.T, socksAddr, secret, upstream string) net.Conn {
+	t.Helper()
+	upHost, upPortStr, _ := net.SplitHostPort(upstream)
+	upPort, _ := strconv.Atoi(upPortStr)
+
+	op, err := net.Dial("tcp", socksAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = op.Write([]byte{0x05, 0x01, 0x02})
+	mr := make([]byte, 2)
+	_, _ = io.ReadFull(op, mr)
+	auth := []byte{0x01, byte(len("gdns2tcp"))}
+	auth = append(auth, []byte("gdns2tcp")...)
+	auth = append(auth, byte(len(secret)))
+	auth = append(auth, []byte(secret)...)
+	_, _ = op.Write(auth)
+	authStatus := make([]byte, 2)
+	_, _ = io.ReadFull(op, authStatus)
+	if authStatus[1] != 0x00 {
+		op.Close()
+		t.Fatalf("auth failed: %v", authStatus)
+	}
+	req := []byte{0x05, 0x01, 0x00, 0x01}
+	for _, b := range net.ParseIP(upHost).To4() {
+		req = append(req, b)
+	}
+	req = append(req, byte(upPort>>8), byte(upPort))
+	_, _ = op.Write(req)
+	rep := make([]byte, 10)
+	_, _ = io.ReadFull(op, rep)
+	if rep[1] != 0x00 {
+		op.Close()
+		t.Fatalf("connect failed: %v", rep)
+	}
+	return op
+}
+
+// startTCPEmbeddedServer is like startEmbeddedServer but binds a TCP DNS
+// listener instead of UDP — required when the agent uses -tcp mode.
+func startTCPEmbeddedServer(t *testing.T) (dnsIP, dnsPort, socksAddr string, secret string) {
+	t.Helper()
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = tcpLn.Close()
+		t.Fatal(err)
+	}
+	secret = "tcp-bulk-secret"
+	srv, err := dnsserver.New(dnsserver.Config{
+		Domain:           "files.test",
+		Secret:           secret,
+		DataDir:          t.TempDir(),
+		AllowList:        true,
+		MaxUploadBytes:   dnsserver.DefaultMaxUploadBytes,
+		MaxDownloadBytes: dnsserver.DefaultMaxDownloadBytes,
+		AllowProxy:       true,
+		ProxyMaxConn:     8,
+		ProxyBufBytes:    64 * 1024,
+		Logger:           stdlog.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpDNSSrv := &dns.Server{Listener: tcpLn, Net: "tcp", Handler: srv}
+	go func() { _ = tcpDNSSrv.ActivateAndServe() }()
+	go func() {
+		for {
+			c, err := socksLn.Accept()
+			if err != nil {
+				return
+			}
+			go srv.HandleSOCKS5OperatorForTest(c)
+		}
+	}()
+	t.Cleanup(func() {
+		_ = tcpDNSSrv.Shutdown()
+		_ = socksLn.Close()
+		srv.Shutdown()
+	})
+	port := strconv.Itoa(tcpLn.Addr().(*net.TCPAddr).Port)
+	return "127.0.0.1", port, socksLn.Addr().String(), secret
+}
+
+func testBulkEcho(t *testing.T, useTCP bool, payloadSize int) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("integration")
+	}
+	var dnsIP, dnsPort, socksAddr, secret string
+	if useTCP {
+		dnsIP, dnsPort, socksAddr, secret = startTCPEmbeddedServer(t)
+	} else {
+		dnsIP, dnsPort, socksAddr, secret = startEmbeddedServer(t)
+	}
+	upstream := echoUpstream(t)
+
+	agentCfg := config{
+		domain:        "files.test",
+		pass:          secret,
+		dnsServer:     dnsIP,
+		dnsPort:       dnsPort,
+		tcp:           useTCP,
+		pollMin:       2 * time.Millisecond,
+		pollMax:       20 * time.Millisecond,
+		maxConn:       4,
+		retries:       3,
+		targetTimeout: 2 * time.Second,
+	}
+	resolver := newTxtResolver(agentCfg)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			cid, target, err := agentPoll(agentCfg, resolver)
+			if err != nil || cid == "" {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			go handleTunnel(agentCfg, resolver, cid, target)
+		}
+	}()
+
+	op := socks5Connect(t, socksAddr, secret, upstream)
+	defer op.Close()
+
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i*7 ^ (i >> 8))
+	}
+
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := op.Write(payload)
+		writeErr <- err
+	}()
+
+	got := make([]byte, payloadSize)
+	_ = op.SetReadDeadline(time.Now().Add(120 * time.Second))
+	if _, err := io.ReadFull(op, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		for i := range payload {
+			if got[i] != payload[i] {
+				t.Fatalf("first divergence at byte %d: got %#x want %#x", i, got[i], payload[i])
+			}
+		}
+	}
+}
+
+func TestEndToEndReverseSOCKS5_2MB_UDP(t *testing.T) {
+	testBulkEcho(t, false, 2*1024*1024)
+}
+
+func TestEndToEndReverseSOCKS5_2MB_TCP(t *testing.T) {
+	testBulkEcho(t, true, 2*1024*1024)
+}

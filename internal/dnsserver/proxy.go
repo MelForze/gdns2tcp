@@ -56,9 +56,12 @@ const (
 // awriteWindow caps how far ahead the agent's awrite seq is allowed to run
 // past the next-expected one. axchgWorkers=32 on the agent + an in-channel
 // queue of 32 jobs + axchgRetries=3 multiplying each seq's lifetime under
-// packet loss adds up to ~96 worst-case in-flight seqs; 128 leaves a
-// comfortable retry margin so transient WAN hiccups don't trip "ERR seq".
-const awriteWindow = 128
+// packet loss adds up to ~96 worst-case in-flight seqs. On fast transports
+// (TCP DNS over LAN / loopback) workers cycle much faster than the server
+// drains, easily doubling or tripling the naive estimate. 512 covers the
+// realistic burst without meaningful memory cost (~42 KB of oooWrite map
+// entries at 84 bytes/chunk).
+const awriteWindow = 512
 
 type reverseConn struct {
 	target      string // "host:port" — agent dials this
@@ -714,7 +717,7 @@ func (s *Server) proxyAgentRead(args []string, now time.Time) []string {
 	if !gproxy.ValidCID(cid) {
 		return []string{"ERR bad cid"}
 	}
-	nonce, err := strconv.ParseUint(args[1], 10, 64)
+	nonce, err := strconv.ParseUint(args[1], 16, 64)
 	if err != nil {
 		return []string{"ERR bad nonce"}
 	}
@@ -777,7 +780,7 @@ func (s *Server) proxyAgentRead(args []string, now time.Time) []string {
 	gproxy.PutBuf(rawBuf)
 	ct := gproxy.SealChunk(rc.aead, gproxy.DirServerToClient, seq, plaintext)
 	b64 := base64.StdEncoding.EncodeToString(ct)
-	out := []string{"DATA " + strconv.FormatUint(seq, 10)}
+	out := []string{"DATA " + strconv.FormatUint(seq, 16)}
 	out = append(out, codec.ChunkString(b64, codec.TXTChunkSize)...)
 	return out
 }
@@ -803,7 +806,7 @@ func (s *Server) proxyAgentWrite(args []string, now time.Time) []string {
 	if !gproxy.ValidCID(cid) {
 		return []string{"ERR bad cid"}
 	}
-	seq, err := strconv.ParseUint(args[1], 10, 64)
+	seq, err := strconv.ParseUint(args[1], 16, 64)
 	if err != nil {
 		return []string{"ERR bad seq"}
 	}
@@ -905,7 +908,7 @@ func (s *Server) proxyAgentClose(args []string, now time.Time) []string {
 	if !gproxy.ValidCID(cid) {
 		return []string{"ERR bad cid"}
 	}
-	nonce, err := strconv.ParseUint(args[1], 10, 64)
+	nonce, err := strconv.ParseUint(args[1], 16, 64)
 	if err != nil {
 		return []string{"ERR bad nonce"}
 	}
@@ -960,12 +963,12 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 	if !gproxy.ValidCID(cid) {
 		return []string{"ERR bad cid"}
 	}
-	writeSeq, err := strconv.ParseUint(args[1], 10, 64)
+	writeSeq, err := strconv.ParseUint(args[1], 16, 64)
 	if err != nil {
 		return []string{"ERR bad seq"}
 	}
 	smac := args[len(args)-1]
-	readNonce, err := strconv.ParseUint(args[len(args)-2], 10, 64)
+	readNonce, err := strconv.ParseUint(args[len(args)-2], 16, 64)
 	if err != nil {
 		return []string{"ERR bad nonce"}
 	}
@@ -996,7 +999,7 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 	rc.mu.Unlock()
 
 	// --- Write phase (if any) ------------------------------------------------
-	writeStatus := "ACK " + strconv.FormatUint(writeSeq, 10)
+	writeStatus := "ACK " + strconv.FormatUint(writeSeq, 16)
 	if writeSeq > 0 {
 		if len(dataLabels) == 0 {
 			return []string{"ERR malformed"}
@@ -1032,7 +1035,7 @@ func (s *Server) applyAxchgWrite(rc *reverseConn, seq uint64, dataLabels []strin
 	if seq <= rc.seqAgentIn {
 		rc.expires = now.Add(reverseTTL)
 		rc.mu.Unlock()
-		return "ACK " + strconv.FormatUint(seq, 10)
+		return "ACK " + strconv.FormatUint(seq, 16)
 	}
 	if seq > rc.seqAgentIn+awriteWindow {
 		rc.mu.Unlock()
@@ -1058,7 +1061,7 @@ func (s *Server) applyAxchgWrite(rc *reverseConn, seq uint64, dataLabels []strin
 	if seq <= rc.seqAgentIn {
 		rc.expires = now.Add(reverseTTL)
 		rc.mu.Unlock()
-		return "ACK " + strconv.FormatUint(seq, 10)
+		return "ACK " + strconv.FormatUint(seq, 16)
 	}
 	if rc.oooWrite == nil {
 		rc.oooWrite = make(map[uint64][]byte)
@@ -1084,7 +1087,7 @@ func (s *Server) applyAxchgWrite(rc *reverseConn, seq uint64, dataLabels []strin
 	}
 	rc.expires = now.Add(reverseTTL)
 	rc.mu.Unlock()
-	return "ACK " + strconv.FormatUint(seq, 10)
+	return "ACK " + strconv.FormatUint(seq, 16)
 }
 
 // collectAxchgRead drains up to maxRead bytes of op→agent data into a TXT
@@ -1132,7 +1135,7 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	gproxy.PutBuf(rawBuf) // raw was copied into compressor's output; release now
 	ct := gproxy.SealChunk(rc.aead, gproxy.DirServerToClient, seq, plaintext)
 	b64 := base64.StdEncoding.EncodeToString(ct)
-	out := []string{"DATA " + strconv.FormatUint(seq, 10)}
+	out := []string{"DATA " + strconv.FormatUint(seq, 16)}
 	out = append(out, codec.ChunkString(b64, codec.TXTChunkSize)...)
 	return out
 }

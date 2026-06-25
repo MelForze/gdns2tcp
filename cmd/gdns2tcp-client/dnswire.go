@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -214,4 +216,178 @@ func exchangeTCP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
 		return nil, err
 	}
 	return resp, nil
+}
+
+// tcpPoolConns is the number of persistent TCP DNS connections. With
+// parallelism=32 default on downloads, a one-connection-per-query
+// approach exhausts ephemeral ports after ~16K queries (macOS default
+// range) when the file is in the MB range. 16 conns serve as fan-out
+// with per-conn DNS-id pipelining (independent readLoop + pending map).
+const tcpPoolConns = 16
+
+type tcpConnEntry struct {
+	parent    *tcpPool
+	mu        sync.Mutex // serialises writes on this conn
+	pendingMu sync.Mutex
+	pending   map[uint16]chan []byte
+	conn      net.Conn
+	closed    bool
+}
+
+type tcpPool struct {
+	addr string
+	mu   sync.Mutex // guards initial setup
+	once sync.Once
+	conns []*tcpConnEntry
+	next atomic.Uint64
+}
+
+func newTCPPool(addr string) *tcpPool {
+	p := &tcpPool{addr: addr}
+	p.conns = make([]*tcpConnEntry, tcpPoolConns)
+	for i := range p.conns {
+		p.conns[i] = &tcpConnEntry{parent: p, pending: make(map[uint16]chan []byte)}
+	}
+	return p
+}
+
+// ensure opens (or re-opens) the TCP conn. Caller must hold entry.mu.
+func (e *tcpConnEntry) ensure(timeout time.Duration) error {
+	if e.conn != nil && !e.closed {
+		return nil
+	}
+	if e.closed {
+		// Drop any stale pendings from the previous readLoop.
+		e.pendingMu.Lock()
+		for id, ch := range e.pending {
+			close(ch)
+			delete(e.pending, id)
+		}
+		e.pendingMu.Unlock()
+	}
+	conn, err := net.DialTimeout("tcp", e.parent.addr, timeout)
+	if err != nil {
+		return err
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+	e.conn = conn
+	e.closed = false
+	go e.readLoop(conn)
+	return nil
+}
+
+func (e *tcpConnEntry) readLoop(conn net.Conn) {
+	defer func() {
+		e.mu.Lock()
+		if e.conn == conn {
+			e.closed = true
+			_ = e.conn.Close()
+			e.conn = nil
+		}
+		e.mu.Unlock()
+		e.pendingMu.Lock()
+		for id, ch := range e.pending {
+			close(ch)
+			delete(e.pending, id)
+		}
+		e.pendingMu.Unlock()
+	}()
+	var prefix [2]byte
+	for {
+		if _, err := io.ReadFull(conn, prefix[:]); err != nil {
+			return
+		}
+		rlen := int(binary.BigEndian.Uint16(prefix[:]))
+		if rlen < 2 {
+			return
+		}
+		buf := make([]byte, rlen)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
+		}
+		id := binary.BigEndian.Uint16(buf[:2])
+		e.pendingMu.Lock()
+		ch, ok := e.pending[id]
+		if ok {
+			delete(e.pending, id)
+		}
+		e.pendingMu.Unlock()
+		if ok {
+			ch <- buf
+		}
+	}
+}
+
+func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error) {
+	if len(q) < 2 {
+		return nil, errors.New("query too short")
+	}
+	id := binary.BigEndian.Uint16(q[:2])
+	ch := make(chan []byte, 1)
+
+	e.mu.Lock()
+	if err := e.ensure(timeout); err != nil {
+		e.mu.Unlock()
+		return nil, err
+	}
+	e.pendingMu.Lock()
+	e.pending[id] = ch
+	e.pendingMu.Unlock()
+
+	var prefix [2]byte
+	binary.BigEndian.PutUint16(prefix[:], uint16(len(q)))
+	_ = e.conn.SetWriteDeadline(time.Now().Add(timeout))
+	if _, err := e.conn.Write(prefix[:]); err != nil {
+		e.closed = true
+		e.mu.Unlock()
+		e.pendingMu.Lock()
+		delete(e.pending, id)
+		e.pendingMu.Unlock()
+		return nil, err
+	}
+	if _, err := e.conn.Write(q); err != nil {
+		e.closed = true
+		e.mu.Unlock()
+		e.pendingMu.Lock()
+		delete(e.pending, id)
+		e.pendingMu.Unlock()
+		return nil, err
+	}
+	_ = e.conn.SetWriteDeadline(time.Time{})
+	e.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case resp, ok := <-ch:
+		if !ok {
+			return nil, errors.New("tcp pool conn closed during exchange")
+		}
+		return resp, nil
+	case <-timer.C:
+		e.pendingMu.Lock()
+		delete(e.pending, id)
+		e.pendingMu.Unlock()
+		return nil, errors.New("tcp exchange timeout")
+	}
+}
+
+// exchange picks a conn round-robin. One retry on closed-pool so a
+// reconnect kicks in transparently.
+func (p *tcpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		idx := int((p.next.Add(1) - 1) % uint64(len(p.conns)))
+		resp, err := p.conns[idx].exchange(q, timeout)
+		if err == nil {
+			return resp, nil
+		}
+		if attempt == 1 {
+			return nil, err
+		}
+	}
+	return nil, errors.New("tcp pool: unreachable")
 }

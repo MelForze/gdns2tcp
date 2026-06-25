@@ -66,6 +66,9 @@ type txtResolver struct {
 	retries int
 	useTCP  bool
 	timeout time.Duration
+
+	tcpPoolOnce sync.Once
+	tcpPool     *tcpPool
 }
 
 type progressBar struct {
@@ -195,7 +198,7 @@ func run() error {
 		cfg.dnsServer = server
 		fmt.Printf("using DNS server %s:%s resolved from %s\n", cfg.dnsServer, cfg.dnsPort, cfg.domain)
 	}
-	resolver := txtResolver{
+	resolver := &txtResolver{
 		server:  cfg.dnsServer,
 		port:    cfg.dnsPort,
 		retries: cfg.retries,
@@ -286,7 +289,7 @@ func resolveDomainServer(domain string) (string, error) {
 	return ips[0].String(), nil
 }
 
-func (r txtResolver) query(name string) (string, error) {
+func (r *txtResolver) query(name string) (string, error) {
 	if strings.TrimSpace(name) == "" {
 		return "", errors.New("empty DNS query name")
 	}
@@ -309,7 +312,7 @@ func (r txtResolver) query(name string) (string, error) {
 	return "", lastErr
 }
 
-func (r txtResolver) queryOnce(name string) (string, error) {
+func (r *txtResolver) queryOnce(name string) (string, error) {
 	timeout := r.timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -338,7 +341,11 @@ func (r txtResolver) queryOnce(name string) (string, error) {
 	addr := net.JoinHostPort(r.server, r.port)
 	var resp []byte
 	if r.useTCP {
-		resp, err = exchangeTCP(addr, q, timeout)
+		// Persistent pool avoids ephemeral-port exhaustion on
+		// multi-thousand-query downloads (parallelism=32 + ~11K
+		// chunks bursts out ~16K connections within seconds).
+		r.tcpPoolOnce.Do(func() { r.tcpPool = newTCPPool(addr) })
+		resp, err = r.tcpPool.exchange(q, timeout)
 	} else {
 		resp, err = exchangeUDP(addr, q, timeout)
 	}
@@ -352,7 +359,7 @@ func (r txtResolver) queryOnce(name string) (string, error) {
 	return value, nil
 }
 
-func testConnection(resolver txtResolver, domain string) (string, error) {
+func testConnection(resolver *txtResolver, domain string) (string, error) {
 	if domain == "" {
 		return "", errors.New("domain is required")
 	}
@@ -366,7 +373,7 @@ func testConnection(resolver txtResolver, domain string) (string, error) {
 	return encoding, nil
 }
 
-func listFiles(resolver txtResolver, cfg config) error {
+func listFiles(resolver *txtResolver, cfg config) error {
 	first, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, "c", nil))
 	if err != nil {
 		return err
@@ -391,7 +398,7 @@ func listFiles(resolver txtResolver, cfg config) error {
 	return nil
 }
 
-func uploadFile(resolver txtResolver, cfg config) error {
+func uploadFile(resolver *txtResolver, cfg config) error {
 	inputPath, err := resolveInputPath(cfg.inFile)
 	if err != nil {
 		return err
@@ -481,7 +488,7 @@ func uploadFile(resolver txtResolver, cfg config) error {
 	return nil
 }
 
-func downloadFile(resolver txtResolver, cfg config) error {
+func downloadFile(resolver *txtResolver, cfg config) error {
 	if strings.TrimSpace(cfg.filename) == "" {
 		return errors.New("filename is required for download")
 	}

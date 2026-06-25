@@ -42,9 +42,48 @@ func randomDNSID() uint16 {
 	return id
 }
 
+// dnsQueryPool recycles DNS query buffers. Each axchg round-trip
+// allocates one ~250-byte buffer; with 96 workers × thousands qps the
+// GC pressure adds up. Reusing a pool of buffers cuts ~MB/s worth of
+// allocations on bulk transfers.
+var dnsQueryPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 280)
+		return &b
+	},
+}
+
+// getDNSQueryBuf returns a pooled []byte (length 0, cap ≥ 280). Pair
+// with putDNSQueryBuf after pool.exchange returns.
+func getDNSQueryBuf() *[]byte {
+	bp := dnsQueryPool.Get().(*[]byte)
+	*bp = (*bp)[:0]
+	return bp
+}
+
+func putDNSQueryBuf(bp *[]byte) {
+	if bp == nil {
+		return
+	}
+	// Drop oversized buffers (oddball long-domain queries) so the pool
+	// doesn't accumulate large slices.
+	if cap(*bp) > 1024 {
+		return
+	}
+	dnsQueryPool.Put(bp)
+}
+
 func buildTXTQuery(name string, id uint16) ([]byte, error) {
 	name = strings.TrimSuffix(name, ".")
 	buf := make([]byte, 0, 64+len(name))
+	return buildTXTQueryInto(buf, name, id)
+}
+
+// buildTXTQueryInto writes the DNS query into the given pre-allocated
+// buffer (extended with append). Returns the resulting slice (which may
+// have a different backing array if buf grew). Caller passes a pooled
+// buffer from getDNSQueryBuf when on the hot path.
+func buildTXTQueryInto(buf []byte, name string, id uint16) ([]byte, error) {
 	var hdr [12]byte
 	binary.BigEndian.PutUint16(hdr[0:2], id)
 	hdr[2] = 0x01
@@ -187,42 +226,73 @@ func exchangeUDP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
 	return buf[:n], nil
 }
 
-// udpPool keeps a single persistent UDP connection and multiplexes queries by
-// DNS transaction ID. Avoids per-query socket allocation overhead.
-type udpPool struct {
-	addr    string
-	conn    net.Conn
+// udpPoolSockets is the number of independent UDP sockets multiplexing
+// queries. Each socket has its own per-id pending map and readLoop, so
+// fanning out across them lets bursts of axchg responses parallelise on
+// the kernel's recv-queue path. 4 sockets ≈ matches the TCP pool size
+// and is enough to keep 96 workers fed without overloading the resolver.
+const udpPoolSockets = 4
+
+// udpConnEntry is one persistent UDP socket + its pending-id dispatcher.
+type udpConnEntry struct {
+	conn    *net.UDPConn
 	mu      sync.Mutex
 	pending map[uint16]chan []byte
 	closed  bool
 }
 
+// udpPool fans out queries across udpPoolSockets independent UDP sockets,
+// round-robin. Each socket still multiplexes by DNS transaction ID.
+type udpPool struct {
+	addr  string
+	conns []*udpConnEntry
+	next  atomic.Uint64
+}
+
 func newUDPPool(addr string) (*udpPool, error) {
-	conn, err := net.DialTimeout("udp", addr, 5*time.Second)
-	if err != nil {
-		return nil, err
+	p := &udpPool{addr: addr, conns: make([]*udpConnEntry, udpPoolSockets)}
+	for i := range p.conns {
+		conn, err := net.DialTimeout("udp", addr, 5*time.Second)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				p.conns[j].close()
+			}
+			return nil, err
+		}
+		// Bump kernel UDP recv buffer to 4 MiB per socket. With 96
+		// workers fanning across 4 sockets, each socket sees bursts
+		// of ~24 in-flight responses; 4 MiB leaves comfortable
+		// headroom (≈ 24 × 40 KiB max response × safety). Kernels
+		// may silently clamp to net.core.rmem_max.
+		if uc, ok := conn.(*net.UDPConn); ok {
+			_ = uc.SetReadBuffer(4 * 1024 * 1024)
+			e := &udpConnEntry{conn: uc, pending: make(map[uint16]chan []byte)}
+			p.conns[i] = e
+			go e.readLoop()
+		} else {
+			// Shouldn't happen for "udp" network, but defend anyway.
+			_ = conn.Close()
+			for j := 0; j < i; j++ {
+				p.conns[j].close()
+			}
+			return nil, errors.New("udp pool: unexpected conn type")
+		}
 	}
-	p := &udpPool{
-		addr:    addr,
-		conn:    conn,
-		pending: make(map[uint16]chan []byte),
-	}
-	go p.readLoop()
 	return p, nil
 }
 
-func (p *udpPool) readLoop() {
+func (e *udpConnEntry) readLoop() {
 	buf := make([]byte, ednsUDPBufferSize)
 	for {
-		n, err := p.conn.Read(buf)
+		n, err := e.conn.Read(buf)
 		if err != nil {
-			p.mu.Lock()
-			p.closed = true
-			for _, ch := range p.pending {
+			e.mu.Lock()
+			e.closed = true
+			for _, ch := range e.pending {
 				close(ch)
 			}
-			p.pending = make(map[uint16]chan []byte)
-			p.mu.Unlock()
+			e.pending = make(map[uint16]chan []byte)
+			e.mu.Unlock()
 			return
 		}
 		if n < 2 {
@@ -231,12 +301,12 @@ func (p *udpPool) readLoop() {
 		id := binary.BigEndian.Uint16(buf[:2])
 		resp := make([]byte, n)
 		copy(resp, buf[:n])
-		p.mu.Lock()
-		ch, ok := p.pending[id]
+		e.mu.Lock()
+		ch, ok := e.pending[id]
 		if ok {
-			delete(p.pending, id)
+			delete(e.pending, id)
 		}
-		p.mu.Unlock()
+		e.mu.Unlock()
 		if ok {
 			ch <- resp
 		}
@@ -247,19 +317,24 @@ func (p *udpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
 	if len(q) < 2 {
 		return nil, errors.New("query too short")
 	}
+	idx := int((p.next.Add(1) - 1) % uint64(len(p.conns)))
+	return p.conns[idx].exchange(q, timeout)
+}
+
+func (e *udpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error) {
 	id := binary.BigEndian.Uint16(q[:2])
 	ch := make(chan []byte, 1)
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
 		return nil, errors.New("udp pool closed")
 	}
-	p.pending[id] = ch
-	p.mu.Unlock()
-	if _, err := p.conn.Write(q); err != nil {
-		p.mu.Lock()
-		delete(p.pending, id)
-		p.mu.Unlock()
+	e.pending[id] = ch
+	e.mu.Unlock()
+	if _, err := e.conn.Write(q); err != nil {
+		e.mu.Lock()
+		delete(e.pending, id)
+		e.mu.Unlock()
 		return nil, err
 	}
 	timer := time.NewTimer(timeout)
@@ -271,18 +346,26 @@ func (p *udpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
 		}
 		return resp, nil
 	case <-timer.C:
-		p.mu.Lock()
-		delete(p.pending, id)
-		p.mu.Unlock()
+		e.mu.Lock()
+		delete(e.pending, id)
+		e.mu.Unlock()
 		return nil, errors.New("udp exchange timeout")
 	}
 }
 
+func (e *udpConnEntry) close() {
+	e.mu.Lock()
+	e.closed = true
+	e.mu.Unlock()
+	_ = e.conn.Close()
+}
+
 func (p *udpPool) close() {
-	p.mu.Lock()
-	p.closed = true
-	p.mu.Unlock()
-	_ = p.conn.Close()
+	for _, e := range p.conns {
+		if e != nil {
+			e.close()
+		}
+	}
 }
 
 func exchangeTCP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
@@ -320,10 +403,14 @@ func exchangeTCP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
 // per-conn readLoop. Two conns by default round-robin around head-of-line
 // blocking in TCP (a slow large reply on one socket doesn't stall the other).
 
-// tcpPoolConns is the default fan-out. Two is enough to hide HoL stalls on
-// any single connection; more would dilute connection re-use without much
-// extra throughput on a single-resolver path.
-const tcpPoolConns = 2
+// tcpPoolConns is the fan-out across persistent TCP DNS connections. Each
+// connection has its own per-id pipelining (independent readLoop + pending
+// map), so adding conns linearly reduces HoL contention when axchgWorkers
+// keep many round-trips in flight. 16 connections give each worker
+// (cap=32) two slots before HoL queueing — empirically necessary to
+// avoid stalls on sustained 50 MB+ TCP-DNS bulk transfers where one
+// slow query on a conn drags the rest behind it.
+const tcpPoolConns = 16
 
 type tcpConnEntry struct {
 	parent     *tcpPool

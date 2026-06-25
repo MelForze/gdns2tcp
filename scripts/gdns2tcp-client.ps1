@@ -1,62 +1,3 @@
-<#
-.SYNOPSIS
-Transfers files through an explicitly configured gdns2tcp DNS TXT server.
-
-.DESCRIPTION
-gdns2tcp-client.ps1 is intended for authorized administration, lab testing, and
-training environments. It uploads and downloads user-selected files through DNS
-TXT requests. The script does not configure autorun, alter monitoring controls,
-or execute code received from the network.
-
-.PARAMETER Domain
-Authoritative domain served by gdns2tcp, for example files.example.com.
-
-.PARAMETER Mode
-Operation to run: Upload, Download, List, or Test.
-
-.PARAMETER InFile
-Local file to upload when Mode is Upload.
-
-.PARAMETER OutFile
-Local destination path when Mode is Download. Existing files are not overwritten.
-
-.PARAMETER Filename
-Remote filename to download when Mode is Download.
-
-.PARAMETER Pass
-Shared encryption secret used by the server and client.
-
-.PARAMETER DnsServer
-Optional DNS server address. When omitted, the client resolves Domain and uses
-the first returned IP address.
-
-.PARAMETER DnsPort
-DNS server port. Defaults to 53.
-
-.PARAMETER ChunkSize
-Maximum encoded upload chunk size. The default is conservative for long domains.
-
-.PARAMETER Retries
-Number of DNS query attempts before failing.
-
-.PARAMETER RetryDelaySeconds
-Delay between failed DNS query attempts.
-
-.PARAMETER LogPath
-Optional path for an append-only text log.
-
-.PARAMETER MaxDownloadBytes
-Maximum decompressed download size. Defaults to 33554432 bytes.
-
-.EXAMPLE
-.\gdns2tcp-client.ps1 -Domain files.example.com -Mode Test -Pass secret -DnsServer 192.0.2.10
-
-.EXAMPLE
-.\gdns2tcp-client.ps1 -Domain files.example.com -Mode Upload -Pass secret -InFile .\sample.txt
-
-.EXAMPLE
-.\gdns2tcp-client.ps1 -Domain files.example.com -Mode Download -Pass secret -Filename sample.txt -OutFile .\sample.txt
-#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -339,8 +280,6 @@ function Invoke-TxtQueryOne {
 
 $script:Pbkdf2CSharpLoaded = $false
 
-# Compiled C# PBKDF2-SHA256 fallback. Works on any .NET version (Framework 4.0+,
-# Core, .NET 5+) and runs in ~milliseconds versus 1-3 minutes for the pure-PS loop.
 function Invoke-Pbkdf2Sha256Fast {
     param(
         [Parameter(Mandatory = $true)][byte[]]$Password,
@@ -420,8 +359,6 @@ function Get-KeyMaterial {
 
 $script:DownloadCSharpLoaded = $false
 
-# Compiled C# parallel DNS downloader. Works on .NET Framework 4.5+ and .NET Core/5+.
-# Recomputes auth tokens per goroutine so timestamps stay fresh across minute boundaries.
 function Import-DownloadCSharp {
     if ($script:DownloadCSharpLoaded) { return }
     Add-Type -TypeDefinition @'
@@ -1316,7 +1253,6 @@ function Invoke-Download {
     }
     Write-Log -Level 'INFO' -Message "Downloading $Filename in $chunkCount chunks."
 
-    # Server always encodes downloads as standard base64 via ProtectToBase64, regardless of upload encoding.
     $chunkPattern = '^[A-Za-z0-9+/=]+$'
     $builder = [System.Text.StringBuilder]::new($chunkCount * 254)
     $parallelDone = $false

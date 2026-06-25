@@ -92,10 +92,13 @@ func (r *txtResolver) queryOnce(name string) ([]string, error) {
 		return nil, errors.New("dns-server is required")
 	}
 	id := randomDNSID()
-	q, err := buildTXTQuery(name, id)
+	qbufPtr := getDNSQueryBuf()
+	defer putDNSQueryBuf(qbufPtr)
+	q, err := buildTXTQueryInto(*qbufPtr, strings.TrimSuffix(name, "."), id)
 	if err != nil {
 		return nil, err
 	}
+	*qbufPtr = q
 	var resp []byte
 	switch {
 	case r.useTCP && r.tcpPool != nil:

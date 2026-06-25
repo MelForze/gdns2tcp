@@ -28,7 +28,12 @@ import (
 
 const (
 	sessionKeyContext = "gdns2tcp-session-v1"
-	sessionMACBytes   = 5 // 40 bits → 8 base32 chars (NoPadding)
+	// 4 bytes = 32 bits → 7 base32 chars (NoPadding). Trade-off vs the
+	// prior 40-bit MAC: online forgery cost drops from ~2^40 to ~2^32
+	// guesses, still impractical at any realistic DNS query rate within
+	// the 5-min cid lifetime (≥ 7 years at 10 Gqps). Reclaims 1 char per
+	// query name, ≈ +0.6 byte plaintext per chunk.
+	sessionMACBytes = 4
 )
 
 // DeriveSessionKey returns a per-cid 32-byte key suitable for SessionMAC.

@@ -171,7 +171,7 @@ func TestResumeCacheKeysAreDomainAndFilenameSensitive(t *testing.T) {
 func TestDownloadFileResumeCleansUpAfterSuccess(t *testing.T) {
 	dataDir := t.TempDir()
 	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 
 	payload := make([]byte, 4000)
 	for i := range payload {
@@ -214,7 +214,7 @@ func TestDownloadFileResumeCleansUpAfterSuccess(t *testing.T) {
 func TestDownloadFileResumeUsesCachedBatch(t *testing.T) {
 	dataDir := t.TempDir()
 	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 
 	payload := make([]byte, 6000)
 	for i := range payload {
@@ -265,7 +265,7 @@ func TestDownloadFileResumeUsesCachedBatch(t *testing.T) {
 func TestDownloadFileResumeDisabled(t *testing.T) {
 	dataDir := t.TempDir()
 	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 
 	payload := make([]byte, 5000)
 	for i := range payload {
@@ -304,7 +304,7 @@ func TestDownloadFileResumeDisabled(t *testing.T) {
 // discoverChunkCount issues a dinit DNS query against the test server and
 // parses the chunk-count response — used by resume tests that need to
 // pre-seed a cache with the exact shape downloadFile will discover.
-func discoverChunkCount(t *testing.T, resolver txtResolver, domain, pass, filename string) int {
+func discoverChunkCount(t *testing.T, resolver *txtResolver, domain, pass, filename string) int {
 	t.Helper()
 	sid, err := protocol.NewSID()
 	if err != nil {

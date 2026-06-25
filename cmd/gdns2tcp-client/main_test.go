@@ -185,7 +185,7 @@ func TestResolveInputPath(t *testing.T) {
 
 func TestQueryOnceSuccess(t *testing.T) {
 	ip, port := startEmbeddedServer(t, newServerCfg(t, ""))
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 	got, err := resolver.queryOnce("EnCoDiNg.test.files.test")
 	if err != nil {
 		t.Fatalf("queryOnce: %v", err)
@@ -243,7 +243,7 @@ func TestListFilesIntegration(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 	cfg := config{domain: "files.test", pass: "integration-test-secret", dnsServer: ip, dnsPort: port, retries: 3}
 	if err := listFiles(resolver, cfg); err != nil {
 		t.Fatalf("listFiles: %v", err)
@@ -253,7 +253,7 @@ func TestListFilesIntegration(t *testing.T) {
 func TestUploadDownloadFileIntegration(t *testing.T) {
 	dataDir := t.TempDir()
 	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 
 	filename := "TestCase!3:256.exe.txt"
 	if runtime.GOOS == "windows" {
@@ -317,7 +317,7 @@ func TestDownloadFileRespectsServerMaxDownloadBytes(t *testing.T) {
 	cfg := newServerCfg(t, dataDir)
 	cfg.MaxDownloadBytes = 4
 	ip, port := startEmbeddedServer(t, cfg)
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 
 	err := downloadFile(resolver, config{
 		domain:           "files.test",
@@ -340,7 +340,7 @@ func TestDownloadFileRespectsServerMaxDownloadBytes(t *testing.T) {
 
 // TestQueryEmptyName verifies that query returns an error when the name is empty.
 func TestQueryEmptyName(t *testing.T) {
-	r := txtResolver{server: "127.0.0.1", port: "53", retries: 1}
+	r := &txtResolver{server: "127.0.0.1", port: "53", retries: 1}
 	_, err := r.query("")
 	if err == nil || !strings.Contains(err.Error(), "empty") {
 		t.Fatalf("query(\"\") error=%v, want error containing \"empty\"", err)
@@ -350,7 +350,7 @@ func TestQueryEmptyName(t *testing.T) {
 // TestQueryOnceNoServerRequiredPort verifies that queryOnce returns an error
 // when no server is configured but the port is non-default (not 53).
 func TestQueryOnceNoServerRequiredPort(t *testing.T) {
-	r := txtResolver{server: "", port: "5353", retries: 1}
+	r := &txtResolver{server: "", port: "5353", retries: 1}
 	_, err := r.queryOnce("test.example.com")
 	if err == nil || !strings.Contains(err.Error(), "dns-server is required") {
 		t.Fatalf("queryOnce with empty server and non-53 port error=%v, want \"dns-server is required\"", err)
@@ -360,7 +360,7 @@ func TestQueryOnceNoServerRequiredPort(t *testing.T) {
 // TestTestConnectionEmptyDomain verifies that testConnection returns an error
 // when the domain is empty.
 func TestTestConnectionEmptyDomain(t *testing.T) {
-	r := txtResolver{}
+	r := &txtResolver{}
 	_, err := testConnection(r, "")
 	if err == nil || !strings.Contains(err.Error(), "domain is required") {
 		t.Fatalf("testConnection(\"\") error=%v, want \"domain is required\"", err)
@@ -371,7 +371,7 @@ func TestTestConnectionEmptyDomain(t *testing.T) {
 // TestUploadFileMissingInput verifies that uploadFile returns an error when
 // domain and pass are provided but no input file is set.
 func TestUploadFileMissingInput(t *testing.T) {
-	r := txtResolver{}
+	r := &txtResolver{}
 	err := uploadFile(r, config{domain: "example.com", pass: "secret"})
 	if err == nil || !strings.Contains(err.Error(), "input file is required") {
 		t.Fatalf("uploadFile with empty inFile error=%v, want error about input file", err)
@@ -382,7 +382,7 @@ func TestUploadFileMissingInput(t *testing.T) {
 // when no filename is set (the check is kept in downloadFile since the
 // fallback output-path logic makes the error message ambiguous otherwise).
 func TestDownloadFileMissingFilename(t *testing.T) {
-	r := txtResolver{}
+	r := &txtResolver{}
 	err := downloadFile(r, config{domain: "example.com", pass: "secret"})
 	if err == nil || !strings.Contains(err.Error(), "filename is required") {
 		t.Fatalf("downloadFile with empty filename error=%v, want \"filename is required\"", err)
@@ -443,7 +443,7 @@ func TestListFilesPagination(t *testing.T) {
 		}
 	}
 	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 	cfg := config{
 		domain:    "files.test",
 		pass:      "integration-test-secret",
@@ -460,7 +460,7 @@ func TestListFilesPagination(t *testing.T) {
 // subdomain returns a non-nil error.
 func TestQueryRetriesOnTransientError(t *testing.T) {
 	ip, port := startEmbeddedServer(t, newServerCfg(t, ""))
-	resolver := txtResolver{server: ip, port: port, retries: 2}
+	resolver := &txtResolver{server: ip, port: port, retries: 2}
 	// Query a name that the server does not serve — it belongs to a different domain.
 	_, err := resolver.queryOnce("notexist.example.subdomain.files.test")
 	// The embedded server only answers for "files.test." so this should yield
@@ -476,7 +476,7 @@ func TestQueryRetriesOnTransientError(t *testing.T) {
 // supported encoding ("base64" or "base32") when talking to the embedded server.
 func TestTestConnectionIntegration(t *testing.T) {
 	ip, port := startEmbeddedServer(t, newServerCfg(t, ""))
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 	encoding, err := testConnection(resolver, "files.test")
 	if err != nil {
 		t.Fatalf("testConnection: %v", err)
@@ -626,7 +626,7 @@ func TestQueryOnceRcodeError(t *testing.T) {
 		_ = w.WriteMsg(m)
 	})
 
-	r := txtResolver{server: ip, port: port, retries: 1}
+	r := &txtResolver{server: ip, port: port, retries: 1}
 	_, err := r.queryOnce("test.files.test")
 	if err == nil || !strings.Contains(err.Error(), "REFUSED") {
 		t.Fatalf("queryOnce REFUSED error=%v, want 'REFUSED'", err)
@@ -643,7 +643,7 @@ func TestQueryOnceNoTXTInAnswer(t *testing.T) {
 		_ = w.WriteMsg(m)
 	})
 
-	r := txtResolver{server: ip, port: port, retries: 1}
+	r := &txtResolver{server: ip, port: port, retries: 1}
 	_, err := r.queryOnce("test.files.test")
 	if err == nil || !strings.Contains(err.Error(), "no TXT response") {
 		t.Fatalf("queryOnce empty answer error=%v, want 'no TXT response'", err)
@@ -659,7 +659,7 @@ func TestQueryOnceNoTXTInAnswer(t *testing.T) {
 // so every attempt fails and we exercise the loop internals with one iteration.
 func TestQueryZeroRetriesNormalized(t *testing.T) {
 	ip, port := startEmbeddedServer(t, newServerCfg(t, ""))
-	r := txtResolver{server: ip, port: port, retries: 0}
+	r := &txtResolver{server: ip, port: port, retries: 0}
 	_, err := r.query("something.other.example.com")
 	if err == nil {
 		t.Fatal("expected error for wrong-domain query")
@@ -671,7 +671,7 @@ func TestQueryZeroRetriesNormalized(t *testing.T) {
 // Two retries cause one 250 ms sleep, keeping the test fast but verifiable.
 func TestQueryRetryLoopWithSleep(t *testing.T) {
 	ip, port := startEmbeddedServer(t, newServerCfg(t, ""))
-	r := txtResolver{server: ip, port: port, retries: 2}
+	r := &txtResolver{server: ip, port: port, retries: 2}
 	start := time.Now()
 	_, err := r.query("something.other.example.com")
 	elapsed := time.Since(start)
@@ -700,7 +700,7 @@ func TestTestConnectionUnsupportedEncoding(t *testing.T) {
 		_ = w.WriteMsg(m)
 	})
 
-	resolver := txtResolver{server: ip, port: port, retries: 1}
+	resolver := &txtResolver{server: ip, port: port, retries: 1}
 	_, err := testConnection(resolver, "files.test")
 	if err == nil || !strings.Contains(err.Error(), "unsupported encoding") {
 		t.Fatalf("testConnection garbage encoding error=%v, want 'unsupported encoding'", err)
@@ -718,7 +718,7 @@ func TestTestConnectionUnsupportedEncoding(t *testing.T) {
 // executed before the DNS query is made.
 func TestDownloadFileDefaultOutputPath(t *testing.T) {
 	ip, port := startEmbeddedServer(t, newServerCfg(t, ""))
-	r := txtResolver{server: ip, port: port, retries: 1}
+	r := &txtResolver{server: ip, port: port, retries: 1}
 
 	err := downloadFile(r, config{
 		domain:           "files.test",
@@ -740,7 +740,7 @@ func TestDownloadFileDefaultOutputPath(t *testing.T) {
 // failure instead of "Ready to file uploading".
 func TestUploadFileStatusMismatch(t *testing.T) {
 	ip, port := startEmbeddedServer(t, newServerCfg(t, t.TempDir()))
-	r := txtResolver{server: ip, port: port, retries: 1}
+	r := &txtResolver{server: ip, port: port, retries: 1}
 
 	inputPath := filepath.Join(t.TempDir(), "data.txt")
 	if err := os.WriteFile(inputPath, []byte("test data"), 0o600); err != nil {
@@ -771,7 +771,7 @@ func TestUploadFileStatusMismatch(t *testing.T) {
 func TestDownloadFileParallelMultiChunk(t *testing.T) {
 	dataDir := t.TempDir()
 	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
-	resolver := txtResolver{server: ip, port: port, retries: 3}
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
 
 	// Build a payload that is varied enough to resist compression, so the
 	// encrypted output spans well over downloadParallelism chunks.
@@ -822,7 +822,7 @@ func TestDownloadFileParallelChunkError(t *testing.T) {
 	}
 
 	// Use retries=1 and a bad pass so the chunk queries fail with auth errors.
-	resolver := txtResolver{server: ip, port: port, retries: 1}
+	resolver := &txtResolver{server: ip, port: port, retries: 1}
 	cfg := config{
 		domain:           "files.test",
 		pass:             "wrong-secret",

@@ -167,20 +167,96 @@ func TestUDPPoolExchangeShortQuery(t *testing.T) {
 	}
 }
 
-// TestMaxAwritePlaintextBytesTransportParity pins the post-bugfix invariant:
-// the DNS QNAME 253-char ceiling is a wire-format constraint, not a
-// transport-level one, so UDP and TCP yield the same per-query plaintext
-// budget. The previous hardcoded `if tcp { return 4000 }` produced query
-// names ~6400 chars long and triggered FORMERR on the server.
-func TestMaxAwritePlaintextBytesTransportParity(t *testing.T) {
-	tcp := maxAwritePlaintextBytes("example.com", true)
-	udp := maxAwritePlaintextBytes("example.com", false)
-	if tcp != udp {
-		t.Fatalf("tcp %d != udp %d — DNS QNAME limit is transport-independent", tcp, udp)
+// TestMaxAxchgWritePlaintextBytes checks the plaintext budget against the
+// actual axchg wire format. For each transport, it assembles a worst-case
+// query (maximum-width seq/nonce, base32-encoded sealed payload at the full
+// budget, "tcp" label when applicable) and asserts the resulting QNAME fits
+// inside the 253-char DNS name limit. The previous test only asserted
+// `tcp < udp`, which would have passed a regression that silently shrank
+// the budget or one that pushed the assembled query past 253 chars.
+func TestMaxAxchgWritePlaintextBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		domain string
+		tcp    bool
+	}{
+		{"short-udp", "example.com", false},
+		{"short-tcp", "example.com", true},
+		{"medium-udp", "files.example.com", false},
+		{"medium-tcp", "files.example.com", true},
+		{"long-udp", strings.Repeat("a", 60) + ".example.com", false},
+		{"long-tcp", strings.Repeat("a", 60) + ".example.com", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Worst-case hex widths — same as handleTunnel's startup check.
+			raw := maxAxchgWritePlaintextBytes(tc.domain, tc.tcp, 8, 8)
+			if raw < 16 {
+				t.Fatalf("budget %d too small to carry useful plaintext", raw)
+			}
+			got := assembleAxchgQueryLen(tc.domain, tc.tcp, raw)
+			if got > 253 {
+				t.Fatalf("assembled axchg QNAME %d chars > 253 limit (domain=%q tcp=%v raw=%d)", got, tc.domain, tc.tcp, raw)
+			}
+		})
 	}
-	if udp <= 0 || udp >= 200 {
-		t.Fatalf("plaintext budget: got %d, expected 1-199", udp)
+
+	// TCP must yield a strictly smaller budget than UDP for the same
+	// domain because the "tcp" label adds 4 chars (label + dot).
+	if tcp, udp := maxAxchgWritePlaintextBytes("example.com", true, 8, 8), maxAxchgWritePlaintextBytes("example.com", false, 8, 8); tcp >= udp {
+		t.Fatalf("tcp %d should be smaller than udp %d (tcp label costs 4 chars)", tcp, udp)
 	}
+
+	// Dynamic budget reclaims overhead when seq/nonce are small (typical
+	// at the start of a tunnel). With widths 2+2 vs 8+8, the budget
+	// should grow by a measurable margin.
+	worst := maxAxchgWritePlaintextBytes("example.com", false, 8, 8)
+	dyn := maxAxchgWritePlaintextBytes("example.com", false, 2, 2)
+	if dyn-worst < 6 {
+		t.Fatalf("dynamic budget gain too small: worst=%d dyn=%d (expected ≥+6 bytes)", worst, dyn)
+	}
+}
+
+// TestMaxAxchgWritePlaintextBytesRefusesLongDomains pins the contract that a
+// domain too long to fit any useful payload yields a budget below the 16-byte
+// floor handleTunnel enforces, so the agent fails loudly instead of issuing
+// queries that overflow the 253-char QNAME and trigger server FORMERR.
+func TestMaxAxchgWritePlaintextBytesRefusesLongDomains(t *testing.T) {
+	tooLong := strings.Repeat("a", 200) + ".example.com"
+	if raw := maxAxchgWritePlaintextBytes(tooLong, false, 8, 8); raw >= 16 {
+		t.Fatalf("expected refusal-grade budget for 212-char domain, got %d", raw)
+	}
+}
+
+// assembleAxchgQueryLen mimics the wire-format encoding agentExchange uses:
+// cid . writeSeq . [base32 data labels] . [tcp] . readNonce . smac . axchg
+// . domain. It returns the total QNAME char count for a worst-case payload
+// of `raw` plaintext bytes (raw + 16-byte AES-GCM tag, base32 expansion,
+// split into 63-char labels).
+func assembleAxchgQueryLen(domain string, tcp bool, raw int) int {
+	const (
+		cidLen     = 16
+		seqMaxLen  = 8 // hex chars, capped at uint32 in practice
+		nonceLen   = 8
+		smacLen    = 7
+		cmdLen     = 5 // "axchg"
+		labelLimit = 63
+	)
+	sealedBytes := raw + 16
+	// base32 (no padding) expansion: ceil(8/5).
+	encChars := (sealedBytes*8 + 4) / 5
+	dataLabels := (encChars + labelLimit - 1) / labelLimit
+	total := cidLen + seqMaxLen + encChars + nonceLen + smacLen + cmdLen + len(domain)
+	if tcp {
+		total += 3 // "tcp" label chars
+	}
+	// Dots: between every adjacent label. Labels = 2 (cid,seq) + dataLabels
+	// + (1 if tcp) + 3 (nonce, smac, axchg) + 1 (domain).
+	labels := 2 + dataLabels + 3 + 1
+	if tcp {
+		labels++
+	}
+	total += labels - 1
+	return total
 }
 
 // fakeTCPDNS spins up a TCP listener that speaks DNS-over-TCP framing and
