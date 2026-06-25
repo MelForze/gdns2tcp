@@ -352,9 +352,9 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 					}
 				}
 				var (
-					res                exchangeResult
-					err                error
-					backpressureStart  time.Time
+					res               exchangeResult
+					err               error
+					backpressureStart time.Time
 				)
 				for attempt := 0; attempt < axchgRetries; attempt++ {
 					if haveJob {
@@ -580,7 +580,7 @@ type awriteJob struct {
 // place in a single axchg DNS query name without exceeding 253 printable
 // chars. The layout is:
 //
-//	cid(16) . writeSeq(seqWidth) . [dataLabels...] . ["tcp"(3)] . readNonce(nonceWidth) . smac(8) . "axchg"(5) . domain
+//	cid(16) . writeSeq(seqWidth) . [dataLabels...] . ["x-tcp"(5)] . readNonce(nonceWidth) . smac(8) . "axchg"(5) . domain
 //
 // seqWidth / nonceWidth let the caller pass the *actual* decimal-digit
 // widths of the seq and nonce to be sent. Passing the worst-case width
@@ -589,7 +589,7 @@ type awriteJob struct {
 // chars of overhead that the worst-case reserves but rarely uses,
 // translating to +5-15 plaintext bytes per chunk.
 //
-// The tcp flag adds 4 chars (label + dot) when present.
+// The tcp flag adds 6 chars (label + dot) when present.
 //
 // Returns the math-computed budget without clamping; a domain long enough to
 // drive the result toward zero or negative makes axchg infeasible at this
@@ -611,7 +611,7 @@ func maxAxchgWritePlaintextBytes(domain string, tcp bool, seqWidth, nonceWidth i
 	)
 	overhead := cidLabel + seqWidth + nonceWidth + smacLabel + cmdLabel + len(domain) + dotsMargin
 	if tcp {
-		overhead += 4 // "tcp" + dot
+		overhead += len(gproxy.AxchgTCPMarker) + 1
 	}
 	available := dnsNameMax - overhead
 	raw := (available * 5) / 8
@@ -696,7 +696,7 @@ type exchangeResult struct {
 // chunk (or none) with a fresh aread pull. Returns the parsed exchangeResult
 // or an error; the caller decides what to retry.
 //
-// Wire: cid . writeSeq . [writeChunks...] . [tcp] . readNonce . smac . axchg . domain
+// Wire: cid . writeSeq . [writeChunks...] . [x-tcp] . readNonce . smac . axchg . domain
 func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, writeSeq uint64, writeData []byte) (exchangeResult, error) {
 	readNonce := ts.nextNonce()
 	args := make([]string, 0, 8)
@@ -708,7 +708,7 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 		args = append(args, codec.ChunkString(enc, 63)...)
 	}
 	if cfg.tcp {
-		args = append(args, "tcp")
+		args = append(args, gproxy.AxchgTCPMarker)
 	}
 	args = append(args, strconv.FormatUint(readNonce, 16))
 	args = append(args, protocol.SessionMAC(ts.sessionKey, "axchg", readNonce))
@@ -735,6 +735,9 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 		acked, perr := strconv.ParseUint(strings.TrimPrefix(head, "ACK "), 16, 64)
 		if perr != nil {
 			return exchangeResult{}, fmt.Errorf("malformed ACK: %w", perr)
+		}
+		if acked != writeSeq {
+			return exchangeResult{}, fmt.Errorf("axchg ACK mismatch: got %x want %x", acked, writeSeq)
 		}
 
 		res := exchangeResult{ackedWriteSeq: acked}

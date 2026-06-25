@@ -238,6 +238,7 @@ type udpConnEntry struct {
 	conn    *net.UDPConn
 	mu      sync.Mutex
 	pending map[uint16]chan []byte
+	nextID  uint16
 	closed  bool
 }
 
@@ -266,7 +267,7 @@ func newUDPPool(addr string) (*udpPool, error) {
 		// may silently clamp to net.core.rmem_max.
 		if uc, ok := conn.(*net.UDPConn); ok {
 			_ = uc.SetReadBuffer(4 * 1024 * 1024)
-			e := &udpConnEntry{conn: uc, pending: make(map[uint16]chan []byte)}
+			e := &udpConnEntry{conn: uc, pending: make(map[uint16]chan []byte), nextID: randomDNSID()}
 			p.conns[i] = e
 			go e.readLoop()
 		} else {
@@ -322,18 +323,22 @@ func (p *udpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
 }
 
 func (e *udpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error) {
-	id := binary.BigEndian.Uint16(q[:2])
 	ch := make(chan []byte, 1)
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
 		return nil, errors.New("udp pool closed")
 	}
-	e.pending[id] = ch
+	id, err := reserveDNSIDLocked(e.pending, &e.nextID, ch)
+	if err != nil {
+		e.mu.Unlock()
+		return nil, err
+	}
+	binary.BigEndian.PutUint16(q[:2], id)
 	e.mu.Unlock()
 	if _, err := e.conn.Write(q); err != nil {
 		e.mu.Lock()
-		delete(e.pending, id)
+		deletePendingIfOwnedLocked(e.pending, id, ch)
 		e.mu.Unlock()
 		return nil, err
 	}
@@ -347,7 +352,7 @@ func (e *udpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		return resp, nil
 	case <-timer.C:
 		e.mu.Lock()
-		delete(e.pending, id)
+		deletePendingIfOwnedLocked(e.pending, id, ch)
 		e.mu.Unlock()
 		return nil, errors.New("udp exchange timeout")
 	}
@@ -417,6 +422,7 @@ type tcpConnEntry struct {
 	mu         sync.Mutex // serializes writes on this conn
 	pendingMu  sync.Mutex
 	pending    map[uint16]chan []byte
+	nextID     uint16
 	conn       net.Conn
 	closed     bool
 	connectErr error
@@ -436,7 +442,7 @@ func newTCPPool(addr string) *tcpPool {
 	}
 	p.conns = make([]*tcpConnEntry, tcpPoolConns)
 	for i := range p.conns {
-		p.conns[i] = &tcpConnEntry{parent: p, pending: make(map[uint16]chan []byte)}
+		p.conns[i] = &tcpConnEntry{parent: p, pending: make(map[uint16]chan []byte), nextID: randomDNSID()}
 	}
 	return p
 }
@@ -531,7 +537,6 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 	if len(q) < 2 {
 		return nil, errors.New("query too short")
 	}
-	id := binary.BigEndian.Uint16(q[:2])
 	ch := make(chan []byte, 1)
 
 	e.mu.Lock()
@@ -540,7 +545,13 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		return nil, err
 	}
 	e.pendingMu.Lock()
-	e.pending[id] = ch
+	id, err := reserveDNSIDLocked(e.pending, &e.nextID, ch)
+	if err != nil {
+		e.pendingMu.Unlock()
+		e.mu.Unlock()
+		return nil, err
+	}
+	binary.BigEndian.PutUint16(q[:2], id)
 	e.pendingMu.Unlock()
 
 	var prefix [2]byte
@@ -550,7 +561,7 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		e.closed = true
 		e.mu.Unlock()
 		e.pendingMu.Lock()
-		delete(e.pending, id)
+		deletePendingIfOwnedLocked(e.pending, id, ch)
 		e.pendingMu.Unlock()
 		return nil, err
 	}
@@ -558,7 +569,7 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		e.closed = true
 		e.mu.Unlock()
 		e.pendingMu.Lock()
-		delete(e.pending, id)
+		deletePendingIfOwnedLocked(e.pending, id, ch)
 		e.pendingMu.Unlock()
 		return nil, err
 	}
@@ -575,9 +586,31 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		return resp, nil
 	case <-timer.C:
 		e.pendingMu.Lock()
-		delete(e.pending, id)
+		deletePendingIfOwnedLocked(e.pending, id, ch)
 		e.pendingMu.Unlock()
 		return nil, errors.New("tcp exchange timeout")
+	}
+}
+
+func reserveDNSIDLocked(pending map[uint16]chan []byte, nextID *uint16, ch chan []byte) (uint16, error) {
+	for i := 0; i < 65535; i++ {
+		*nextID = *nextID + 1
+		if *nextID == 0 {
+			*nextID = 1
+		}
+		id := *nextID
+		if _, exists := pending[id]; exists {
+			continue
+		}
+		pending[id] = ch
+		return id, nil
+	}
+	return 0, errors.New("dns transaction id space exhausted")
+}
+
+func deletePendingIfOwnedLocked(pending map[uint16]chan []byte, id uint16, ch chan []byte) {
+	if pending[id] == ch {
+		delete(pending, id)
 	}
 }
 

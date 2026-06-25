@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	gproxy "gdns2tcp/internal/proxy"
 )
 
 func TestParseTXTSegmentsErrors(t *testing.T) {
@@ -103,8 +105,9 @@ func TestUDPPoolExchange(t *testing.T) {
 		t.Fatal("response too short")
 	}
 	gotID := binary.BigEndian.Uint16(resp[:2])
-	if gotID != 42 {
-		t.Fatalf("ID mismatch: got %d want 42", gotID)
+	wantID := binary.BigEndian.Uint16(q[:2])
+	if gotID != wantID {
+		t.Fatalf("ID mismatch: got %d want %d", gotID, wantID)
 	}
 }
 
@@ -167,10 +170,36 @@ func TestUDPPoolExchangeShortQuery(t *testing.T) {
 	}
 }
 
+func TestReserveDNSIDLockedSkipsPendingID(t *testing.T) {
+	existing := make(chan []byte, 1)
+	ch := make(chan []byte, 1)
+	nextID := uint16(41)
+	pending := map[uint16]chan []byte{42: existing}
+
+	id, err := reserveDNSIDLocked(pending, &nextID, ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 43 {
+		t.Fatalf("reserved id=%d, want 43", id)
+	}
+	if pending[42] != existing {
+		t.Fatal("existing pending id was overwritten")
+	}
+	deletePendingIfOwnedLocked(pending, 42, ch)
+	if pending[42] != existing {
+		t.Fatal("deletePendingIfOwnedLocked removed a channel it did not own")
+	}
+	deletePendingIfOwnedLocked(pending, 43, ch)
+	if _, ok := pending[43]; ok {
+		t.Fatal("owned pending id was not removed")
+	}
+}
+
 // TestMaxAxchgWritePlaintextBytes checks the plaintext budget against the
 // actual axchg wire format. For each transport, it assembles a worst-case
 // query (maximum-width seq/nonce, base32-encoded sealed payload at the full
-// budget, "tcp" label when applicable) and asserts the resulting QNAME fits
+// budget, "x-tcp" label when applicable) and asserts the resulting QNAME fits
 // inside the 253-char DNS name limit. The previous test only asserted
 // `tcp < udp`, which would have passed a regression that silently shrank
 // the budget or one that pushed the assembled query past 253 chars.
@@ -201,9 +230,9 @@ func TestMaxAxchgWritePlaintextBytes(t *testing.T) {
 	}
 
 	// TCP must yield a strictly smaller budget than UDP for the same
-	// domain because the "tcp" label adds 4 chars (label + dot).
+	// domain because the "x-tcp" label adds 6 chars (label + dot).
 	if tcp, udp := maxAxchgWritePlaintextBytes("example.com", true, 8, 8), maxAxchgWritePlaintextBytes("example.com", false, 8, 8); tcp >= udp {
-		t.Fatalf("tcp %d should be smaller than udp %d (tcp label costs 4 chars)", tcp, udp)
+		t.Fatalf("tcp %d should be smaller than udp %d (tcp label costs 6 chars)", tcp, udp)
 	}
 
 	// Dynamic budget reclaims overhead when seq/nonce are small (typical
@@ -228,7 +257,7 @@ func TestMaxAxchgWritePlaintextBytesRefusesLongDomains(t *testing.T) {
 }
 
 // assembleAxchgQueryLen mimics the wire-format encoding agentExchange uses:
-// cid . writeSeq . [base32 data labels] . [tcp] . readNonce . smac . axchg
+// cid . writeSeq . [base32 data labels] . [x-tcp] . readNonce . smac . axchg
 // . domain. It returns the total QNAME char count for a worst-case payload
 // of `raw` plaintext bytes (raw + 16-byte AES-GCM tag, base32 expansion,
 // split into 63-char labels).
@@ -247,7 +276,7 @@ func assembleAxchgQueryLen(domain string, tcp bool, raw int) int {
 	dataLabels := (encChars + labelLimit - 1) / labelLimit
 	total := cidLen + seqMaxLen + encChars + nonceLen + smacLen + cmdLen + len(domain)
 	if tcp {
-		total += 3 // "tcp" label chars
+		total += len(gproxy.AxchgTCPMarker)
 	}
 	// Dots: between every adjacent label. Labels = 2 (cid,seq) + dataLabels
 	// + (1 if tcp) + 3 (nonce, smac, axchg) + 1 (domain).
@@ -333,13 +362,14 @@ func TestTCPPoolExchange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("exchange: %v", err)
 	}
-	if got := binary.BigEndian.Uint16(resp[:2]); got != 1234 {
-		t.Fatalf("DNS ID mismatch: got %d want 1234", got)
+	if got, want := binary.BigEndian.Uint16(resp[:2]), binary.BigEndian.Uint16(q[:2]); got != want {
+		t.Fatalf("DNS ID mismatch: got %d want %d", got, want)
 	}
 }
 
-// TestTCPPoolMultiplexedIDs runs concurrent exchanges and verifies each
-// gets back its own ID — proving the pending-by-ID dispatch in readLoop.
+// TestTCPPoolMultiplexedIDs runs concurrent exchanges and verifies each gets
+// back the ID assigned by the pool, proving the pending-by-ID dispatch in
+// readLoop.
 func TestTCPPoolMultiplexedIDs(t *testing.T) {
 	addr, stop := fakeTCPDNS(t)
 	defer stop()
@@ -362,8 +392,8 @@ func TestTCPPoolMultiplexedIDs(t *testing.T) {
 				errs[i] = err
 				return
 			}
-			if got := binary.BigEndian.Uint16(resp[:2]); got != uint16(i+100) {
-				errs[i] = fmt.Errorf("id mismatch: got %d want %d", got, i+100)
+			if got, want := binary.BigEndian.Uint16(resp[:2]), binary.BigEndian.Uint16(q[:2]); got != want {
+				errs[i] = fmt.Errorf("id mismatch: got %d want %d", got, want)
 			}
 		}(i)
 	}

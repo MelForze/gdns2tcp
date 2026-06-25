@@ -200,8 +200,8 @@ intermediate resolvers truncate large UDP responses or block UDP/53.
 The reverse mode turns gdns2tcp into a way to **see what the agent sees**: an
 internal-network machine runs `gdns2tcp-client-proxy` (the *agent*), polls
 the public server through DNS, and dials upstream services locally. Your
-host connects to `socks5://server:9050` as a normal SOCKS5 proxy — no DNS
-client involved — and traffic emerges from the agent's vantage point.
+host connects to the server's SOCKS5 listener as a normal SOCKS5 proxy — no
+DNS client involved — and traffic emerges from the agent's vantage point.
 
 ```
 operator ── TCP/SOCKS5 ──> server:9050 ── DNS tunnel ──> agent ──> upstream
@@ -221,15 +221,17 @@ Add `-allow-proxy` to your server invocation. Off by default:
 sudo ./servers/gdns2tcp-server-linux-amd64 -domain files.example.com -secret "change-me" -allow-proxy
 ```
 
-This starts a TCP SOCKS5 listener on **`0.0.0.0:9050`**. SOCKS5
-**username/password authentication is required** (RFC 1929): username =
-`gdns2tcp`, password = the `-secret` value, so the open port is not
-actually usable without the secret.
+This starts a TCP SOCKS5 listener on **`127.0.0.1:9050`** with SOCKS5
+authentication disabled by default. Use `-socks-listen 0.0.0.0:9050` only
+when you intentionally want to expose it to remote operators; pair public
+binds with `-socks-no-auth=false` if you want RFC 1929 username/password
+authentication (`gdns2tcp` / the `-secret` value).
 
 | Flag | Default | Description |
 |---|---|---|
 | `-allow-proxy` | `false` | enable reverse SOCKS5 + agent endpoints |
-| `-socks-listen` | `0.0.0.0:9050` | TCP address for the operator-facing SOCKS5 listener |
+| `-socks-listen` | `127.0.0.1:9050` | TCP address for the operator-facing SOCKS5 listener |
+| `-socks-no-auth` | `true` | disable SOCKS5 username/password auth; pass `-socks-no-auth=false` to require auth |
 | `-proxy-max-conn` | `64` | global cap on concurrent tunnel connections |
 | `-proxy-buf-bytes` | `1048576` | per-tunnel buffer cap in each direction |
 
@@ -344,13 +346,13 @@ session asks for.
 
 ### Use the tunnel
 
-Point any SOCKS5 client at `<server-ip>:9050` (user `gdns2tcp`,
-password `<-secret>`); browsers and ssh's `ProxyCommand=ncat --proxy`
-both work the same way.
+Point any SOCKS5 client at the listener; browsers and ssh's
+`ProxyCommand=ncat --proxy` both work the same way. If you started the server
+with `-socks-no-auth=false`, use username `gdns2tcp` and password
+`<-secret>`.
 
 ```sh
-curl --socks5-hostname --proxy-user "gdns2tcp:change-me" \
-     socks5h://<server-ip>:9050 https://internal-service.corp/
+curl --socks5-hostname socks5h://127.0.0.1:9050 https://internal-service.corp/
 ```
 
 ### Throughput limits
@@ -408,7 +410,8 @@ as the only allowed channel.
 | `-max-download-bytes` | 33 MiB | Maximum source file size for downloads |
 | `-disable-list` | `false` | Disable the `list` (catalog) command |
 | `-allow-proxy` | `false` | Enable reverse SOCKS5 listener + agent DNS endpoints |
-| `-socks-listen` | `0.0.0.0:9050` | TCP address for the operator-facing SOCKS5 listener |
+| `-socks-listen` | `127.0.0.1:9050` | TCP address for the operator-facing SOCKS5 listener |
+| `-socks-no-auth` | `true` | Disable SOCKS5 username/password auth; pass `-socks-no-auth=false` to require auth |
 | `-proxy-max-conn` | `64` | Maximum concurrent tunnel connections |
 | `-proxy-buf-bytes` | 1 MiB | Per-tunnel buffer cap in each direction |
 

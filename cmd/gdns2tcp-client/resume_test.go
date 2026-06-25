@@ -206,12 +206,11 @@ func TestDownloadFileResumeCleansUpAfterSuccess(t *testing.T) {
 	}
 }
 
-// TestDownloadFileResumeUsesCachedBatch proves the cache is actually read by
-// pre-seeding it with deliberately-broken data and expecting the download to
-// fail at the decode/decrypt step. A run without resume would have succeeded
-// against the same server, so the failure isolates "cache was used" as the
-// cause.
-func TestDownloadFileResumeUsesCachedBatch(t *testing.T) {
+// TestDownloadFileResumeDropsPoisonedCache proves stale or corrupt cached
+// batches do not trap the client in a permanent decrypt failure. The first
+// attempt reads the poisoned cache, detects the final payload failure, clears
+// the cache, and retries the transfer without resume.
+func TestDownloadFileResumeDropsPoisonedCache(t *testing.T) {
 	dataDir := t.TempDir()
 	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
 	resolver := &txtResolver{server: ip, port: port, retries: 3}
@@ -253,9 +252,18 @@ func TestDownloadFileResumeUsesCachedBatch(t *testing.T) {
 		maxDownloadBytes: defaultMaxDownloadBytes,
 		cacheDir:         cacheDir,
 	}
-	err := downloadFile(resolver, cfg)
-	if err == nil {
-		t.Fatal("expected decode/decrypt failure due to poisoned cache, got nil")
+	if err := downloadFile(resolver, cfg); err != nil {
+		t.Fatalf("downloadFile should recover from poisoned cache, got %v", err)
+	}
+	got, err := os.ReadFile(cfg.outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatal("downloaded payload mismatch after poisoned-cache retry")
+	}
+	if _, err := os.Stat(cache.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cache dir %s should be cleared after retry success", cache.dir)
 	}
 }
 

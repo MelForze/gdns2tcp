@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 	"strings"
@@ -115,5 +116,5 @@ func (r *txtResolver) queryOnce(name string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseTXTSegments(resp, id)
+	return parseTXTSegments(resp, binary.BigEndian.Uint16(q[:2]))
 }

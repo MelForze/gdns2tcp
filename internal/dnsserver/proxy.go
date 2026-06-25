@@ -64,16 +64,16 @@ const (
 const awriteWindow = 512
 
 type reverseConn struct {
-	target      string // "host:port" — agent dials this
-	operator    net.Conn
-	aead        cipher.AEAD
-	sessionKey  [32]byte
-	compressor  *gproxy.Compressor
-	mu          sync.Mutex
+	target     string // "host:port" — agent dials this
+	operator   net.Conn
+	aead       cipher.AEAD
+	sessionKey [32]byte
+	compressor *gproxy.Compressor
+	mu         sync.Mutex
 	// writeMu serialises the writev to rc.operator so concurrent awrite/
 	// axchg drains don't interleave bytes on the operator socket. It's
 	// held only across the syscall — drain itself runs under rc.mu.
-	writeMu sync.Mutex
+	writeMu     sync.Mutex
 	opToAgent   bytes.Buffer
 	opCond      *sync.Cond
 	seqAgentIn  uint64 // last contiguously written awrite seq
@@ -194,7 +194,6 @@ func (rc *reverseConn) commitOperatorWrite(batch net.Buffers) error {
 // already-buffered burst clears in two batches.
 const drainBatchSize = 32
 
-
 // awaitReadData parks the caller for up to window while waiting for new
 // op→agent bytes. Returns true if data arrived (or the tunnel closed),
 // false on plain timeout. Used by collectAxchgRead's long-poll path.
@@ -281,9 +280,12 @@ type reverseState struct {
 	maxConns       int
 	watchdogWindow time.Duration
 	socksLn        net.Listener
-	logger         interface{ Printf(format string, v ...interface{}) }
-	parentSrv      *Server
-	shutdownCh     chan struct{}
+	logger         interface {
+		Printf(format string, v ...interface{})
+	}
+	parentSrv    *Server
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
 
 	// agentReady is closed once the first apoll arrives, signalling
 	// ServeSOCKS5 that it's safe to bind the operator-facing port. Until
@@ -297,7 +299,7 @@ type reverseState struct {
 	// secret or huge clock drift) loops at ~1 apoll/sec; without rate
 	// limiting we'd flood the server log. One line per source IP per minute
 	// is enough for a human admin to notice.
-	authFailLogMu  sync.Mutex
+	authFailLogMu   sync.Mutex
 	lastAuthFailLog map[string]time.Time
 }
 
@@ -314,14 +316,14 @@ func newReverseState(maxBufCap, maxConns int, watchdog time.Duration, logger int
 		watchdog = reverseDefaultWatchdogWindow
 	}
 	return &reverseState{
-		conns:          make(map[string]*reverseConn),
-		pendCids:       make(map[*reverseConn]string),
-		maxBufCap:      maxBufCap,
-		maxConns:       maxConns,
-		watchdogWindow: watchdog,
-		logger:         logger,
-		shutdownCh:     make(chan struct{}),
-		agentReady:     make(chan struct{}),
+		conns:           make(map[string]*reverseConn),
+		pendCids:        make(map[*reverseConn]string),
+		maxBufCap:       maxBufCap,
+		maxConns:        maxConns,
+		watchdogWindow:  watchdog,
+		logger:          logger,
+		shutdownCh:      make(chan struct{}),
+		agentReady:      make(chan struct{}),
 		knownAgents:     make(map[string]time.Time),
 		lastAuthFailLog: make(map[string]time.Time),
 	}
@@ -705,7 +707,7 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 //
 // Wire (post-session-MAC cutover):
 //
-//	cid . nonce . ["tcp"] . smac . aread . domain
+//	cid . nonce . ["x-tcp"] . smac . aread . domain
 func (s *Server) proxyAgentRead(args []string, now time.Time) []string {
 	if !s.allowProxy || s.reverse == nil {
 		return []string{proxyDisabledResponse}
@@ -724,7 +726,7 @@ func (s *Server) proxyAgentRead(args []string, now time.Time) []string {
 	smac := args[len(args)-1]
 	maxRead := gproxy.MaxReadBytes
 	if len(args) == 4 {
-		if args[2] != "tcp" {
+		if args[2] != gproxy.AxchgTCPMarker && args[2] != "tcp" {
 			return []string{"ERR malformed"}
 		}
 		maxRead = gproxy.MaxReadBytesTCP
@@ -937,7 +939,7 @@ func (s *Server) proxyAgentClose(args []string, now time.Time) []string {
 //
 // Wire (request):
 //
-//	cid . write_seq . chunk1 . chunk2 ... . read_nonce . smac . axchg . domain
+//	cid . write_seq . chunk1 . chunk2 ... . ["x-tcp"] . read_nonce . smac . axchg . domain
 //
 // write_seq == 0 means "no payload, this is a pure read". When write_seq > 0
 // the labels between it and read_nonce are the base32 ciphertext chunks (same
@@ -972,10 +974,12 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 	if err != nil {
 		return []string{"ERR bad nonce"}
 	}
-	// Optional "tcp" hint, like aread. Goes just before the nonce/smac trailer.
+	// Optional TCP hint, like aread. Goes just before the nonce/smac trailer.
+	// The marker must not be a bare base32 word; otherwise a ciphertext label
+	// can be mistaken for transport metadata.
 	maxRead := gproxy.MaxReadBytes
 	chunksEnd := len(args) - 2
-	if chunksEnd > 0 && args[chunksEnd-1] == "tcp" {
+	if chunksEnd > 0 && args[chunksEnd-1] == gproxy.AxchgTCPMarker {
 		maxRead = gproxy.MaxReadBytesTCP
 		chunksEnd--
 	}
@@ -1187,7 +1191,9 @@ func (s *Server) proxyShutdown() {
 	if s.reverse == nil {
 		return
 	}
-	close(s.reverse.shutdownCh)
+	s.reverse.shutdownOnce.Do(func() {
+		close(s.reverse.shutdownCh)
+	})
 	s.reverse.mu.Lock()
 	if s.reverse.socksLn != nil {
 		_ = s.reverse.socksLn.Close()
@@ -1369,4 +1375,3 @@ func tuneTCPConn(c net.Conn) {
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(30 * time.Second)
 }
-

@@ -22,6 +22,11 @@ import (
 // Constants live in one place so the server response sizing logic and the
 // client poll loop can never drift.
 const (
+	// AxchgTCPMarker is the optional transport marker used in axchg query
+	// names. It deliberately contains '-' so it cannot collide with base32
+	// ciphertext labels, which only use A-Z and 2-7.
+	AxchgTCPMarker = "x-tcp"
+
 	// MaxReadBytes caps the plaintext size of a single aread/axchg response
 	// so the resulting (AEAD-sealed → base64-chunked) TXT record fits inside
 	// an 8192-byte EDNS0 UDP buffer with headroom. Sized for axchg which

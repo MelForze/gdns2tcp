@@ -30,25 +30,25 @@ const (
 	// client artifacts over DNS. 254 fills a single DNS TXT character-string
 	// (max 255 bytes) with one byte of safety margin. Independent from the
 	// client's upload chunking.
-	clientChunkSize        = 254
+	clientChunkSize         = 254
 	maxClientTransferState  = 1024
 	maxTransferChunks       = 1_000_000
 	maxDownloadCacheEntries = 16
 	maxDownloadBatch        = 32
 	transferTTL             = 10 * time.Minute
-	authFailedResponse     = "Authentication failed."
+	authFailedResponse      = "Authentication failed."
 )
 
 var dnsToBase64 = strings.NewReplacer("_", "+", "-", "/")
 
 type Config struct {
-	Domain           string
-	Secret           string
-	DataDir          string
-	ClientArtifacts  []ClientArtifactConfig
-	AllowList        bool
-	MaxUploadBytes   int64
-	MaxDownloadBytes int64
+	Domain              string
+	Secret              string
+	DataDir             string
+	ClientArtifacts     []ClientArtifactConfig
+	AllowList           bool
+	MaxUploadBytes      int64
+	MaxDownloadBytes    int64
 	AllowProxy          bool
 	SocksNoAuth         bool
 	ProxyMaxConn        int
@@ -82,8 +82,8 @@ type Server struct {
 	downloadCache      map[string]downloadCacheEntry
 	downloadCacheOrder []string // FIFO insertion order for bounded eviction
 	clientArtifacts    map[string]clientArtifact
-	clientTransfers map[string]clientTransfer
-	reverse         *reverseState
+	clientTransfers    map[string]clientTransfer
+	reverse            *reverseState
 }
 
 type clientArtifact struct {
@@ -106,16 +106,18 @@ type downloadState struct {
 type downloadCacheEntry struct {
 	chunks []string
 	mtime  time.Time
+	size   int64
+	sha256 string
 }
 
 type uploadState struct {
-	file       *os.File
-	filename   string
-	path       string
-	chunks     map[int]string
-	total      int
-	chunkSize  int
-	encoding   string
+	file      *os.File
+	filename  string
+	path      string
+	chunks    map[int]string
+	total     int
+	chunkSize int
+	encoding  string
 	nextIndex int
 	expires   time.Time
 }
@@ -378,8 +380,20 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 		s.logger.Printf("download %q exceeded max size", filename)
 		return []string{"Download is too large for this server policy."}
 	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		s.logger.Printf("read download file %q: %v", filename, err)
+		return []string{"Error open file."}
+	}
+	if int64(len(raw)) > s.maxDownloadBytes {
+		s.logger.Printf("download %q exceeded max size after read", filename)
+		return []string{"Download is too large for this server policy."}
+	}
+	sum := sha256.Sum256(raw)
+	digest := hex.EncodeToString(sum[:])
+
 	s.mu.Lock()
-	if entry, ok := s.downloadCache[path]; ok && entry.mtime.Equal(info.ModTime()) {
+	if entry, ok := s.downloadCache[path]; ok && entry.size == int64(len(raw)) && entry.sha256 == digest {
 		if _, exists := s.downloads[sid]; exists {
 			s.mu.Unlock()
 			return []string{"Transfer already exists."}
@@ -396,11 +410,6 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 	}
 	s.mu.Unlock()
 
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		s.logger.Printf("read download file %q: %v", filename, err)
-		return []string{"Error open file."}
-	}
 	compressed, err := codec.Compress(raw)
 	if err != nil {
 		s.logger.Printf("compress download file %q: %v", filename, err)
@@ -427,7 +436,7 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 		}
 		s.downloadCacheOrder = append(s.downloadCacheOrder, path)
 	}
-	s.downloadCache[path] = downloadCacheEntry{chunks: chunks, mtime: info.ModTime()}
+	s.downloadCache[path] = downloadCacheEntry{chunks: chunks, mtime: info.ModTime(), size: int64(len(raw)), sha256: digest}
 	s.cleanupExpiredLocked(now)
 	if _, exists := s.downloads[sid]; exists {
 		s.mu.Unlock()
@@ -567,11 +576,11 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 	}
 
 	state := uploadState{
-		file:       file,
-		filename:   filename,
-		path:       path,
-		chunks:     make(map[int]string),
-		total:      total,
+		file:      file,
+		filename:  filename,
+		path:      path,
+		chunks:    make(map[int]string),
+		total:     total,
 		chunkSize: chunkSize,
 		encoding:  encoding,
 		nextIndex: 0,

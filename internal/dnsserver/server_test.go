@@ -64,14 +64,14 @@ func signedName(command string, args []string) string {
 	return protocol.JoinName(testDomain, command, labels)
 }
 
-// sessionAreadArgs builds the [cid, nonce, ("tcp")?, smac] args slice that
+// sessionAreadArgs builds the [cid, nonce, ("x-tcp")?, smac] args slice that
 // proxyAgentRead expects after the session-MAC cutover. The MAC is keyed
 // by (cmd, nonce) so each request is replay-protected by the server's
 // per-cid sliding window.
 func sessionAreadArgs(cid string, key [32]byte, nonce uint64, tcp bool) []string {
 	args := []string{cid, strconv.FormatUint(nonce, 16)}
 	if tcp {
-		args = append(args, "tcp")
+		args = append(args, gproxy.AxchgTCPMarker)
 	}
 	return append(args, protocol.SessionMAC(key, "aread", nonce))
 }
@@ -1273,6 +1273,58 @@ func TestDownloadCacheMtimeInvalidation(t *testing.T) {
 	}
 }
 
+func TestDownloadCacheContentInvalidationWithSameMtime(t *testing.T) {
+	s := newTestServer(t)
+	filename := "hash-test.txt"
+	path := filepath.Join(s.dataDir, filename)
+	fixed := time.Unix(1_700_000_000, 0)
+	originalData := []byte("payload-version-0001")
+	updatedData := []byte("payload-version-0002")
+	if len(originalData) != len(updatedData) {
+		t.Fatal("test payloads must have identical sizes")
+	}
+	if err := os.WriteFile(path, originalData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, fixed, fixed); err != nil {
+		t.Fatal(err)
+	}
+	key := cacheKey(t, s, filename)
+
+	startDownload(t, s, "hashsid01", filename)
+	s.mu.Lock()
+	firstDigest := s.downloadCache[key].sha256
+	firstMtime := s.downloadCache[key].mtime
+	s.mu.Unlock()
+
+	if err := os.WriteFile(path, updatedData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, fixed, fixed); err != nil {
+		t.Fatal(err)
+	}
+
+	count := startDownload(t, s, "hashsid02", filename)
+	s.mu.Lock()
+	secondDigest := s.downloadCache[key].sha256
+	secondMtime := s.downloadCache[key].mtime
+	s.mu.Unlock()
+
+	if !firstMtime.Equal(secondMtime) {
+		t.Fatalf("test setup failed: mtimes differ: %v vs %v", firstMtime, secondMtime)
+	}
+	if firstDigest == secondDigest {
+		t.Fatal("cache digest unchanged after same-size same-mtime content modification")
+	}
+	var b strings.Builder
+	for i := 0; i < count; i++ {
+		b.WriteString(fetchDownloadChunk(t, s, "hashsid02", i))
+	}
+	if got := openDownloadedPayload(t, b.String()); !bytes.Equal(got, updatedData) {
+		t.Fatalf("got %q after same-mtime content change, want %q", got, updatedData)
+	}
+}
+
 func TestDownloadCacheEviction(t *testing.T) {
 	s := newTestServer(t)
 
@@ -1678,11 +1730,11 @@ func TestApollAuthFailLogRateLimit(t *testing.T) {
 }
 
 // TestReverseEndToEndEcho exercises the full reverse loop:
-//   1. operator connects via TCP SOCKS5 to the server (with -secret as password)
-//   2. server enqueues the target and replies with SOCKS5 success
-//   3. test acts as the agent: polls apoll, dials the echo server, pumps bytes
-//      back via awrite while pumping operator's bytes forward via aread
-//   4. operator sends a payload, expects it echoed
+//  1. operator connects via TCP SOCKS5 to the server (with -secret as password)
+//  2. server enqueues the target and replies with SOCKS5 success
+//  3. test acts as the agent: polls apoll, dials the echo server, pumps bytes
+//     back via awrite while pumping operator's bytes forward via aread
+//  4. operator sends a payload, expects it echoed
 func TestReverseEndToEndEcho(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration")
@@ -2653,6 +2705,7 @@ func TestReverseShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.proxyShutdown()
 	s.proxyShutdown()
 	s.reverse.mu.Lock()
 	defer s.reverse.mu.Unlock()

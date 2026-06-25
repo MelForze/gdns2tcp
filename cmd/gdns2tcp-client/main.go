@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -352,7 +353,7 @@ func (r *txtResolver) queryOnce(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	value, err := parseTXTResponse(resp, id)
+	value, err := parseTXTResponse(resp, binary.BigEndian.Uint16(q[:2]))
 	if err != nil {
 		return "", fmt.Errorf("%w for %s", err, name)
 	}
@@ -542,6 +543,7 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 	}
 	cache := newResumeCache(cacheRoot, cfg.domain, cfg.filename, !cfg.noResume)
 	completed, _ := cache.loadCompleted(chunkCount, batchSize)
+	usedCachedBatches := len(completed) > 0
 	if err := cache.saveMeta(chunkCount, batchSize); err != nil {
 		return fmt.Errorf("write resume meta: %w", err)
 	}
@@ -604,16 +606,14 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 		encoded.WriteString(batchResults[k])
 	}
 
-	protected, err := codec.DecodeDNSPayload(encoded.String(), "base64")
+	raw, err := decodeDownloadedPayload(encoded.String(), cfg.pass, cfg.maxDownloadBytes)
 	if err != nil {
-		return fmt.Errorf("decode download payload: %w", err)
-	}
-	compressed, err := secure.Open(cfg.pass, protected)
-	if err != nil {
-		return err
-	}
-	raw, err := codec.DecompressLimit(compressed, cfg.maxDownloadBytes)
-	if err != nil {
+		if usedCachedBatches && !cfg.noResume {
+			_ = cache.clear()
+			retryCfg := cfg
+			retryCfg.noResume = true
+			return downloadFile(resolver, retryCfg)
+		}
 		return err
 	}
 	if err := writeOutput(outputPath, raw); err != nil {
@@ -622,6 +622,22 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 	_ = cache.clear()
 	fmt.Printf("saved %s\n", outputPath)
 	return nil
+}
+
+func decodeDownloadedPayload(encoded, pass string, maxDownloadBytes int64) ([]byte, error) {
+	protected, err := codec.DecodeDNSPayload(encoded, "base64")
+	if err != nil {
+		return nil, fmt.Errorf("decode download payload: %w", err)
+	}
+	compressed, err := secure.Open(pass, protected)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := codec.DecompressLimit(compressed, maxDownloadBytes)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 func resolveInputPath(path string) (string, error) {
