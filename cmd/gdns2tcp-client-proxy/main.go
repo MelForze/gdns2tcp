@@ -126,6 +126,15 @@ func parseFlags() config {
 	if cfg.retries < 1 {
 		cfg.retries = 1
 	}
+	if cfg.pollMin <= 0 {
+		cfg.pollMin = 20 * time.Millisecond
+	}
+	if cfg.pollMax <= 0 {
+		cfg.pollMax = 200 * time.Millisecond
+	}
+	if cfg.pollMax < cfg.pollMin {
+		cfg.pollMax = cfg.pollMin
+	}
 	if cfg.targetTimeout <= 0 {
 		cfg.targetTimeout = 1 * time.Second
 	}
@@ -385,14 +394,20 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 							} else {
 								jitter = time.Duration(5+rand.IntN(20)) * time.Millisecond
 							}
+							// NewTimer+Stop instead of time.After so we don't
+							// leak timer goroutines when canceled via done/
+							// internalStop.
+							timer := time.NewTimer(jitter)
 							select {
 							case <-done:
+								timer.Stop()
 								gproxy.PutBuf(job.bufPtr)
 								return
 							case <-internalStop:
+								timer.Stop()
 								gproxy.PutBuf(job.bufPtr)
 								return
-							case <-time.After(jitter):
+							case <-timer.C:
 							}
 							attempt--
 							continue
@@ -451,6 +466,20 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 	go func() {
 		var seq uint64
 		for {
+			// Refuse to issue more queries once the per-tunnel counters
+			// approach 32 bits — the budget calc assumes 8-hex-char
+			// seq/nonce and an overflow would silently start emitting
+			// 9+ char labels, blowing the 253-char query name and
+			// causing the server to FORMERR every round-trip until the
+			// tunnel dies. Tear down cleanly instead. At 100K q/s with
+			// 96 workers this triggers after ~12 hours of continuous
+			// bulk on a single cid — well beyond realistic SOCKS5
+			// session lengths but possible for long-running pipes.
+			if seq+1 > 0xFFFFFFFF || ts.nonce.Load()+uint64(tuning.workers) > 0xFFFFFFFF {
+				fmt.Fprintf(os.Stderr, "axchg cid=%s: seq/nonce approaching 32-bit cap, closing tunnel\n", cid)
+				stopAll()
+				return
+			}
 			// Dynamic seq width (predicted: next seq we'll assign).
 			// Conservative nonce width = 8 hex chars (32-bit cap, see
 			// worstBuf comment in handleTunnel); any worker can bump

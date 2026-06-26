@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gdns2tcp/internal/dnshelpers"
 )
 
 const dnsTypeTXT uint16 = 16
@@ -225,20 +227,30 @@ func exchangeTCP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
 // with per-conn DNS-id pipelining (independent readLoop + pending map).
 const tcpPoolConns = 16
 
+// tcpPoolBlackHoleThreshold: a conn that times out this many times in a
+// row gets force-closed so the next exchange redials. Catches misbehaving
+// middleboxes that ACK queries but never deliver responses; without this
+// the conn would stay "alive" for the kernel keepalive period (~30s+).
+const tcpPoolBlackHoleThreshold = 2
+
+// tcpPoolMaxRetries: pool.exchange tries this many different conns before
+// giving up. With 16 conns, three attempts is enough that a single bad
+// conn (or two simultaneously bad) doesn't fail an otherwise-healthy
+// download burst.
+const tcpPoolMaxRetries = 3
+
 type tcpConnEntry struct {
-	parent    *tcpPool
-	mu        sync.Mutex // serialises writes on this conn
-	pendingMu sync.Mutex
-	pending   map[uint16]chan []byte
-	nextID    uint16
-	conn      net.Conn
-	closed    bool
+	parent       *tcpPool
+	mu           sync.Mutex // covers conn, pending, closed, timeoutCount
+	pending      map[uint16]chan []byte
+	nextID       uint16
+	conn         net.Conn
+	closed       bool
+	timeoutCount int
 }
 
 type tcpPool struct {
 	addr  string
-	mu    sync.Mutex // guards initial setup
-	once  sync.Once
 	conns []*tcpConnEntry
 	next  atomic.Uint64
 }
@@ -247,55 +259,79 @@ func newTCPPool(addr string) *tcpPool {
 	p := &tcpPool{addr: addr}
 	p.conns = make([]*tcpConnEntry, tcpPoolConns)
 	for i := range p.conns {
-		p.conns[i] = &tcpConnEntry{parent: p, pending: make(map[uint16]chan []byte), nextID: randomDNSID()}
+		p.conns[i] = &tcpConnEntry{parent: p, pending: make(map[uint16]chan []byte), nextID: randomDNSID(), closed: true}
 	}
 	return p
 }
 
-// ensure opens (or re-opens) the TCP conn. Caller must hold entry.mu.
-func (e *tcpConnEntry) ensure(timeout time.Duration) error {
-	if e.conn != nil && !e.closed {
-		return nil
-	}
-	if e.closed {
-		// Drop any stale pendings from the previous readLoop.
-		e.pendingMu.Lock()
-		for id, ch := range e.pending {
-			close(ch)
-			delete(e.pending, id)
-		}
-		e.pendingMu.Unlock()
-	}
-	conn, err := net.DialTimeout("tcp", e.parent.addr, timeout)
+// dialTCPConn opens a new TCP DNS conn with the connection tuning that
+// matters for long-lived multiplexed use: NoDelay (axchg queries are
+// tiny, Nagle hurts), KeepAlive (kernel surfaces dead conns within
+// ~30s instead of the OS-default minutes).
+func dialTCPConn(addr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 	}
+	return conn, nil
+}
+
+// ensureLocked makes sure entry has a live TCP conn, redialing after a
+// previous read/write error. Caller must hold e.mu. The pending map is
+// drained before dial so the new conn starts with a clean slate.
+//
+// Known limitation: this runs DialTimeout while holding e.mu, so other
+// workers round-robined to this entry stall up to `timeout` on dial.
+// Mitigated by tcpPoolMaxRetries in pool.exchange — if a conn is busy
+// dialing, the worker picks another entry on the next attempt.
+func (e *tcpConnEntry) ensureLocked(timeout time.Duration) error {
+	if e.conn != nil && !e.closed {
+		return nil
+	}
+	for id, ch := range e.pending {
+		close(ch)
+		delete(e.pending, id)
+	}
+	if e.conn != nil {
+		_ = e.conn.Close()
+		e.conn = nil
+	}
+	conn, err := dialTCPConn(e.parent.addr, timeout)
+	if err != nil {
+		e.closed = true
+		return err
+	}
 	e.conn = conn
 	e.closed = false
+	e.timeoutCount = 0
 	go e.readLoop(conn)
 	return nil
 }
 
+// readLoop reads framed DNS-over-TCP responses and dispatches by DNS
+// transaction ID. The deferred cleanup is gated on `e.conn == conn`:
+// without that check, an old readLoop firing AFTER the entry has already
+// reconnected would close pending channels owned by the NEW conn — a
+// race condition that surfaces as spurious "tcp pool conn closed during
+// exchange" errors on healthy queries.
 func (e *tcpConnEntry) readLoop(conn net.Conn) {
 	defer func() {
 		e.mu.Lock()
 		if e.conn == conn {
 			e.closed = true
-			_ = e.conn.Close()
 			e.conn = nil
+			for id, ch := range e.pending {
+				close(ch)
+				delete(e.pending, id)
+			}
 		}
 		e.mu.Unlock()
-		e.pendingMu.Lock()
-		for id, ch := range e.pending {
-			close(ch)
-			delete(e.pending, id)
-		}
-		e.pendingMu.Unlock()
+		_ = conn.Close()
 	}()
 	var prefix [2]byte
 	for {
@@ -311,12 +347,13 @@ func (e *tcpConnEntry) readLoop(conn net.Conn) {
 			return
 		}
 		id := binary.BigEndian.Uint16(buf[:2])
-		e.pendingMu.Lock()
+		e.mu.Lock()
 		ch, ok := e.pending[id]
 		if ok {
 			delete(e.pending, id)
+			e.timeoutCount = 0 // any successful response clears black-hole counter
 		}
-		e.pendingMu.Unlock()
+		e.mu.Unlock()
 		if ok {
 			ch <- buf
 		}
@@ -330,40 +367,46 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 	ch := make(chan []byte, 1)
 
 	e.mu.Lock()
-	if err := e.ensure(timeout); err != nil {
+	if err := e.ensureLocked(timeout); err != nil {
 		e.mu.Unlock()
 		return nil, err
 	}
-	e.pendingMu.Lock()
-	id, err := reserveDNSIDLocked(e.pending, &e.nextID, ch)
+	id, err := dnshelpers.ReserveDNSIDLocked(e.pending, &e.nextID, ch)
 	if err != nil {
-		e.pendingMu.Unlock()
 		e.mu.Unlock()
 		return nil, err
 	}
+	conn := e.conn
 	binary.BigEndian.PutUint16(q[:2], id)
-	e.pendingMu.Unlock()
 
+	// Write prefix+body under e.mu. On any error we hard-close the conn
+	// here (not just flag e.closed=true) so the in-flight readLoop
+	// returns immediately, and any partial write that desynced the
+	// server's framing is followed by a FIN to unblock the server's
+	// io.ReadFull.
 	var prefix [2]byte
 	binary.BigEndian.PutUint16(prefix[:], uint16(len(q)))
-	_ = e.conn.SetWriteDeadline(time.Now().Add(timeout))
-	if _, err := e.conn.Write(prefix[:]); err != nil {
-		e.closed = true
-		e.mu.Unlock()
-		e.pendingMu.Lock()
-		deletePendingIfOwnedLocked(e.pending, id, ch)
-		e.pendingMu.Unlock()
-		return nil, err
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	werr := writeAll(conn, prefix[:])
+	if werr == nil {
+		werr = writeAll(conn, q)
 	}
-	if _, err := e.conn.Write(q); err != nil {
-		e.closed = true
+	_ = conn.SetWriteDeadline(time.Time{})
+	if werr != nil {
+		if e.conn == conn {
+			e.closed = true
+			e.conn = nil
+			for pid, pch := range e.pending {
+				close(pch)
+				delete(e.pending, pid)
+			}
+			_ = conn.Close()
+		} else {
+			dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
+		}
 		e.mu.Unlock()
-		e.pendingMu.Lock()
-		deletePendingIfOwnedLocked(e.pending, id, ch)
-		e.pendingMu.Unlock()
-		return nil, err
+		return nil, werr
 	}
-	_ = e.conn.SetWriteDeadline(time.Time{})
 	e.mu.Unlock()
 
 	timer := time.NewTimer(timeout)
@@ -375,47 +418,51 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		}
 		return resp, nil
 	case <-timer.C:
-		e.pendingMu.Lock()
-		deletePendingIfOwnedLocked(e.pending, id, ch)
-		e.pendingMu.Unlock()
+		e.mu.Lock()
+		dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
+		e.timeoutCount++
+		if e.timeoutCount >= tcpPoolBlackHoleThreshold && e.conn == conn {
+			// Black-hole: too many timeouts on this conn. Force-close so
+			// the next exchange redials instead of waiting for kernel
+			// keepalive (~30s) to surface the dead conn.
+			e.closed = true
+			e.conn = nil
+			for pid, pch := range e.pending {
+				close(pch)
+				delete(e.pending, pid)
+			}
+			_ = conn.Close()
+			e.timeoutCount = 0
+		}
+		e.mu.Unlock()
 		return nil, errors.New("tcp exchange timeout")
 	}
 }
 
-func reserveDNSIDLocked(pending map[uint16]chan []byte, nextID *uint16, ch chan []byte) (uint16, error) {
-	for i := 0; i < 65535; i++ {
-		*nextID = *nextID + 1
-		if *nextID == 0 {
-			*nextID = 1
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if err != nil {
+			return err
 		}
-		id := *nextID
-		if _, exists := pending[id]; exists {
-			continue
-		}
-		pending[id] = ch
-		return id, nil
+		data = data[n:]
 	}
-	return 0, errors.New("dns transaction id space exhausted")
+	return nil
 }
 
-func deletePendingIfOwnedLocked(pending map[uint16]chan []byte, id uint16, ch chan []byte) {
-	if pending[id] == ch {
-		delete(pending, id)
-	}
-}
-
-// exchange picks a conn round-robin. One retry on closed-pool so a
-// reconnect kicks in transparently.
+// exchange picks a conn round-robin, retrying on different conns up to
+// tcpPoolMaxRetries times. With pool=16 and 3 retries, a single dead
+// conn (or two simultaneously dead) doesn't fail an otherwise healthy
+// download burst.
 func (p *tcpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
-	for attempt := 0; attempt < 2; attempt++ {
+	var lastErr error
+	for attempt := 0; attempt < tcpPoolMaxRetries; attempt++ {
 		idx := int((p.next.Add(1) - 1) % uint64(len(p.conns)))
 		resp, err := p.conns[idx].exchange(q, timeout)
 		if err == nil {
 			return resp, nil
 		}
-		if attempt == 1 {
-			return nil, err
-		}
+		lastErr = err
 	}
-	return nil, errors.New("tcp pool: unreachable")
+	return nil, lastErr
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"gdns2tcp/internal/dnshelpers"
 	gproxy "gdns2tcp/internal/proxy"
 )
 
@@ -111,6 +112,94 @@ func TestUDPPoolExchange(t *testing.T) {
 	}
 }
 
+func TestUDPPoolReconnectAfterSocketClose(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 2 {
+				continue
+			}
+			resp := make([]byte, 12)
+			copy(resp[:2], buf[:2])
+			resp[2] = 0x80
+			resp[3] = 0x00
+			binary.BigEndian.PutUint16(resp[4:6], 0)
+			binary.BigEndian.PutUint16(resp[6:8], 1)
+			resp = append(resp, 0x00)
+			var trailer [4]byte
+			binary.BigEndian.PutUint16(trailer[0:2], 16)
+			binary.BigEndian.PutUint16(trailer[2:4], 1)
+			resp = append(resp, trailer[:]...)
+			resp = append(resp, 0x00, 0x04)
+			resp = append(resp, 0x03, 'O', 'K', '!')
+			_, _ = pc.WriteTo(resp, addr)
+		}
+	}()
+
+	pool, err := newUDPPool(pc.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.close()
+
+	q, err := buildTXTQuery("test.example.com", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.exchange(q, 2*time.Second); err != nil {
+		t.Fatalf("initial exchange: %v", err)
+	}
+
+	for _, e := range pool.conns {
+		e.mu.Lock()
+		conn := e.conn
+		e.mu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+	waitUDPPoolClosedEntries(t, pool)
+
+	q, err = buildTXTQuery("test.example.com", 43)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.exchange(q, 2*time.Second); err != nil {
+		t.Fatalf("exchange after socket close: %v", err)
+	}
+}
+
+func waitUDPPoolClosedEntries(t *testing.T, pool *udpPool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		allClosed := true
+		for _, e := range pool.conns {
+			e.mu.Lock()
+			closed := e.closed || e.conn == nil
+			e.mu.Unlock()
+			allClosed = allClosed && closed
+		}
+		if allClosed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("UDP pool entries did not observe forced socket close")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestUDPPoolExchangeTimeout(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -176,7 +265,7 @@ func TestReserveDNSIDLockedSkipsPendingID(t *testing.T) {
 	nextID := uint16(41)
 	pending := map[uint16]chan []byte{42: existing}
 
-	id, err := reserveDNSIDLocked(pending, &nextID, ch)
+	id, err := dnshelpers.ReserveDNSIDLocked(pending, &nextID, ch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,11 +275,11 @@ func TestReserveDNSIDLockedSkipsPendingID(t *testing.T) {
 	if pending[42] != existing {
 		t.Fatal("existing pending id was overwritten")
 	}
-	deletePendingIfOwnedLocked(pending, 42, ch)
+	dnshelpers.DeletePendingIfOwnedLocked(pending, 42, ch)
 	if pending[42] != existing {
-		t.Fatal("deletePendingIfOwnedLocked removed a channel it did not own")
+		t.Fatal("DeletePendingIfOwnedLocked removed a channel it did not own")
 	}
-	deletePendingIfOwnedLocked(pending, 43, ch)
+	dnshelpers.DeletePendingIfOwnedLocked(pending, 43, ch)
 	if _, ok := pending[43]; ok {
 		t.Fatal("owned pending id was not removed")
 	}

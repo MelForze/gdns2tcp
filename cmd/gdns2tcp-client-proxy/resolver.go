@@ -42,6 +42,18 @@ func newTxtResolver(cfg config) *txtResolver {
 	return r
 }
 
+func (r *txtResolver) close() {
+	if r == nil {
+		return
+	}
+	if r.pool != nil {
+		r.pool.close()
+	}
+	if r.tcpPool != nil {
+		r.tcpPool.close()
+	}
+}
+
 func (r *txtResolver) query(name string) (string, error) {
 	segs, err := r.queryStrings(name)
 	if err != nil {

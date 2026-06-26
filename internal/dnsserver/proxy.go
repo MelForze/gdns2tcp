@@ -648,22 +648,74 @@ func (s *Server) reversePumpOperator(cid string, rc *reverseConn) {
 	}
 }
 
-// reverseCloseConn marks the tunnel as closed from one side. The agent
-// learns via aread returning CLOSED; the operator's TCP socket is closed
-// here. The cid sticks around until cleanupExpiredLocked removes it.
+// reverseCloseConn marks the tunnel as closed from one side and removes it
+// from the server-wide indexes. The agent learns via subsequent aread/axchg
+// returning CLOSED for an unknown cid; aclose remains idempotent.
 func (s *Server) reverseCloseConn(cid string, rc *reverseConn, reason string) {
-	rc.mu.Lock()
-	if rc.opClosed && rc.agentClosed {
-		rc.mu.Unlock()
+	if rc == nil {
 		return
 	}
-	rc.opClosed = true
-	rc.agentClosed = true
-	_ = rc.operator.Close()
-	rc.opCond.Broadcast()
-	rc.closeAllReadersLocked() // Шаг C: unblock every parked long-poll
+	closedNow := false
+	rc.mu.Lock()
+	if !rc.opClosed || !rc.agentClosed {
+		rc.opClosed = true
+		rc.agentClosed = true
+		_ = rc.operator.Close()
+		rc.opCond.Broadcast()
+		rc.closeAllReadersLocked() // Шаг C: unblock every parked long-poll
+		closedNow = true
+	}
 	rc.mu.Unlock()
-	s.logger.Printf("reverse close cid=%s (%s)", cid, reason)
+
+	if s.reverse != nil {
+		s.reverse.mu.Lock()
+		cid = s.reverse.removeConnLocked(cid, rc)
+		s.reverse.mu.Unlock()
+	}
+	if closedNow {
+		s.logger.Printf("reverse close cid=%s (%s)", cid, reason)
+	}
+}
+
+// removeConnLocked drops rc from every reverseState index. Caller must hold
+// reverseState.mu. Returns a printable cid, looking it up from rc when the
+// caller only had a pointer.
+func (r *reverseState) removeConnLocked(cid string, rc *reverseConn) string {
+	if cid == "" || cid == "?" {
+		if known, ok := r.pendCids[rc]; ok {
+			cid = known
+		}
+	}
+	if cid != "" && cid != "?" {
+		if r.conns[cid] == rc {
+			delete(r.conns, cid)
+		}
+	}
+	for known, c := range r.conns {
+		if c == rc {
+			delete(r.conns, known)
+			if cid == "" || cid == "?" {
+				cid = known
+			}
+			break
+		}
+	}
+	if known, ok := r.pendCids[rc]; ok {
+		if cid == "" || cid == "?" {
+			cid = known
+		}
+		delete(r.pendCids, rc)
+	}
+	for i, pending := range r.pending {
+		if pending == rc {
+			r.pending = append(r.pending[:i], r.pending[i+1:]...)
+			break
+		}
+	}
+	if cid == "" {
+		return "?"
+	}
+	return cid
 }
 
 // --- Agent DNS endpoints ---------------------------------------------------
@@ -688,18 +740,25 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 		s.logger.Printf("agent connected from %s (first apoll)", client)
 	}
 
-	s.reverse.mu.Lock()
-	defer s.reverse.mu.Unlock()
-	if len(s.reverse.pending) == 0 {
-		return []string{"EMPTY"}
-	}
-	rc := s.reverse.pending[0]
-	s.reverse.pending = s.reverse.pending[1:]
-	cid := s.reverse.pendCids[rc]
-	delete(s.reverse.pendCids, rc)
+	for {
+		s.reverse.mu.Lock()
+		if len(s.reverse.pending) == 0 {
+			s.reverse.mu.Unlock()
+			return []string{"EMPTY"}
+		}
+		rc := s.reverse.pending[0]
+		s.reverse.pending = s.reverse.pending[1:]
+		cid := s.reverse.pendCids[rc]
+		delete(s.reverse.pendCids, rc)
+		_, live := s.reverse.conns[cid]
+		s.reverse.mu.Unlock()
+		if !live || cid == "" {
+			continue
+		}
 
-	targetB32 := strings.ToLower(reverseB32().EncodeToString([]byte(rc.target)))
-	return []string{"OPEN " + cid + " " + targetB32}
+		targetB32 := strings.ToLower(reverseB32().EncodeToString([]byte(rc.target)))
+		return []string{"OPEN " + cid + " " + targetB32}
+	}
 }
 
 // aread: agent fetches operator-to-target bytes for cid. Returns
@@ -1164,25 +1223,37 @@ func (s *Server) proxyCleanupExpiredLocked(now time.Time) {
 		return
 	}
 	s.reverse.mu.Lock()
-	defer s.reverse.mu.Unlock()
+	snapshot := make([]struct {
+		cid string
+		rc  *reverseConn
+	}, 0, len(s.reverse.conns))
 	for cid, rc := range s.reverse.conns {
-		rc.mu.Lock()
-		expired := now.After(rc.expires)
-		both := rc.opClosed && rc.agentClosed
-		rc.mu.Unlock()
+		snapshot = append(snapshot, struct {
+			cid string
+			rc  *reverseConn
+		}{cid: cid, rc: rc})
+	}
+	s.reverse.mu.Unlock()
+
+	var expiredConns []struct {
+		cid string
+		rc  *reverseConn
+	}
+	for _, item := range snapshot {
+		item.rc.mu.Lock()
+		expired := now.After(item.rc.expires)
+		both := item.rc.opClosed && item.rc.agentClosed
+		item.rc.mu.Unlock()
 		if !expired && !both {
 			continue
 		}
-		if !both {
-			rc.mu.Lock()
-			rc.opClosed = true
-			rc.agentClosed = true
-			_ = rc.operator.Close()
-			rc.opCond.Broadcast()
-			rc.mu.Unlock()
-			s.logger.Printf("reverse expired cid=%s (idle past %s)", cid, reverseTTL)
-		}
-		delete(s.reverse.conns, cid)
+		expiredConns = append(expiredConns, struct {
+			cid string
+			rc  *reverseConn
+		}{cid: item.cid, rc: item.rc})
+	}
+	for _, item := range expiredConns {
+		s.reverseCloseConn(item.cid, item.rc, "idle past "+reverseTTL.String())
 	}
 }
 

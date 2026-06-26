@@ -29,14 +29,15 @@ make clients servers
 Produces:
 
 - `clients/gdns2tcp-client-linux-amd64`, `…-linux-arm64`,
-  `…-darwin-amd64`, `…-darwin-arm64`, `gdns2tcp-client.ps1`
+  `…-darwin-amd64`, `…-darwin-arm64`, `gdns2tcp-client.ps1`,
+  and matching `gdns2tcp-client-proxy-*` agent binaries
 - `servers/gdns2tcp-server-linux-amd64`, `…-linux-arm64`,
   `…-darwin-amd64`, `…-darwin-arm64`
 
 For only the current platform:
 
 ```sh
-make build      # → ./gdns2tcp and ./gdns2tcp-client
+make build      # → ./gdns2tcp, ./gdns2tcp-client, ./gdns2tcp-client-proxy
 ```
 
 ### 2. Run the server
@@ -221,11 +222,12 @@ Add `-allow-proxy` to your server invocation. Off by default:
 sudo ./servers/gdns2tcp-server-linux-amd64 -domain files.example.com -secret "change-me" -allow-proxy
 ```
 
-This starts a TCP SOCKS5 listener on **`127.0.0.1:9050`** with SOCKS5
-authentication disabled by default. Use `-socks-listen 0.0.0.0:9050` only
-when you intentionally want to expose it to remote operators; pair public
-binds with `-socks-no-auth=false` if you want RFC 1929 username/password
-authentication (`gdns2tcp` / the `-secret` value).
+This enables the agent endpoints. The TCP SOCKS5 listener binds on
+**`127.0.0.1:9050`** only after the first authenticated agent `apoll`.
+Use `-socks-listen 0.0.0.0:9050` only when you intentionally want to expose
+it to remote operators; pair public binds with `-socks-no-auth=false` if you
+want RFC 1929 username/password authentication (`gdns2tcp` / the `-secret`
+value).
 
 | Flag | Default | Description |
 |---|---|---|
@@ -344,128 +346,3 @@ The agent has no flags for the SOCKS5 port — it doesn't listen at all. It
 just polls the server and dials whatever target the operator's SOCKS5
 session asks for.
 
-### Use the tunnel
-
-Point any SOCKS5 client at the listener; browsers and ssh's
-`ProxyCommand=ncat --proxy` both work the same way. If you started the server
-with `-socks-no-auth=false`, use username `gdns2tcp` and password
-`<-secret>`.
-
-```sh
-curl --socks5-hostname socks5h://127.0.0.1:9050 https://internal-service.corp/
-```
-
-### Throughput limits
-
-The proxy is fundamentally throughput-limited by the DNS wire format. Each
-`awrite` chunk goes inside a single DNS query name (RFC 1035 caps QNAME at
-253 chars total), which after the `cid . seq . chunks . smac . cmd .
-domain` overhead leaves ~96 bytes of plaintext per round-trip. This limit
-applies to **both UDP and TCP DNS transports** — the QNAME ceiling is part
-of the DNS message format, not the transport layer.
-
-At 30 ms RTT × 16 parallel workers the theoretical ceiling is ~50 KB/s on
-write-heavy direction (operator→upstream); in practice expect **20–30 KB/s**
-on a typical WAN. Aggregate download speed through the proxy will not
-significantly exceed this regardless of transport.
-
-#### What `-tcp` actually changes
-
-`-tcp` swaps the agent's DNS transport from UDP to TCP. This helps only on
-**responses** (server→agent): `MaxReadBytesTCP=48000` vs `MaxReadBytes=5600`
-on UDP. That lifts the **read-heavy direction** (upstream→operator pulls,
-e.g. file uploads through the proxy) by ~8×.
-
-| Direction | Bottleneck | UDP | TCP |
-|---|---|---|---|
-| operator→upstream (write to remote via proxy) | response size | 30 KB/s | **~240 KB/s** |
-| upstream→operator (response body, download) | QNAME 253-char limit | 30 KB/s | 30 KB/s (same) |
-| interactive (SSH keystrokes) | RTT, not throughput | ~RTT | ~RTT |
-| port-scan | many small queries | better (UDP mux) | worse (TCP HoL) |
-
-**Rule of thumb:**
-- Bulk **upload** through the proxy → `-tcp` helps a lot.
-- Bulk **download** through the proxy → roughly the same on either transport (QNAME-bound).
-- SSH, REPL, port-scan → UDP is the right default.
-
-If you need real bulk download speed through this tunnel, the DNS protocol
-isn't the right transport for that workload — that's the cost of using DNS
-as the only allowed channel.
-
----
-
-## Reference
-
-### Server flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `-domain` | *(required)* | Authoritative domain, e.g. `files.example.com` |
-| `-secret` | *(required)* | Shared secret for HMAC auth and payload encryption |
-| `-listen` | `0.0.0.0` | Listen address (all interfaces by default) |
-| `-port` | `53` | Listen port (UDP and TCP both bound) |
-| `-data-dir` | `.` | Directory for uploaded/downloaded files |
-| `-clients-dir` | `clients` | Directory of client artifacts served over DNS |
-| `-max-upload-bytes` | 33 MiB | Maximum protected upload payload accepted |
-| `-max-download-bytes` | 33 MiB | Maximum source file size for downloads |
-| `-disable-list` | `false` | Disable the `list` (catalog) command |
-| `-allow-proxy` | `false` | Enable reverse SOCKS5 listener + agent DNS endpoints |
-| `-socks-listen` | `127.0.0.1:9050` | TCP address for the operator-facing SOCKS5 listener |
-| `-socks-no-auth` | `true` | Disable SOCKS5 username/password auth; pass `-socks-no-auth=false` to require auth |
-| `-proxy-max-conn` | `64` | Maximum concurrent tunnel connections |
-| `-proxy-buf-bytes` | 1 MiB | Per-tunnel buffer cap in each direction |
-
-### Go client flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `-domain` | *(required)* | Server's authoritative domain |
-| `-mode` | *(required)* | `test`, `list`, `upload`, or `download` |
-| `-pass` | *(required for list/upload/download)* | Shared secret (must match server) |
-| `-dns-server` | resolves `-domain` | DNS server IP |
-| `-dns-port` | `53` | DNS server port |
-| `-tcp` | `false` | Use DNS over TCP instead of UDP |
-| `-in` | — | Local file to upload (`-mode upload`) |
-| `-out` | — | Local destination for download (`-mode download`) |
-| `-filename` | — | Remote filename to download (`-mode download`) |
-| `-chunk-size` | `180` | Maximum encoded upload chunk size |
-| `-retries` | `3` | DNS query attempts before failing |
-| `-parallelism` | `32` | Concurrent DNS queries during download (1–64) |
-| `-batch` | `14` | Chunks per DNS response when downloading (1–32) |
-| `-max-download-bytes` | 32 MiB | Maximum decompressed download size |
-
-### PowerShell client parameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `-Domain` | *(required)* | Server's authoritative domain |
-| `-Mode` | *(required)* | `test`, `list`, `upload`, or `download` |
-| `-Pass` | *(required for list/upload/download)* | Shared secret (must match server) |
-| `-DnsServer` | resolves `-Domain` | DNS server IP |
-| `-DnsPort` | `53` | DNS server port |
-| `-Tcp` | `false` | Use DNS over TCP instead of UDP |
-| `-InFile` | — | Local file to upload (`-Mode upload`) |
-| `-OutFile` | — | Local destination for download (`-Mode download`) |
-| `-Filename` | — | Remote filename to download (`-Mode download`) |
-| `-ChunkSize` | `180` | Maximum encoded upload chunk size |
-| `-Retries` | `3` | DNS query attempts before failing |
-| `-RetryDelaySeconds` | `2` | Sleep between retry attempts |
-| `-LogPath` | — | Optional log file path |
-| `-Parallelism` | `32` | Concurrent DNS queries during download (1–64) |
-| `-BatchSize` | `14` | Chunks per DNS response when downloading (1–32) |
-| `-MaxDownloadBytes` | 32 MiB | Maximum decompressed download size |
-
-### Agent flags (`gdns2tcp-client-proxy`)
-
-| Flag | Default | Description |
-|---|---|---|
-| `-domain` | *(required)* | Server's authoritative domain |
-| `-pass` | *(required)* | Shared secret (must match server) |
-| `-dns-server` | resolves `-domain` | DNS server IP |
-| `-dns-port` | `53` | DNS server port |
-| `-tcp` | `false` | Use DNS over TCP instead of UDP |
-| `-poll-min` | `20ms` | Minimum `apoll`/`axchg` interval when active |
-| `-poll-max` | `200ms` | Maximum interval after consecutive idle responses |
-| `-max-conn` | `32` | Maximum concurrent local tunnels (1–512) |
-| `-retries` | `3` | DNS query attempts before failing (apoll only — `axchg` uses fresh nonces, so no retry) |
-| `-target-dial-timeout` | `1s` | TCP dial timeout when the agent connects to the host the operator's SOCKS5 CONNECT requested. Lower values speed up port-scan workflows (filtered ports release their cid faster); raise for legitimately slow upstreams |

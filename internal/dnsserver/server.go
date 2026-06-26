@@ -98,9 +98,10 @@ type clientTransfer struct {
 }
 
 type downloadState struct {
-	filename string
-	chunks   []string
-	expires  time.Time
+	filename     string
+	chunks       []string
+	sourceSHA256 string
+	expires      time.Time
 }
 
 type downloadCacheEntry struct {
@@ -114,7 +115,7 @@ type uploadState struct {
 	file      *os.File
 	filename  string
 	path      string
-	chunks    map[int]string
+	encoded   *strings.Builder
 	total     int
 	chunkSize int
 	encoding  string
@@ -251,6 +252,8 @@ func (s *Server) handleTXT(name, client string) []string {
 		return s.catalog(args, now)
 	case "dinit":
 		return s.downloadInit(args, now)
+	case "dmeta":
+		return s.downloadMeta(args, now)
 	case "d":
 		return s.downloadChunk(args, now)
 	case "db":
@@ -399,9 +402,10 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 			return []string{"Transfer already exists."}
 		}
 		state := downloadState{
-			filename: filename,
-			chunks:   entry.chunks,
-			expires:  now.Add(transferTTL),
+			filename:     filename,
+			chunks:       entry.chunks,
+			sourceSHA256: entry.sha256,
+			expires:      now.Add(transferTTL),
 		}
 		s.downloads[sid] = state
 		s.mu.Unlock()
@@ -423,9 +427,10 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 
 	chunks := codec.ChunkString(protected, codec.TXTChunkSize)
 	state := downloadState{
-		filename: filename,
-		chunks:   chunks,
-		expires:  now.Add(transferTTL),
+		filename:     filename,
+		chunks:       chunks,
+		sourceSHA256: digest,
+		expires:      now.Add(transferTTL),
 	}
 	s.mu.Lock()
 	if _, alreadyCached := s.downloadCache[path]; !alreadyCached {
@@ -447,6 +452,33 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 
 	s.logger.Printf("prepared download %q as %s in %d chunks", filename, sid, len(state.chunks))
 	return []string{strconv.Itoa(len(state.chunks))}
+}
+
+func (s *Server) downloadMeta(args []string, now time.Time) []string {
+	payload, ts, mac, ok := splitAuthenticatedArgs(args)
+	if !ok || !protocol.VerifyAuth(s.secret, s.authDomain, "dmeta", payload, ts, mac, now) {
+		return []string{authFailedResponse}
+	}
+	if len(payload) != 1 {
+		return []string{authFailedResponse}
+	}
+	sid := strings.ToLower(payload[0])
+	if !protocol.ValidSID(sid) {
+		return []string{"Invalid transfer id."}
+	}
+
+	s.mu.Lock()
+	s.cleanupExpiredLocked(now)
+	state, exists := s.downloads[sid]
+	if !exists {
+		s.mu.Unlock()
+		return []string{"Transfer not found."}
+	}
+	state.expires = now.Add(transferTTL)
+	s.downloads[sid] = state
+	s.mu.Unlock()
+
+	return []string{fmt.Sprintf("%d|%s", len(state.chunks), state.sourceSHA256)}
 }
 
 func (s *Server) downloadChunk(args []string, now time.Time) []string {
@@ -579,7 +611,7 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 		file:      file,
 		filename:  filename,
 		path:      path,
-		chunks:    make(map[int]string),
+		encoded:   &strings.Builder{},
 		total:     total,
 		chunkSize: chunkSize,
 		encoding:  encoding,
@@ -636,7 +668,10 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 		s.mu.Unlock()
 		return []string{"Incorrect chunk length format."}
 	}
-	state.chunks[index] = wireChunk
+	if state.encoded == nil {
+		state.encoded = &strings.Builder{}
+	}
+	state.encoded.WriteString(wireChunk)
 	if index == state.total-1 {
 		delete(s.uploads, sid)
 		s.mu.Unlock()
@@ -663,17 +698,12 @@ func (s *Server) finishUpload(sid string, state uploadState) string {
 		}
 	}()
 
-	var encoded strings.Builder
-	for i := 0; i < state.total; i++ {
-		chunk, ok := state.chunks[i]
-		if !ok {
-			s.logger.Printf("upload %q missing chunk %d", state.filename, i)
-			failed = true
-			return strconv.Itoa(i)
-		}
-		encoded.WriteString(chunk)
+	if state.encoded == nil {
+		s.logger.Printf("upload %q missing accumulator", state.filename)
+		failed = true
+		return "Upload decode error."
 	}
-	protected, err := codec.DecodeDNSPayload(encoded.String(), state.encoding)
+	protected, err := codec.DecodeDNSPayload(state.encoded.String(), state.encoding)
 	if err != nil {
 		s.logger.Printf("decode upload %q: %v", state.filename, err)
 		failed = true

@@ -1,4 +1,4 @@
-.PHONY: all build clients servers cover clean test .FORCE
+.PHONY: all build clients servers cover clean test .FORCE .clients-dir .servers-dir
 
 BUILD_DIR  := clients
 SERVER_DIR := servers
@@ -16,7 +16,15 @@ PROXY_PKG  := ./cmd/gdns2tcp-client-proxy
 all: build
 
 build:
-	go build ./cmd/gdns2tcp ./cmd/gdns2tcp-client ./cmd/gdns2tcp-client-proxy
+	go build -o ./gdns2tcp ./cmd/gdns2tcp
+	go build -o ./gdns2tcp-client ./cmd/gdns2tcp-client
+	go build -o ./gdns2tcp-client-proxy ./cmd/gdns2tcp-client-proxy
+
+.clients-dir:
+	mkdir -p $(BUILD_DIR)
+
+.servers-dir:
+	mkdir -p $(SERVER_DIR)
 
 clients: \
 	$(BUILD_DIR)/gdns2tcp-client-linux-amd64 \
@@ -37,49 +45,49 @@ servers: \
 	$(SERVER_DIR)/gdns2tcp-server-darwin-amd64 \
 	$(SERVER_DIR)/gdns2tcp-server-darwin-arm64
 
-$(SERVER_DIR)/gdns2tcp-server-linux-amd64: .FORCE
+$(SERVER_DIR)/gdns2tcp-server-linux-amd64: .FORCE | .servers-dir
 	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
 
-$(SERVER_DIR)/gdns2tcp-server-linux-arm64: .FORCE
+$(SERVER_DIR)/gdns2tcp-server-linux-arm64: .FORCE | .servers-dir
 	GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
 
-$(SERVER_DIR)/gdns2tcp-server-darwin-amd64: .FORCE
+$(SERVER_DIR)/gdns2tcp-server-darwin-amd64: .FORCE | .servers-dir
 	GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
 
-$(SERVER_DIR)/gdns2tcp-server-darwin-arm64: .FORCE
+$(SERVER_DIR)/gdns2tcp-server-darwin-arm64: .FORCE | .servers-dir
 	GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-linux-amd64: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-linux-amd64: .FORCE | .clients-dir
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-linux-arm64: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-linux-arm64: .FORCE | .clients-dir
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-darwin-amd64: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-darwin-amd64: .FORCE | .clients-dir
 	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-darwin-arm64: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-darwin-arm64: .FORCE | .clients-dir
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client.ps1: scripts/gdns2tcp-client.ps1
+$(BUILD_DIR)/gdns2tcp-client.ps1: scripts/gdns2tcp-client.ps1 | .clients-dir
 	cp $< $@
 
-$(BUILD_DIR)/gdns2tcp-client-proxy-linux-amd64: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-proxy-linux-amd64: .FORCE | .clients-dir
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-proxy-linux-arm64: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-proxy-linux-arm64: .FORCE | .clients-dir
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-proxy-darwin-amd64: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-proxy-darwin-amd64: .FORCE | .clients-dir
 	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-proxy-darwin-arm64: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-proxy-darwin-arm64: .FORCE | .clients-dir
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-proxy-windows-amd64.exe: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-proxy-windows-amd64.exe: .FORCE | .clients-dir
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
 
-$(BUILD_DIR)/gdns2tcp-client-proxy-windows-arm64.exe: .FORCE
+$(BUILD_DIR)/gdns2tcp-client-proxy-windows-arm64.exe: .FORCE | .clients-dir
 	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
 
 test:
@@ -92,6 +100,7 @@ cover:
 clean:
 	rm -f \
 		gdns2tcp gdns2tcp-client gdns2tcp-client-proxy \
+		$(BUILD_DIR)/gdns2tcp-client.ps1 \
 		$(BUILD_DIR)/gdns2tcp-client-linux-amd64 \
 		$(BUILD_DIR)/gdns2tcp-client-linux-arm64 \
 		$(BUILD_DIR)/gdns2tcp-client-darwin-amd64 \

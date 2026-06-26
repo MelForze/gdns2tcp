@@ -1,23 +1,28 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"gdns2tcp/internal/protocol"
 )
 
+const testSourceSHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 // --------------------------- unit tests ---------------------------
 
 func TestResumeCacheRoundtrip(t *testing.T) {
 	root := t.TempDir()
 	c := newResumeCache(root, "example.com", "file.bin", true)
-	if err := c.saveMeta(100, 14); err != nil {
+	if err := c.saveMeta(100, 14, testSourceSHA256); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.saveBatch(3, "chunkA"); err != nil {
@@ -27,7 +32,7 @@ func TestResumeCacheRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := c.loadCompleted(100, 14)
+	got, err := c.loadCompleted(100, 14, testSourceSHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,10 +47,10 @@ func TestResumeCacheRoundtrip(t *testing.T) {
 func TestResumeCacheChunkCountMismatch(t *testing.T) {
 	root := t.TempDir()
 	c := newResumeCache(root, "example.com", "file.bin", true)
-	_ = c.saveMeta(100, 14)
+	_ = c.saveMeta(100, 14, testSourceSHA256)
 	_ = c.saveBatch(0, "data")
 
-	got, err := c.loadCompleted(200, 14) // different chunkCount
+	got, err := c.loadCompleted(200, 14, testSourceSHA256) // different chunkCount
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,10 +65,10 @@ func TestResumeCacheChunkCountMismatch(t *testing.T) {
 func TestResumeCacheBatchSizeMismatch(t *testing.T) {
 	root := t.TempDir()
 	c := newResumeCache(root, "example.com", "file.bin", true)
-	_ = c.saveMeta(100, 14)
+	_ = c.saveMeta(100, 14, testSourceSHA256)
 	_ = c.saveBatch(0, "data")
 
-	got, err := c.loadCompleted(100, 8) // different batchSize
+	got, err := c.loadCompleted(100, 8, testSourceSHA256) // different batchSize
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,6 +77,42 @@ func TestResumeCacheBatchSizeMismatch(t *testing.T) {
 	}
 	if _, err := os.Stat(c.dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("cache dir should be removed after batchSize mismatch")
+	}
+}
+
+func TestResumeCacheSourceDigestMismatch(t *testing.T) {
+	root := t.TempDir()
+	c := newResumeCache(root, "example.com", "file.bin", true)
+	_ = c.saveMeta(100, 14, testSourceSHA256)
+	_ = c.saveBatch(0, "data")
+
+	got, err := c.loadCompleted(100, 14, strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty map on source digest mismatch, got %v", got)
+	}
+	if _, err := os.Stat(c.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("cache dir should be removed after source digest mismatch")
+	}
+}
+
+func TestResumeCacheSourceDigestRequired(t *testing.T) {
+	root := t.TempDir()
+	c := newResumeCache(root, "example.com", "file.bin", true)
+	_ = c.saveMeta(100, 14, testSourceSHA256)
+	_ = c.saveBatch(0, "data")
+
+	got, err := c.loadCompleted(100, 14, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty map without source digest, got %v", got)
+	}
+	if _, err := os.Stat(c.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("cache dir should be removed when source digest is unavailable")
 	}
 }
 
@@ -88,7 +129,7 @@ func TestResumeCacheNoMetaIgnoresStrayBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := c.loadCompleted(100, 14)
+	got, err := c.loadCompleted(100, 14, testSourceSHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,13 +140,13 @@ func TestResumeCacheNoMetaIgnoresStrayBatches(t *testing.T) {
 
 func TestResumeCacheDisabled(t *testing.T) {
 	c := newResumeCache(t.TempDir(), "example.com", "file.bin", false)
-	if err := c.saveMeta(100, 14); err != nil {
+	if err := c.saveMeta(100, 14, testSourceSHA256); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.saveBatch(0, "data"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := c.loadCompleted(100, 14)
+	got, err := c.loadCompleted(100, 14, testSourceSHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +161,7 @@ func TestResumeCacheDisabled(t *testing.T) {
 func TestResumeCacheClear(t *testing.T) {
 	root := t.TempDir()
 	c := newResumeCache(root, "example.com", "file.bin", true)
-	_ = c.saveMeta(50, 7)
+	_ = c.saveMeta(50, 7, testSourceSHA256)
 	_ = c.saveBatch(0, "a")
 	_ = c.saveBatch(1, "b")
 	if _, err := os.Stat(c.dir); err != nil {
@@ -142,7 +183,7 @@ func TestResumeCacheCorruptMetaIsTreatedAsStale(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := c.loadCompleted(100, 14)
+	got, err := c.loadCompleted(100, 14, testSourceSHA256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +273,7 @@ func TestDownloadFileResumeDropsPoisonedCache(t *testing.T) {
 	cacheDir := t.TempDir()
 	batchSize := defaultDownloadBatch
 	cache := newResumeCache(cacheDir, "files.test", filename, true)
-	if err := cache.saveMeta(chunkCount, batchSize); err != nil {
+	if err := cache.saveMeta(chunkCount, batchSize, sha256Hex(payload)); err != nil {
 		t.Fatal(err)
 	}
 	// Valid base64 alphabet but cryptographically wrong: decryption will
@@ -289,7 +330,7 @@ func TestDownloadFileResumeDisabled(t *testing.T) {
 	// Pre-seed poisoned cache.
 	cacheDir := t.TempDir()
 	cache := newResumeCache(cacheDir, "files.test", filename, true)
-	_ = cache.saveMeta(chunkCount, defaultDownloadBatch)
+	_ = cache.saveMeta(chunkCount, defaultDownloadBatch, sha256Hex(payload))
 	_ = cache.saveBatch(0, "AAAAAAAAAAAAAAAAAAAA")
 
 	cfg := config{
@@ -379,11 +420,16 @@ func TestFormatETA(t *testing.T) {
 // instead of going through json.Marshal because the test runs frequently and
 // schema changes should be intentional.
 func TestResumeMetaSchema(t *testing.T) {
-	raw, err := json.Marshal(resumeMeta{ChunkCount: 7, BatchSize: 2})
+	raw, err := json.Marshal(resumeMeta{ChunkCount: 7, BatchSize: 2, SourceSHA256: testSourceSHA256})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(raw); got != `{"chunk_count":7,"batch_size":2}` {
+	if got := string(raw); got != `{"chunk_count":7,"batch_size":2,"source_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}` {
 		t.Fatalf("meta json shape changed: %s", got)
 	}
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }

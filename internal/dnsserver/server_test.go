@@ -192,6 +192,23 @@ func fetchDownloadChunk(t *testing.T, s *Server, sid string, index int) string {
 	return resp[0]
 }
 
+func fetchDownloadMeta(t *testing.T, s *Server, sid string) (int, string) {
+	t.Helper()
+	resp := s.handleTXT(signedName("dmeta", []string{sid}), "127.0.0.1")
+	if len(resp) != 1 {
+		t.Fatalf("dmeta %s: %v", sid, resp)
+	}
+	parts := strings.Split(resp[0], "|")
+	if len(parts) != 2 {
+		t.Fatalf("dmeta malformed: %q", resp[0])
+	}
+	count, err := strconv.Atoi(parts[0])
+	if err != nil || count <= 0 {
+		t.Fatalf("dmeta count=%q", parts[0])
+	}
+	return count, parts[1]
+}
+
 func openDownloadedPayload(t *testing.T, encoded string) []byte {
 	t.Helper()
 	compressed, err := secure.OpenBase64(testSecret, encoded)
@@ -1410,6 +1427,25 @@ func TestDownloadBatchEqualsPerChunk(t *testing.T) {
 	}
 }
 
+func TestDownloadMetaReturnsSourceDigest(t *testing.T) {
+	s := newTestServer(t)
+	const filename = "meta.bin"
+	payload := []byte("download metadata source bytes")
+	if err := os.WriteFile(filepath.Join(s.dataDir, filename), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sid := "metasid-aaaa"
+	count := startDownload(t, s, sid, filename)
+	metaCount, digest := fetchDownloadMeta(t, s, sid)
+	if metaCount != count {
+		t.Fatalf("dmeta count=%d want %d", metaCount, count)
+	}
+	sum := sha256.Sum256(payload)
+	if digest != hex.EncodeToString(sum[:]) {
+		t.Fatalf("dmeta digest=%q want %x", digest, sum)
+	}
+}
+
 // TestDownloadBatchAuthFail rejects unsigned db queries.
 func TestDownloadBatchAuthFail(t *testing.T) {
 	s := newTestServer(t)
@@ -1963,6 +1999,44 @@ func TestReverseAcloseIdempotent(t *testing.T) {
 	}
 }
 
+func TestReverseCloseFreesCapacityImmediately(t *testing.T) {
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.ProxyMaxConn = 1
+		cfg.ProxyBufBytes = 64 * 1024
+	})
+	op1, peer1 := net.Pipe()
+	t.Cleanup(func() {
+		_ = op1.Close()
+		_ = peer1.Close()
+	})
+	cid1, rc1, err := s.reverseEnqueueOpen("127.0.0.1:80", op1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opFull, peerFull := net.Pipe()
+	t.Cleanup(func() {
+		_ = opFull.Close()
+		_ = peerFull.Close()
+	})
+	if _, _, err := s.reverseEnqueueOpen("127.0.0.1:81", opFull); err == nil {
+		t.Fatal("expected capacity error before closing the first tunnel")
+	}
+
+	s.reverseCloseConn(cid1, rc1, "test close frees slot")
+
+	op2, peer2 := net.Pipe()
+	t.Cleanup(func() {
+		_ = op2.Close()
+		_ = peer2.Close()
+	})
+	cid2, rc2, err := s.reverseEnqueueOpen("127.0.0.1:82", op2)
+	if err != nil {
+		t.Fatalf("second tunnel should fit after close: %v", err)
+	}
+	s.reverseCloseConn(cid2, rc2, "test cleanup")
+}
+
 // TestSOCKS5ReadConnectATYPVariants verifies the parser handles IPv4, IPv6
 // and domain ATYP forms equivalently.
 func TestSOCKS5ReadConnectATYPVariants(t *testing.T) {
@@ -2223,6 +2297,37 @@ func TestReverseCleanupExpiredLocked(t *testing.T) {
 	s.reverse.mu.Unlock()
 	if exists {
 		t.Fatal("cleanup left an idle-expired cid in the map")
+	}
+}
+
+func TestReverseCleanupDropsExpiredPending(t *testing.T) {
+	s := proxyTestServer(t)
+	op, peer := net.Pipe()
+	t.Cleanup(func() {
+		_ = op.Close()
+		_ = peer.Close()
+	})
+	_, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.mu.Lock()
+	rc.expires = time.Now().Add(-time.Hour)
+	rc.mu.Unlock()
+
+	s.proxyCleanupExpiredLocked(time.Now())
+
+	got := s.handleTXT(signedName("apoll", nil), "127.0.0.1")
+	if len(got) != 1 || got[0] != "EMPTY" {
+		t.Fatalf("expired pending tunnel should not be returned by apoll, got %v", got)
+	}
+	s.reverse.mu.Lock()
+	conns := len(s.reverse.conns)
+	pending := len(s.reverse.pending)
+	pendCids := len(s.reverse.pendCids)
+	s.reverse.mu.Unlock()
+	if conns != 0 || pending != 0 || pendCids != 0 {
+		t.Fatalf("cleanup left reverse indexes populated: conns=%d pending=%d pendCids=%d", conns, pending, pendCids)
 	}
 }
 

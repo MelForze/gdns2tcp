@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -102,6 +103,95 @@ func echoUpstream(t *testing.T) string {
 	return ln.Addr().String()
 }
 
+type testAgent struct {
+	cfg      config
+	resolver *txtResolver
+	stop     chan struct{}
+
+	mu      sync.Mutex
+	stopped bool
+	wg      sync.WaitGroup
+}
+
+func startTestAgent(t *testing.T, cfg config) *testAgent {
+	t.Helper()
+	a := &testAgent{
+		cfg:      cfg,
+		resolver: newTxtResolver(cfg),
+		stop:     make(chan struct{}),
+	}
+	a.wg.Add(1)
+	go a.pollLoop()
+	t.Cleanup(func() { a.stopAndWait(t) })
+	return a
+}
+
+func (a *testAgent) pollLoop() {
+	defer a.wg.Done()
+	for {
+		select {
+		case <-a.stop:
+			return
+		default:
+		}
+		cid, target, err := agentPoll(a.cfg, a.resolver)
+		if err != nil || cid == "" {
+			if !a.sleep(5 * time.Millisecond) {
+				return
+			}
+			continue
+		}
+		a.startTunnel(cid, target)
+	}
+}
+
+func (a *testAgent) sleep(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-a.stop:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (a *testAgent) startTunnel(cid, target string) {
+	a.mu.Lock()
+	if a.stopped {
+		a.mu.Unlock()
+		return
+	}
+	a.wg.Add(1)
+	a.mu.Unlock()
+	go func() {
+		defer a.wg.Done()
+		handleTunnel(a.cfg, a.resolver, cid, target)
+	}()
+}
+
+func (a *testAgent) stopAndWait(t *testing.T) {
+	t.Helper()
+	a.mu.Lock()
+	if !a.stopped {
+		a.stopped = true
+		close(a.stop)
+		a.resolver.close()
+	}
+	a.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent goroutines did not stop")
+	}
+}
+
 // TestParseFlagsDefaults pins the agent's defaults.
 func TestParseFlagsDefaults(t *testing.T) {
 	saved := os.Args
@@ -133,7 +223,7 @@ func TestParseFlagsClamps(t *testing.T) {
 		os.Args = saved
 		flag.CommandLine = savedFlag
 	})
-	os.Args = []string{"agent", "-domain", "d", "-pass", "p", "-max-conn", "9999", "-retries", "0", "-dns-port", ""}
+	os.Args = []string{"agent", "-domain", "d", "-pass", "p", "-max-conn", "9999", "-retries", "0", "-dns-port", "", "-poll-min", "-1ms", "-poll-max", "0s"}
 	flag.CommandLine = flag.NewFlagSet("agent", flag.ContinueOnError)
 	flag.CommandLine.SetOutput(io.Discard)
 	cfg := parseFlags()
@@ -145,6 +235,31 @@ func TestParseFlagsClamps(t *testing.T) {
 	}
 	if cfg.dnsPort != "53" {
 		t.Fatalf("empty dns-port should default to 53, got %q", cfg.dnsPort)
+	}
+	if cfg.pollMin != 20*time.Millisecond {
+		t.Fatalf("poll-min should default to 20ms, got %s", cfg.pollMin)
+	}
+	if cfg.pollMax != 200*time.Millisecond {
+		t.Fatalf("poll-max should default to 200ms, got %s", cfg.pollMax)
+	}
+}
+
+func TestParseFlagsPollMaxClampsToPollMin(t *testing.T) {
+	saved := os.Args
+	savedFlag := flag.CommandLine
+	t.Cleanup(func() {
+		os.Args = saved
+		flag.CommandLine = savedFlag
+	})
+	os.Args = []string{"agent", "-domain", "d", "-pass", "p", "-poll-min", "75ms", "-poll-max", "50ms"}
+	flag.CommandLine = flag.NewFlagSet("agent", flag.ContinueOnError)
+	flag.CommandLine.SetOutput(io.Discard)
+	cfg := parseFlags()
+	if cfg.pollMin != 75*time.Millisecond {
+		t.Fatalf("poll-min drifted: got %s", cfg.pollMin)
+	}
+	if cfg.pollMax != cfg.pollMin {
+		t.Fatalf("poll-max should clamp to poll-min, got poll-min=%s poll-max=%s", cfg.pollMin, cfg.pollMax)
 	}
 }
 
@@ -274,24 +389,7 @@ func TestEndToEndReverseSOCKS5OverTCP(t *testing.T) {
 		maxConn:   4,
 		retries:   3,
 	}
-	resolver := newTxtResolver(agentCfg)
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			cid, target, err := agentPoll(agentCfg, resolver)
-			if err != nil || cid == "" {
-				time.Sleep(5 * time.Millisecond)
-				continue
-			}
-			go handleTunnel(agentCfg, resolver, cid, target)
-		}
-	}()
+	_ = startTestAgent(t, agentCfg)
 
 	op, err := net.Dial("tcp", socksLn.Addr().String())
 	if err != nil {
@@ -335,11 +433,11 @@ func TestEndToEndReverseSOCKS5OverTCP(t *testing.T) {
 }
 
 // TestEndToEndReverseSOCKS5 exercises the full reverse tunnel:
-//   1. server + agent running
-//   2. operator connects to server's SOCKS5 with username/password
-//   3. operator CONNECTs to the echo upstream
-//   4. agent (this process) polls, dials echo, bridges bytes
-//   5. operator's payload should come back echoed
+//  1. server + agent running
+//  2. operator connects to server's SOCKS5 with username/password
+//  3. operator CONNECTs to the echo upstream
+//  4. agent (this process) polls, dials echo, bridges bytes
+//  5. operator's payload should come back echoed
 func TestEndToEndReverseSOCKS5(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration")
@@ -357,25 +455,7 @@ func TestEndToEndReverseSOCKS5(t *testing.T) {
 		maxConn:   4,
 		retries:   3,
 	}
-	resolver := newTxtResolver(agentCfg)
-
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			cid, target, err := agentPoll(agentCfg, resolver)
-			if err != nil || cid == "" {
-				time.Sleep(5 * time.Millisecond)
-				continue
-			}
-			go handleTunnel(agentCfg, resolver, cid, target)
-		}
-	}()
+	_ = startTestAgent(t, agentCfg)
 
 	// Operator-side SOCKS5 driver.
 	upHost, upPortStr, _ := net.SplitHostPort(upstream)
@@ -468,24 +548,7 @@ func TestEndToEndReverseSOCKS5BulkStreamReorder(t *testing.T) {
 		maxConn:   4,
 		retries:   3,
 	}
-	resolver := newTxtResolver(agentCfg)
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			cid, target, err := agentPoll(agentCfg, resolver)
-			if err != nil || cid == "" {
-				time.Sleep(5 * time.Millisecond)
-				continue
-			}
-			go handleTunnel(agentCfg, resolver, cid, target)
-		}
-	}()
+	_ = startTestAgent(t, agentCfg)
 
 	upHost, upPortStr, _ := net.SplitHostPort(upstream)
 	upPort, _ := strconv.Atoi(upPortStr)
@@ -667,24 +730,7 @@ func testBulkEcho(t *testing.T, useTCP bool, payloadSize int) {
 		retries:       3,
 		targetTimeout: 2 * time.Second,
 	}
-	resolver := newTxtResolver(agentCfg)
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			cid, target, err := agentPoll(agentCfg, resolver)
-			if err != nil || cid == "" {
-				time.Sleep(5 * time.Millisecond)
-				continue
-			}
-			go handleTunnel(agentCfg, resolver, cid, target)
-		}
-	}()
+	_ = startTestAgent(t, agentCfg)
 
 	op := socks5Connect(t, socksAddr, secret, upstream)
 	defer op.Close()

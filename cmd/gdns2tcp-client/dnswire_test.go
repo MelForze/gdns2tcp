@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"gdns2tcp/internal/dnshelpers"
+)
 
 func TestReserveDNSIDLockedSkipsPendingID(t *testing.T) {
 	existing := make(chan []byte, 1)
@@ -8,7 +12,7 @@ func TestReserveDNSIDLockedSkipsPendingID(t *testing.T) {
 	nextID := uint16(41)
 	pending := map[uint16]chan []byte{42: existing}
 
-	id, err := reserveDNSIDLocked(pending, &nextID, ch)
+	id, err := dnshelpers.ReserveDNSIDLocked(pending, &nextID, ch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -18,11 +22,11 @@ func TestReserveDNSIDLockedSkipsPendingID(t *testing.T) {
 	if pending[42] != existing {
 		t.Fatal("existing pending id was overwritten")
 	}
-	deletePendingIfOwnedLocked(pending, 42, ch)
+	dnshelpers.DeletePendingIfOwnedLocked(pending, 42, ch)
 	if pending[42] != existing {
-		t.Fatal("deletePendingIfOwnedLocked removed a channel it did not own")
+		t.Fatal("DeletePendingIfOwnedLocked removed a channel it did not own")
 	}
-	deletePendingIfOwnedLocked(pending, 43, ch)
+	dnshelpers.DeletePendingIfOwnedLocked(pending, 43, ch)
 	if _, ok := pending[43]; ok {
 		t.Fatal("owned pending id was not removed")
 	}

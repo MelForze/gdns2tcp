@@ -23,8 +23,9 @@ type resumeCache struct {
 }
 
 type resumeMeta struct {
-	ChunkCount int `json:"chunk_count"`
-	BatchSize  int `json:"batch_size"`
+	ChunkCount   int    `json:"chunk_count"`
+	BatchSize    int    `json:"batch_size"`
+	SourceSHA256 string `json:"source_sha256"`
 }
 
 // newResumeCache returns a cache scoped to the (domain, filename) pair. When
@@ -54,11 +55,15 @@ func defaultResumeRoot() string {
 }
 
 // loadCompleted returns the map of batchIdx → base64 payload for batches
-// already present on disk. If meta.json's recorded shape (chunkCount,
-// batchSize) does not match the current dinit, the entire cache directory is
-// wiped and an empty map is returned so the download proceeds from scratch.
-func (c *resumeCache) loadCompleted(chunkCount, batchSize int) (map[int]string, error) {
+// already present on disk. If meta.json's recorded shape or source digest does
+// not match the current dinit/dmeta, the entire cache directory is wiped and an
+// empty map is returned so the download proceeds from scratch.
+func (c *resumeCache) loadCompleted(chunkCount, batchSize int, sourceSHA256 string) (map[int]string, error) {
 	if !c.enabled {
+		return map[int]string{}, nil
+	}
+	if sourceSHA256 == "" {
+		_ = os.RemoveAll(c.dir)
 		return map[int]string{}, nil
 	}
 	metaPath := filepath.Join(c.dir, "meta.json")
@@ -77,7 +82,7 @@ func (c *resumeCache) loadCompleted(chunkCount, batchSize int) (map[int]string, 
 		_ = os.RemoveAll(c.dir)
 		return map[int]string{}, nil
 	}
-	if meta.ChunkCount != chunkCount || meta.BatchSize != batchSize {
+	if meta.ChunkCount != chunkCount || meta.BatchSize != batchSize || meta.SourceSHA256 != sourceSHA256 {
 		_ = os.RemoveAll(c.dir)
 		return map[int]string{}, nil
 	}
@@ -107,15 +112,19 @@ func (c *resumeCache) loadCompleted(chunkCount, batchSize int) (map[int]string, 
 }
 
 // saveMeta writes the meta.json file describing the current download's shape.
-// Called once at the start of a run after chunkCount and batchSize are known.
-func (c *resumeCache) saveMeta(chunkCount, batchSize int) error {
+// Called once at the start of a run after chunkCount, batchSize, and source
+// digest are known.
+func (c *resumeCache) saveMeta(chunkCount, batchSize int, sourceSHA256 string) error {
 	if !c.enabled {
+		return nil
+	}
+	if sourceSHA256 == "" {
 		return nil
 	}
 	if err := os.MkdirAll(c.dir, 0o700); err != nil {
 		return fmt.Errorf("create resume cache: %w", err)
 	}
-	raw, err := json.Marshal(resumeMeta{ChunkCount: chunkCount, BatchSize: batchSize})
+	raw, err := json.Marshal(resumeMeta{ChunkCount: chunkCount, BatchSize: batchSize, SourceSHA256: sourceSHA256})
 	if err != nil {
 		return err
 	}

@@ -120,6 +120,32 @@ func TestAuthenticatedNameWithTimestampVerifies(t *testing.T) {
 	}
 }
 
+func TestParseDownloadMeta(t *testing.T) {
+	wantDigest := strings.Repeat("a", sha256HexLength)
+	count, digest, ok := parseDownloadMeta("12|" + strings.ToUpper(wantDigest))
+	if !ok {
+		t.Fatal("expected valid dmeta response")
+	}
+	if count != 12 || digest != wantDigest {
+		t.Fatalf("parseDownloadMeta = (%d, %q), want (12, %q)", count, digest, wantDigest)
+	}
+}
+
+func TestParseDownloadMetaRejectsMalformed(t *testing.T) {
+	for _, value := range []string{
+		"12",
+		"abc|" + strings.Repeat("a", sha256HexLength),
+		"0|" + strings.Repeat("a", sha256HexLength),
+		"12|short",
+		"12|" + strings.Repeat("g", sha256HexLength),
+		"12|" + strings.Repeat("a", sha256HexLength) + "|extra",
+	} {
+		if _, _, ok := parseDownloadMeta(value); ok {
+			t.Fatalf("parseDownloadMeta(%q) unexpectedly succeeded", value)
+		}
+	}
+}
+
 func TestResolveOutputPath(t *testing.T) {
 	if _, err := resolveOutputPath("   "); err == nil {
 		t.Fatal("expected error for empty output path")
@@ -366,7 +392,6 @@ func TestTestConnectionEmptyDomain(t *testing.T) {
 		t.Fatalf("testConnection(\"\") error=%v, want \"domain is required\"", err)
 	}
 }
-
 
 // TestUploadFileMissingInput verifies that uploadFile returns an error when
 // domain and pass are provided but no input file is set.

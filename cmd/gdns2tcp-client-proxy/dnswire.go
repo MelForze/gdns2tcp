@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gdns2tcp/internal/dnshelpers"
 )
 
 const dnsTypeTXT uint16 = 16
@@ -235,11 +237,13 @@ const udpPoolSockets = 4
 
 // udpConnEntry is one persistent UDP socket + its pending-id dispatcher.
 type udpConnEntry struct {
-	conn    *net.UDPConn
-	mu      sync.Mutex
-	pending map[uint16]chan []byte
-	nextID  uint16
-	closed  bool
+	parent   *udpPool
+	conn     *net.UDPConn
+	mu       sync.Mutex
+	pending  map[uint16]chan []byte
+	nextID   uint16
+	closed   bool
+	shutdown bool
 }
 
 // udpPool fans out queries across udpPoolSockets independent UDP sockets,
@@ -253,47 +257,84 @@ type udpPool struct {
 func newUDPPool(addr string) (*udpPool, error) {
 	p := &udpPool{addr: addr, conns: make([]*udpConnEntry, udpPoolSockets)}
 	for i := range p.conns {
-		conn, err := net.DialTimeout("udp", addr, 5*time.Second)
+		e := &udpConnEntry{parent: p, pending: make(map[uint16]chan []byte), nextID: randomDNSID(), closed: true}
+		e.mu.Lock()
+		err := e.ensureLocked(5 * time.Second)
+		e.mu.Unlock()
 		if err != nil {
 			for j := 0; j < i; j++ {
 				p.conns[j].close()
 			}
 			return nil, err
 		}
-		// Bump kernel UDP recv buffer to 4 MiB per socket. With 96
-		// workers fanning across 4 sockets, each socket sees bursts
-		// of ~24 in-flight responses; 4 MiB leaves comfortable
-		// headroom (≈ 24 × 40 KiB max response × safety). Kernels
-		// may silently clamp to net.core.rmem_max.
-		if uc, ok := conn.(*net.UDPConn); ok {
-			_ = uc.SetReadBuffer(4 * 1024 * 1024)
-			e := &udpConnEntry{conn: uc, pending: make(map[uint16]chan []byte), nextID: randomDNSID()}
-			p.conns[i] = e
-			go e.readLoop()
-		} else {
-			// Shouldn't happen for "udp" network, but defend anyway.
-			_ = conn.Close()
-			for j := 0; j < i; j++ {
-				p.conns[j].close()
-			}
-			return nil, errors.New("udp pool: unexpected conn type")
-		}
+		p.conns[i] = e
 	}
 	return p, nil
 }
 
-func (e *udpConnEntry) readLoop() {
+func dialUDPConn(addr string, timeout time.Duration) (*net.UDPConn, error) {
+	conn, err := net.DialTimeout("udp", addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	uc, ok := conn.(*net.UDPConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, errors.New("udp pool: unexpected conn type")
+	}
+	// Bump kernel UDP recv buffer to 4 MiB per socket. With 96
+	// workers fanning across 4 sockets, each socket sees bursts
+	// of ~24 in-flight responses; 4 MiB leaves comfortable
+	// headroom (≈ 24 × 40 KiB max response × safety). Kernels
+	// may silently clamp to net.core.rmem_max.
+	_ = uc.SetReadBuffer(4 * 1024 * 1024)
+	return uc, nil
+}
+
+// ensureLocked makes sure entry has a live UDP socket, redialing after a
+// previous read/write error. Caller must hold e.mu.
+func (e *udpConnEntry) ensureLocked(timeout time.Duration) error {
+	if e.shutdown {
+		return errors.New("udp pool closed")
+	}
+	if e.conn != nil && !e.closed {
+		return nil
+	}
+	for id, ch := range e.pending {
+		close(ch)
+		delete(e.pending, id)
+	}
+	if e.conn != nil {
+		_ = e.conn.Close()
+		e.conn = nil
+	}
+	conn, err := dialUDPConn(e.parent.addr, timeout)
+	if err != nil {
+		e.closed = true
+		return err
+	}
+	e.conn = conn
+	e.closed = false
+	go e.readLoop(conn)
+	return nil
+}
+
+func (e *udpConnEntry) readLoop(conn *net.UDPConn) {
 	buf := make([]byte, ednsUDPBufferSize)
 	for {
-		n, err := e.conn.Read(buf)
+		n, err := conn.Read(buf)
 		if err != nil {
 			e.mu.Lock()
-			e.closed = true
-			for _, ch := range e.pending {
-				close(ch)
+			if e.conn == conn {
+				e.closed = true
+				e.conn = nil
+				for id, ch := range e.pending {
+					close(ch)
+					delete(e.pending, id)
+				}
 			}
-			e.pending = make(map[uint16]chan []byte)
 			e.mu.Unlock()
+			_ = conn.Close()
 			return
 		}
 		if n < 2 {
@@ -325,20 +366,31 @@ func (p *udpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
 func (e *udpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error) {
 	ch := make(chan []byte, 1)
 	e.mu.Lock()
-	if e.closed {
+	if err := e.ensureLocked(timeout); err != nil {
 		e.mu.Unlock()
-		return nil, errors.New("udp pool closed")
+		return nil, err
 	}
-	id, err := reserveDNSIDLocked(e.pending, &e.nextID, ch)
+	id, err := dnshelpers.ReserveDNSIDLocked(e.pending, &e.nextID, ch)
 	if err != nil {
 		e.mu.Unlock()
 		return nil, err
 	}
+	conn := e.conn
 	binary.BigEndian.PutUint16(q[:2], id)
 	e.mu.Unlock()
-	if _, err := e.conn.Write(q); err != nil {
+	if _, err := conn.Write(q); err != nil {
 		e.mu.Lock()
-		deletePendingIfOwnedLocked(e.pending, id, ch)
+		if e.conn == conn {
+			e.closed = true
+			e.conn = nil
+			for pendingID, pendingCh := range e.pending {
+				close(pendingCh)
+				delete(e.pending, pendingID)
+			}
+			_ = conn.Close()
+		} else {
+			dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
+		}
 		e.mu.Unlock()
 		return nil, err
 	}
@@ -352,7 +404,7 @@ func (e *udpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		return resp, nil
 	case <-timer.C:
 		e.mu.Lock()
-		deletePendingIfOwnedLocked(e.pending, id, ch)
+		dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
 		e.mu.Unlock()
 		return nil, errors.New("udp exchange timeout")
 	}
@@ -360,9 +412,22 @@ func (e *udpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 
 func (e *udpConnEntry) close() {
 	e.mu.Lock()
+	if e.shutdown {
+		e.mu.Unlock()
+		return
+	}
+	e.shutdown = true
 	e.closed = true
+	conn := e.conn
+	e.conn = nil
+	for id, ch := range e.pending {
+		close(ch)
+		delete(e.pending, id)
+	}
 	e.mu.Unlock()
-	_ = e.conn.Close()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 func (p *udpPool) close() {
@@ -545,7 +610,7 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		return nil, err
 	}
 	e.pendingMu.Lock()
-	id, err := reserveDNSIDLocked(e.pending, &e.nextID, ch)
+	id, err := dnshelpers.ReserveDNSIDLocked(e.pending, &e.nextID, ch)
 	if err != nil {
 		e.pendingMu.Unlock()
 		e.mu.Unlock()
@@ -561,7 +626,7 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		e.closed = true
 		e.mu.Unlock()
 		e.pendingMu.Lock()
-		deletePendingIfOwnedLocked(e.pending, id, ch)
+		dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
 		e.pendingMu.Unlock()
 		return nil, err
 	}
@@ -569,7 +634,7 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		e.closed = true
 		e.mu.Unlock()
 		e.pendingMu.Lock()
-		deletePendingIfOwnedLocked(e.pending, id, ch)
+		dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
 		e.pendingMu.Unlock()
 		return nil, err
 	}
@@ -586,31 +651,9 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		return resp, nil
 	case <-timer.C:
 		e.pendingMu.Lock()
-		deletePendingIfOwnedLocked(e.pending, id, ch)
+		dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
 		e.pendingMu.Unlock()
 		return nil, errors.New("tcp exchange timeout")
-	}
-}
-
-func reserveDNSIDLocked(pending map[uint16]chan []byte, nextID *uint16, ch chan []byte) (uint16, error) {
-	for i := 0; i < 65535; i++ {
-		*nextID = *nextID + 1
-		if *nextID == 0 {
-			*nextID = 1
-		}
-		id := *nextID
-		if _, exists := pending[id]; exists {
-			continue
-		}
-		pending[id] = ch
-		return id, nil
-	}
-	return 0, errors.New("dns transaction id space exhausted")
-}
-
-func deletePendingIfOwnedLocked(pending map[uint16]chan []byte, id uint16, ch chan []byte) {
-	if pending[id] == ch {
-		delete(pending, id)
 	}
 }
 

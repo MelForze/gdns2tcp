@@ -541,10 +541,19 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 	if cacheRoot == "" {
 		cacheRoot = defaultResumeRoot()
 	}
-	cache := newResumeCache(cacheRoot, cfg.domain, cfg.filename, !cfg.noResume)
-	completed, _ := cache.loadCompleted(chunkCount, batchSize)
+	sourceSHA256 := ""
+	resumeEnabled := !cfg.noResume
+	if resumeEnabled {
+		var ok bool
+		sourceSHA256, ok = fetchDownloadSourceSHA256(resolver, cfg, sid, chunkCount)
+		if !ok {
+			resumeEnabled = false
+		}
+	}
+	cache := newResumeCache(cacheRoot, cfg.domain, cfg.filename, resumeEnabled)
+	completed, _ := cache.loadCompleted(chunkCount, batchSize, sourceSHA256)
 	usedCachedBatches := len(completed) > 0
-	if err := cache.saveMeta(chunkCount, batchSize); err != nil {
+	if err := cache.saveMeta(chunkCount, batchSize, sourceSHA256); err != nil {
 		return fmt.Errorf("write resume meta: %w", err)
 	}
 	for k, data := range completed {
@@ -623,6 +632,42 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 	fmt.Printf("saved %s\n", outputPath)
 	return nil
 }
+
+func fetchDownloadSourceSHA256(resolver *txtResolver, cfg config, sid string, chunkCount int) (string, bool) {
+	resp, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, "dmeta", []string{sid}))
+	if err != nil {
+		return "", false
+	}
+	metaChunkCount, sourceSHA256, ok := parseDownloadMeta(resp)
+	if !ok || metaChunkCount != chunkCount {
+		return "", false
+	}
+	return sourceSHA256, true
+}
+
+func parseDownloadMeta(value string) (chunkCount int, sourceSHA256 string, ok bool) {
+	parts := strings.Split(value, "|")
+	if len(parts) != 2 {
+		return 0, "", false
+	}
+	n, err := strconv.Atoi(parts[0])
+	if err != nil || n <= 0 {
+		return 0, "", false
+	}
+	digest := strings.ToLower(parts[1])
+	if len(digest) != sha256HexLength {
+		return 0, "", false
+	}
+	for _, r := range digest {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			continue
+		}
+		return 0, "", false
+	}
+	return n, digest, true
+}
+
+const sha256HexLength = 64
 
 func decodeDownloadedPayload(encoded, pass string, maxDownloadBytes int64) ([]byte, error) {
 	protected, err := codec.DecodeDNSPayload(encoded, "base64")
