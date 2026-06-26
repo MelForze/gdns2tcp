@@ -194,32 +194,6 @@ func exchangeUDP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
 	return buf[:n], nil
 }
 
-func exchangeTCP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", addr, timeout)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-	var prefix [2]byte
-	binary.BigEndian.PutUint16(prefix[:], uint16(len(q)))
-	if _, err := conn.Write(prefix[:]); err != nil {
-		return nil, err
-	}
-	if _, err := conn.Write(q); err != nil {
-		return nil, err
-	}
-	if _, err := io.ReadFull(conn, prefix[:]); err != nil {
-		return nil, err
-	}
-	rlen := int(binary.BigEndian.Uint16(prefix[:]))
-	resp := make([]byte, rlen)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
 // tcpPoolConns is the number of persistent TCP DNS connections. With
 // parallelism=32 default on downloads, a one-connection-per-query
 // approach exhausts ephemeral ports after ~16K queries (macOS default
