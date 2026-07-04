@@ -25,24 +25,24 @@ func resetFlagCommandLine(t *testing.T, args ...string) {
 }
 
 func TestRunMissingDomain(t *testing.T) {
-	resetFlagCommandLine(t, "-listen=127.0.0.1", "-secret=s")
+	resetFlagCommandLine(t, "-listen=127.0.0.1", "-p=s")
 	err := run()
 	if err == nil || !strings.Contains(err.Error(), "domain is required") {
 		t.Fatalf("error=%v, want 'domain is required'", err)
 	}
 }
 
-func TestRunMissingSecret(t *testing.T) {
+func TestRunMissingPassword(t *testing.T) {
 	resetFlagCommandLine(t, "-domain=files.test", "-listen=127.0.0.1")
 	err := run()
-	if err == nil || !strings.Contains(err.Error(), "secret is required") {
-		t.Fatalf("error=%v, want 'secret is required'", err)
+	if err == nil || !strings.Contains(err.Error(), "password is required") {
+		t.Fatalf("error=%v, want 'password is required'", err)
 	}
 }
 
 func TestRunInvalidMaxUploadBytes(t *testing.T) {
 	resetFlagCommandLine(t,
-		"-domain=files.test", "-listen=127.0.0.1", "-secret=s",
+		"-domain=files.test", "-listen=127.0.0.1", "-p=s",
 		"-max-upload-bytes=0",
 	)
 	err := run()
@@ -53,7 +53,7 @@ func TestRunInvalidMaxUploadBytes(t *testing.T) {
 
 func TestRunInvalidMaxDownloadBytes(t *testing.T) {
 	resetFlagCommandLine(t,
-		"-domain=files.test", "-listen=127.0.0.1", "-secret=s",
+		"-domain=files.test", "-listen=127.0.0.1", "-p=s",
 		"-max-download-bytes=-1",
 	)
 	err := run()
@@ -68,7 +68,7 @@ func TestRunInvalidMaxDownloadBytes(t *testing.T) {
 func TestRunMissingRequiredClientArtifact(t *testing.T) {
 	clientsDir := t.TempDir() // no gdns2tcp-client.ps1 inside
 	resetFlagCommandLine(t,
-		"-domain=files.test", "-listen=127.0.0.1", "-secret=test-secret",
+		"-domain=files.test", "-listen=127.0.0.1", "-p=test-secret",
 		"-clients-dir="+clientsDir,
 	)
 	err := run()
@@ -89,7 +89,7 @@ func TestRunListenAndServeFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	resetFlagCommandLine(t,
-		"-domain=files.test", "-listen=256.256.256.256", "-secret=test-secret",
+		"-domain=files.test", "-listen=256.256.256.256", "-p=test-secret",
 		"-clients-dir="+clientsDir,
 	)
 	errc := make(chan error, 1)

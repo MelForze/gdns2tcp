@@ -18,17 +18,26 @@ type txtResolver struct {
 	timeout time.Duration
 	pool    *udpPool
 	tcpPool *tcpPool
+	// hostPort is the pre-joined server:port, computed once at construction
+	// to avoid net.JoinHostPort allocations on the fallback exchange paths.
+	hostPort string
 }
 
 func newTxtResolver(cfg config) *txtResolver {
+	// Trim once at construction — cfg values come from flag.String and may
+	// contain trailing whitespace on some platforms. Doing this per query
+	// (as queryOnce did previously) is O(n) waste on the hot path.
+	server := strings.TrimSpace(cfg.dnsServer)
+	port := strings.TrimSpace(cfg.dnsPort)
 	r := &txtResolver{
-		server:  cfg.dnsServer,
-		port:    cfg.dnsPort,
-		retries: cfg.retries,
-		useTCP:  cfg.tcp,
-		timeout: 5 * time.Second,
+		server:   server,
+		port:     port,
+		retries:  cfg.retries,
+		useTCP:   cfg.tcp,
+		timeout:  5 * time.Second,
+		hostPort: net.JoinHostPort(server, port),
 	}
-	addr := net.JoinHostPort(cfg.dnsServer, cfg.dnsPort)
+	addr := r.hostPort
 	if cfg.tcp {
 		// Lazy-dial inside tcpPool: connections aren't opened until first
 		// exchange. This keeps newTxtResolver cheap and lets startup proceed
@@ -101,13 +110,17 @@ func (r *txtResolver) queryOnce(name string) ([]string, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	if strings.TrimSpace(r.server) == "" {
+	// r.server was trimmed at construction — a plain length check suffices
+	// and avoids O(n) TrimSpace on every query.
+	if r.server == "" {
 		return nil, errors.New("dns-server is required")
 	}
-	id := randomDNSID()
+	// ID=0 is fine on pool paths — reserveDNSIDLocked overwrites q[0:2]
+	// with a per-conn counter. Only the fallback exchangeTCP/exchangeUDP
+	// paths need a real random ID; we set one there.
 	qbufPtr := getDNSQueryBuf()
 	defer putDNSQueryBuf(qbufPtr)
-	q, err := buildTXTQueryInto(*qbufPtr, strings.TrimSuffix(name, "."), id)
+	q, err := buildTXTQueryInto(*qbufPtr, name, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -117,13 +130,13 @@ func (r *txtResolver) queryOnce(name string) ([]string, error) {
 	case r.useTCP && r.tcpPool != nil:
 		resp, err = r.tcpPool.exchange(q, timeout)
 	case r.useTCP:
-		addr := net.JoinHostPort(r.server, r.port)
-		resp, err = exchangeTCP(addr, q, timeout)
+		binary.BigEndian.PutUint16(q[:2], randomDNSID())
+		resp, err = exchangeTCP(r.hostPort, q, timeout)
 	case r.pool != nil:
 		resp, err = r.pool.exchange(q, timeout)
 	default:
-		addr := net.JoinHostPort(r.server, r.port)
-		resp, err = exchangeUDP(addr, q, timeout)
+		binary.BigEndian.PutUint16(q[:2], randomDNSID())
+		resp, err = exchangeUDP(r.hostPort, q, timeout)
 	}
 	if err != nil {
 		return nil, err

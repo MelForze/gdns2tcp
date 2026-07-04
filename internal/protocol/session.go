@@ -3,8 +3,10 @@ package protocol
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"hash"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Session MAC: short authenticator for per-cid hot-path commands (aread,
@@ -48,25 +50,66 @@ func DeriveSessionKey(secret, cid string) [32]byte {
 	return out
 }
 
-// SessionMAC returns a short authenticator for (cmd, seq). The seq parameter
-// is the value caller bound to this request: agent-chosen for awrite (the
-// chunk seq) and for aread/aclose (an agent-side request nonce).
+// hmacPool caches HMAC-SHA256 hashers indexed by session key. hmac.New
+// allocates a full block schedule; on axchg-heavy workloads (SessionMAC
+// runs on the agent for every query and again on the server to verify)
+// this dominated protocol-package allocations. The pool value is a
+// *hmacEntry so writing to it under Get/Put is a pointer swap.
+type hmacEntry struct {
+	h   hash.Hash
+	key [32]byte
+	ok  bool
+}
+
+var hmacPool = sync.Pool{
+	New: func() any { return &hmacEntry{} },
+}
+
+// SessionMAC returns a short authenticator for (cmd, seq). Callers pass an
+// already-lowercase cmd literal (`"axchg"`, `"awrite"`, `"aread"`, `"aclose"`)
+// — SessionMAC skips strings.ToLower on the hot path.
 func SessionMAC(key [32]byte, cmd string, seq uint64) string {
-	mac := hmac.New(sha256.New, key[:])
-	mac.Write([]byte(strings.ToLower(cmd)))
-	mac.Write([]byte{'|'})
-	mac.Write([]byte(strconv.FormatUint(seq, 10)))
-	sum := mac.Sum(nil)
-	return strings.ToLower(base32NoPadding.EncodeToString(sum[:sessionMACBytes]))
+	e := hmacPool.Get().(*hmacEntry)
+	if !e.ok || e.key != key {
+		e.h = hmac.New(sha256.New, key[:])
+		e.key = key
+		e.ok = true
+	} else {
+		e.h.Reset()
+	}
+	e.h.Write([]byte(cmd))
+	e.h.Write([]byte{'|'})
+	var buf [20]byte
+	e.h.Write(strconv.AppendUint(buf[:0], seq, 10))
+	var sum [sha256.Size]byte
+	digest := e.h.Sum(sum[:0])
+	out := base32LowerNoPadding.EncodeToString(digest[:sessionMACBytes])
+	hmacPool.Put(e)
+	return out
 }
 
 // VerifySessionMAC is a constant-time check that mac matches the expected
 // SessionMAC(key, cmd, seq). Caller is responsible for the replay decision
 // (seq monotonicity / sliding window).
 func VerifySessionMAC(key [32]byte, cmd string, seq uint64, mac string) bool {
-	if strings.TrimSpace(mac) == "" {
+	if mac == "" {
 		return false
 	}
 	expected := SessionMAC(key, cmd, seq)
+	// Fast path: DNS labels arrive already lowercased in the common case.
+	// Only allocate the ToLower copy if we see uppercase — most peers
+	// (including our own encoder) speak lowercase on the wire.
+	if !hasUpper(mac) {
+		return hmac.Equal([]byte(expected), []byte(mac))
+	}
 	return hmac.Equal([]byte(expected), []byte(strings.ToLower(mac)))
+}
+
+func hasUpper(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return true
+		}
+	}
+	return false
 }

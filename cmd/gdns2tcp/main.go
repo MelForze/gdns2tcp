@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,16 +43,16 @@ func run() error {
 		socksNoAuth      bool
 		proxyMaxConn     int
 		proxyBufBytes    int
+		pprofAddr        string
 	)
 
-	flag.StringVar(&domain, "domain", "", "authoritative DNS domain, for example files.example.com")
+	flag.StringVar(&domain, "domain", "", "authoritative DNS domain. Accepts a single name (files.example.com) or a comma-separated list for shard-domain fan-out (files.example.com,files1.example.com,files2.example.com); the first entry is used as the canonical HMAC domain.")
 	flag.StringVar(&domain, "d", "", "short alias for -domain")
 	flag.StringVar(&listenHost, "listen", "0.0.0.0", "UDP listen address (defaults to all interfaces)")
 	flag.StringVar(&listenHost, "l", "0.0.0.0", "short alias for -listen")
 	flag.StringVar(&port, "port", defaultPort, "UDP listen port")
-	flag.StringVar(&port, "p", defaultPort, "short alias for -port")
-	flag.StringVar(&secret, "secret", "", "shared encryption secret")
-	flag.StringVar(&secret, "s", "", "short alias for -secret")
+	flag.StringVar(&secret, "password", "", "shared encryption secret")
+	flag.StringVar(&secret, "p", "", "short alias for -password")
 	flag.StringVar(&dataDir, "data-dir", ".", "directory used for uploaded and downloaded files")
 	flag.StringVar(&clientsDir, "clients-dir", "clients", "directory containing client artifacts served through client-*/cl-* endpoints")
 	flag.Int64Var(&maxUploadBytes, "max-upload-bytes", dnsserver.DefaultMaxUploadBytes, "maximum protected upload payload accepted by the server")
@@ -62,13 +64,23 @@ func run() error {
 	flag.BoolVar(&socksNoAuth, "socks-no-auth", true, "skip SOCKS5 username/password auth. Default: on; pass -socks-no-auth=false to require user=gdns2tcp password=<-secret>.")
 	flag.IntVar(&proxyMaxConn, "proxy-max-conn", 64, "maximum concurrent tunnel connections")
 	flag.IntVar(&proxyBufBytes, "proxy-buf-bytes", 1<<20, "per-tunnel buffer cap (bytes) in each direction")
+	flag.StringVar(&pprofAddr, "pprof-addr", "", "if set, expose net/http/pprof on this addr (e.g. 127.0.0.1:6060). Dev-only.")
 	flag.Parse()
+
+	if strings.TrimSpace(pprofAddr) != "" {
+		go func() {
+			log.Printf("pprof listening on http://%s/debug/pprof/", pprofAddr)
+			if err := http.ListenAndServe(pprofAddr, nil); err != nil {
+				log.Printf("pprof exited: %v", err)
+			}
+		}()
+	}
 
 	if strings.TrimSpace(domain) == "" {
 		return errors.New("domain is required")
 	}
 	if strings.TrimSpace(secret) == "" {
-		return errors.New("secret is required")
+		return errors.New("password is required")
 	}
 	if strings.TrimSpace(listenHost) == "" {
 		listenHost = "0.0.0.0"
@@ -119,7 +131,11 @@ func run() error {
 	if abs, err := filepath.Abs(clientsDir); err == nil {
 		absClientsDir = abs
 	}
-	log.Printf("gdns2tcp listening on udp+tcp://%s for %s", addr, server.Domain())
+	if all := server.Domains(); len(all) > 1 {
+		log.Printf("gdns2tcp listening on udp+tcp://%s for %d shard domains (canonical %s): %s", addr, len(all), server.Domain(), strings.Join(all, ", "))
+	} else {
+		log.Printf("gdns2tcp listening on udp+tcp://%s for %s", addr, server.Domain())
+	}
 	log.Printf("data directory: %s", absDataDir)
 	log.Printf("clients directory: %s", absClientsDir)
 	udpSrv := &dns.Server{Addr: addr, Net: "udp", Handler: server}

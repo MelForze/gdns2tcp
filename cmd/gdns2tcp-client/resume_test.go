@@ -364,7 +364,7 @@ func discoverChunkCount(t *testing.T, resolver *txtResolver, domain, pass, filen
 		t.Fatal(err)
 	}
 	initArgs := append([]string{sid}, labels...)
-	name := authenticatedName(pass, domain, "dinit", initArgs)
+	name := authenticatedName(pass, domain, protocol.AuthDomain(domain), "dinit", initArgs)
 	resp, err := resolver.query(name)
 	if err != nil {
 		t.Fatalf("dinit: %v", err)

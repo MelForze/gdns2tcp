@@ -79,7 +79,7 @@ func TestEffectiveUploadChunkSize(t *testing.T) {
 				t.Fatalf("got %d, want between 32 and %d", got, tc.max)
 			}
 			args := append([]string{sid, "999999"}, codec.ChunkString(strings.Repeat("a", got), 63)...)
-			name := authenticatedNameWithTimestamp("secret", tc.domain, "u", args, "9999999999")
+			name := authenticatedNameWithTimestamp("secret", tc.domain, protocol.AuthDomain(tc.domain), "u", args, "9999999999")
 			if len(name) > 253 {
 				t.Fatalf("returned chunk size produces %d-byte DNS name", len(name))
 			}
@@ -106,7 +106,7 @@ func TestDnsSafeChunk(t *testing.T) {
 func TestAuthenticatedNameWithTimestampVerifies(t *testing.T) {
 	ts := protocol.CurrentTimestamp(time.Now().UTC())
 	args := []string{"sid12345", "0"}
-	name := authenticatedNameWithTimestamp("secret", "files.test", "d", args, ts)
+	name := authenticatedNameWithTimestamp("secret", "files.test", protocol.AuthDomain("files.test"), "d", args, ts)
 	labels := strings.Split(name, ".")
 	commandIdx := len(labels) - 3
 	if commandIdx < 2 || labels[commandIdx] != "d" {
@@ -227,7 +227,7 @@ func TestQueryOnceSuccess(t *testing.T) {
 
 func TestValidateConfigDomainRequired(t *testing.T) {
 	for _, mode := range []string{"test", "list", "upload", "download"} {
-		err := validateConfig(mode, config{})
+		err := validateConfig(config{mode: mode})
 		if err == nil || !strings.Contains(err.Error(), "domain is required") {
 			t.Fatalf("mode=%q: got error %v, want 'domain is required'", mode, err)
 		}
@@ -236,29 +236,29 @@ func TestValidateConfigDomainRequired(t *testing.T) {
 
 func TestValidateConfigPassRequired(t *testing.T) {
 	for _, mode := range []string{"list", "upload", "download"} {
-		err := validateConfig(mode, config{domain: "files.test"})
-		if err == nil || !strings.Contains(err.Error(), "pass is required") {
-			t.Fatalf("mode=%q: got error %v, want 'pass is required'", mode, err)
+		err := validateConfig(config{mode: mode, domain: "files.test"})
+		if err == nil || !strings.Contains(err.Error(), "password is required") {
+			t.Fatalf("mode=%q: got error %v, want 'password is required'", mode, err)
 		}
 	}
 }
 
 func TestValidateConfigUploadInputRequired(t *testing.T) {
-	err := validateConfig("upload", config{domain: "files.test", pass: "s"})
+	err := validateConfig(config{mode: "upload", domain: "files.test", pass: "s"})
 	if err == nil || !strings.Contains(err.Error(), "input file is required") {
 		t.Fatalf("error=%v, want 'input file is required'", err)
 	}
 }
 
 func TestValidateConfigDownloadFilenameRequired(t *testing.T) {
-	err := validateConfig("download", config{domain: "files.test", pass: "s"})
+	err := validateConfig(config{mode: "download", domain: "files.test", pass: "s"})
 	if err == nil || !strings.Contains(err.Error(), "filename is required") {
 		t.Fatalf("error=%v, want 'filename is required'", err)
 	}
 }
 
 func TestValidateConfigTestModeNoPassRequired(t *testing.T) {
-	if err := validateConfig("test", config{domain: "files.test"}); err != nil {
+	if err := validateConfig(config{mode: "test", domain: "files.test"}); err != nil {
 		t.Fatalf("test mode with domain should pass validation: %v", err)
 	}
 }
@@ -552,7 +552,7 @@ func resetFlagCommandLine(t *testing.T, args ...string) {
 // TestParseFlagsBasic covers the main parseFlags body: all flag.XXXVar
 // registrations, flag.Parse, and the cfg.domain TrimSuffix normalization.
 func TestParseFlagsBasic(t *testing.T) {
-	resetFlagCommandLine(t, "-domain=example.com.", "-mode=upload", "-pass=s", "-chunk-size=50")
+	resetFlagCommandLine(t, "-d=example.com.", "-upload=test.txt", "-p=s", "-chunk-size=50")
 
 	cfg := parseFlags()
 	if cfg.domain != "example.com" {
@@ -560,6 +560,9 @@ func TestParseFlagsBasic(t *testing.T) {
 	}
 	if cfg.mode != "upload" {
 		t.Fatalf("mode=%q", cfg.mode)
+	}
+	if cfg.inFile != "test.txt" {
+		t.Fatalf("inFile=%q, want test.txt", cfg.inFile)
 	}
 	if cfg.chunkSize != 50 {
 		t.Fatalf("chunkSize=%d, want 50", cfg.chunkSize)
@@ -587,16 +590,16 @@ func TestParseFlagsDefaultPort(t *testing.T) {
 // run() coverage
 // ---------------------------------------------------------------------------
 
-// TestRunUnsupportedMode exercises the default switch case in run().
-func TestRunUnsupportedMode(t *testing.T) {
+// TestRunNoMode exercises the validation when no mode flag is provided.
+func TestRunNoMode(t *testing.T) {
 	resetFlagCommandLine(t,
-		"-domain=files.test", "-mode=badmode",
-		"-dns-server=127.0.0.1", "-dns-port=9", "-retries=1",
+		"-d=files.test", "-p=s",
+		"-ds=127.0.0.1", "-dp=9", "-retries=1",
 	)
 
 	err := run()
-	if err == nil || !strings.Contains(err.Error(), "unsupported mode") {
-		t.Fatalf("run badmode error=%v, want 'unsupported mode'", err)
+	if err == nil || !strings.Contains(err.Error(), "specify --list") {
+		t.Fatalf("run no-mode error=%v, want 'specify --list'", err)
 	}
 }
 
@@ -604,36 +607,12 @@ func TestRunUnsupportedMode(t *testing.T) {
 func TestRunTestMode(t *testing.T) {
 	ip, port := startEmbeddedServer(t, newServerCfg(t, ""))
 	resetFlagCommandLine(t,
-		"-domain=files.test", "-mode=test",
-		"-dns-server="+ip, "-dns-port="+port, "-retries=1",
+		"-d=files.test", "-test",
+		"-ds="+ip, "-dp="+port, "-retries=1",
 	)
 
 	if err := run(); err != nil {
 		t.Fatalf("run test mode: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// resolveDomainServer coverage
-// ---------------------------------------------------------------------------
-
-// TestResolveDomainServerEmpty covers the domain=="" guard.
-func TestResolveDomainServerEmpty(t *testing.T) {
-	_, err := resolveDomainServer("")
-	if err == nil || !strings.Contains(err.Error(), "domain is required") {
-		t.Fatalf("resolveDomainServer(\"\") error=%v, want 'domain is required'", err)
-	}
-}
-
-// TestResolveDomainServerLocalhost covers the DNS lookup and IPv4-preference
-// code path using localhost (which resolves in almost every environment).
-func TestResolveDomainServerLocalhost(t *testing.T) {
-	ip, err := resolveDomainServer("localhost")
-	if err != nil {
-		t.Skipf("localhost DNS resolution not available: %v", err)
-	}
-	if ip == "" {
-		t.Fatal("expected non-empty IP for localhost")
 	}
 }
 

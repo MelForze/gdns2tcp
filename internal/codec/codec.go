@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"gdns2tcp/internal/dnshelpers"
 )
 
 const TXTChunkSize = 254
@@ -45,19 +47,11 @@ func EncodeDNSPayload(data []byte, encoding string) (string, error) {
 	}
 }
 
+// ChunkString is a thin wrapper around dnshelpers.ChunkString kept for
+// backwards compatibility with callers that already import this package
+// for other codec helpers. New code should call dnshelpers directly.
 func ChunkString(value string, size int) []string {
-	if size <= 0 {
-		return nil
-	}
-	chunks := make([]string, 0, (len(value)+size-1)/size)
-	for start := 0; start < len(value); start += size {
-		end := start + size
-		if end > len(value) {
-			end = len(value)
-		}
-		chunks = append(chunks, value[start:end])
-	}
-	return chunks
+	return dnshelpers.ChunkString(value, size)
 }
 
 func Compress(data []byte) ([]byte, error) {

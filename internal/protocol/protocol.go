@@ -14,6 +14,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"gdns2tcp/internal/dnshelpers"
 )
 
 const (
@@ -21,10 +23,61 @@ const (
 	FilenamePrefix = "f1"
 )
 
+// base32NoPadding is the uppercase RFC 4648 alphabet, kept for the
+// decoder path (some places accept legacy uppercase input).
 var base32NoPadding = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+// base32LowerNoPadding produces lowercase base32 output directly, so
+// callers don't need to allocate a second string via strings.ToLower.
+// The two encodings are wire-compatible (same code points 2-7 for
+// digits, a-z <-> A-Z case fold) so a decoder that accepts either
+// case can read output from either encoder.
+var base32LowerNoPadding = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
 
 func AuthDomain(domain string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+}
+
+// ParseDomainCSV splits the -domain flag value used by every gdns2tcp
+// binary (server, agent, file client). Single-domain input (no comma)
+// is fully backward compatible: canonical == input, shardDomains has
+// one entry. For CSV input the first entry becomes canonical (drives
+// HMAC), and every entry (deduped, whitespace-trimmed, trailing-dot-
+// stripped) joins shardDomains so the QNAME rotator can fan out
+// across all of them.
+//
+// Returns (canonical, shardDomains, shardAuthDomains, longest). An
+// empty raw input yields ("", [""], [""], "") — the caller sees the
+// empty canonical and rejects with "domain is required".
+func ParseDomainCSV(raw string) (canonical string, shardDomains, shardAuthDomains []string, longest string) {
+	parts := strings.Split(raw, ",")
+	shardDomains = make([]string, 0, len(parts))
+	shardAuthDomains = make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		d := strings.TrimSuffix(strings.TrimSpace(p), ".")
+		if d == "" {
+			continue
+		}
+		if _, dup := seen[d]; dup {
+			continue
+		}
+		seen[d] = struct{}{}
+		shardDomains = append(shardDomains, d)
+		shardAuthDomains = append(shardAuthDomains, AuthDomain(d))
+		if canonical == "" {
+			canonical = d
+		}
+		if len(d) > len(longest) {
+			longest = d
+		}
+	}
+	if canonical == "" {
+		// Preserve len==1 invariant callers rely on for the "skip
+		// atomic on single-domain configs" fast path.
+		return "", []string{""}, []string{""}, ""
+	}
+	return canonical, shardDomains, shardAuthDomains, longest
 }
 
 func CurrentTimestamp(now time.Time) string {
@@ -33,13 +86,20 @@ func CurrentTimestamp(now time.Time) string {
 
 func AuthToken(secret, domain, command, timestamp string, args []string) string {
 	parts := []string{AuthVersion, AuthDomain(domain), strings.ToLower(command), timestamp}
-	parts = append(parts, args...)
+	// Lowercase every arg so a resolver that randomizes DNS-label case
+	// (RFC 5452 0x20 anti-spoofing) or upcases a whole label in transit
+	// can't invalidate a legitimate MAC. Client-side callers still pass
+	// lowercase by convention; this ensures the wire-observed case has
+	// no effect either way.
+	for _, a := range args {
+		parts = append(parts, strings.ToLower(a))
+	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(strings.Join(parts, "|")))
 	sum := mac.Sum(nil)
 	// 16 bytes (128 bits) is sufficient for a MAC used as a single-use
 	// per-minute token and keeps the DNS label short.
-	return strings.ToLower(base32NoPadding.EncodeToString(sum[:16]))
+	return base32LowerNoPadding.EncodeToString(sum[:16])
 }
 
 // VerifyAuthWindowMinutes is the clock-drift tolerance VerifyAuth accepts
@@ -51,7 +111,10 @@ func AuthToken(secret, domain, command, timestamp string, args []string) string 
 const VerifyAuthWindowMinutes = 15
 
 func VerifyAuth(secret, domain, command string, args []string, timestamp, token string, now time.Time) bool {
-	if strings.TrimSpace(secret) == "" || strings.TrimSpace(timestamp) == "" || strings.TrimSpace(token) == "" {
+	// Server callers pass their normalized secret (trimmed at startup) and
+	// DNS labels never contain leading/trailing whitespace after label
+	// decoding — a plain length check suffices without an O(n) TrimSpace.
+	if secret == "" || timestamp == "" || token == "" {
 		return false
 	}
 	minute, err := strconv.ParseInt(timestamp, 10, 64)
@@ -106,7 +169,7 @@ func EncodeFilenameLabels(filename string) ([]string, error) {
 	if strings.TrimSpace(filename) == "" {
 		return nil, errors.New("filename is empty")
 	}
-	encoded := strings.ToLower(base32NoPadding.EncodeToString([]byte(filename)))
+	encoded := base32LowerNoPadding.EncodeToString([]byte(filename))
 	labels := []string{FilenamePrefix}
 	labels = append(labels, ChunkString(encoded, 63)...)
 	return labels, nil
@@ -116,8 +179,15 @@ func DecodeFilenameLabels(labels []string) (string, error) {
 	if len(labels) < 2 || labels[0] != FilenamePrefix {
 		return "", errors.New("missing filename encoding prefix")
 	}
-	joined := strings.ToUpper(strings.Join(labels[1:], ""))
-	raw, err := base32NoPadding.DecodeString(joined)
+	// New wire is lowercase (base32LowerNoPadding); older peers may still
+	// send uppercase. Try the lowercase decoder first and fall back only
+	// if it fails — this avoids the strings.ToUpper allocation on the
+	// hot path when both sides speak the new encoding.
+	joined := strings.Join(labels[1:], "")
+	raw, err := base32LowerNoPadding.DecodeString(joined)
+	if err != nil {
+		raw, err = base32NoPadding.DecodeString(strings.ToUpper(joined))
+	}
 	if err != nil {
 		return "", fmt.Errorf("decode filename: %w", err)
 	}
@@ -151,24 +221,24 @@ func ValidateFilename(filename string) error {
 	return nil
 }
 
+// ChunkString is a thin wrapper around dnshelpers.ChunkString kept for
+// backwards compatibility. New code should call dnshelpers directly.
 func ChunkString(value string, size int) []string {
-	if size <= 0 {
-		return nil
-	}
-	chunks := make([]string, 0, (len(value)+size-1)/size)
-	for start := 0; start < len(value); start += size {
-		end := start + size
-		if end > len(value) {
-			end = len(value)
-		}
-		chunks = append(chunks, value[start:end])
-	}
-	return chunks
+	return dnshelpers.ChunkString(value, size)
 }
 
 func JoinName(domain, command string, args []string) string {
+	return JoinNameFast(AuthDomain(domain), strings.ToLower(command), args)
+}
+
+// JoinNameFast is JoinName with the caller-side normalization pre-applied:
+// authDomain must already be lowercase and dot-trimmed (AuthDomain output);
+// lowerCmd must already be lowercase. Hot-path callers should compute both
+// once per tunnel and reuse across every DNS query in that tunnel to skip
+// the strings.ToLower / AuthDomain allocations on each round-trip.
+func JoinNameFast(authDomain, lowerCmd string, args []string) string {
 	labels := make([]string, 0, len(args)+2)
 	labels = append(labels, args...)
-	labels = append(labels, strings.ToLower(command), AuthDomain(domain))
+	labels = append(labels, lowerCmd, authDomain)
 	return strings.Join(labels, ".")
 }

@@ -95,23 +95,6 @@ function Normalize-Domain {
     return $normalized
 }
 
-function Resolve-DomainServer {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    try {
-        $addresses = @([System.Net.Dns]::GetHostAddresses($Value))
-    }
-    catch {
-        throw "Cannot resolve DNS server from domain $Value. Specify -DnsServer explicitly. $($_.Exception.Message)"
-    }
-    if ($addresses.Length -lt 1) {
-        throw "Domain $Value did not resolve to an IP address. Specify -DnsServer explicitly."
-    }
-    $ipv4Addresses = @($addresses | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork })
-    if ($ipv4Addresses.Length -gt 0) {
-        return $ipv4Addresses[0].IPAddressToString
-    }
-    return $addresses[0].IPAddressToString
-}
 
 function Get-DnsTool {
     $resolveDnsName = Get-Command -Name Resolve-DnsName -ErrorAction SilentlyContinue
@@ -1333,11 +1316,13 @@ function Invoke-Download {
 
 try {
     $script:DomainName = Normalize-Domain -Value $Domain
-    if ([string]::IsNullOrWhiteSpace($DnsServer)) {
-        $DnsServer = Resolve-DomainServer -Value $script:DomainName
-        Write-Log -Level 'INFO' -Message "Using DNS server $($DnsServer):$DnsPort resolved from $script:DomainName."
-    }
     $script:DnsTool = Get-DnsTool
+    if ([string]::IsNullOrWhiteSpace($DnsServer)) {
+        Write-Log -Level 'INFO' -Message "Using system DNS resolver for $script:DomainName."
+    }
+    else {
+        Write-Log -Level 'INFO' -Message "Using DNS server $($DnsServer):$DnsPort."
+    }
     Write-Log -Level 'INFO' -Message "Using DNS resolver $($script:DnsTool.Name)."
 
     switch ($Mode) {

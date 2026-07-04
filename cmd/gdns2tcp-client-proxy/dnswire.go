@@ -148,7 +148,11 @@ func parseTXTSegments(resp []byte, expectID uint16) ([]string, error) {
 		}
 		pos += 4
 	}
-	out := make([]string, 0)
+	// Pre-size to a reasonable upper bound: TXT responses in this project
+	// carry at most ~28 chunks (a full 8 KB EDNS UDP frame at 254 bytes per
+	// character-string). Starting from 0 caused a 0→1→2→4→8→16 grow
+	// sequence per response — throws away 3 intermediate slices.
+	out := make([]string, 0, 32)
 	for range ancount {
 		var err error
 		pos, err = skipDNSName(resp, pos)

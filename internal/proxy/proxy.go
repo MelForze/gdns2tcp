@@ -161,16 +161,34 @@ func SessionAEAD(secret, cid string) (cipher.AEAD, error) {
 // the server's seqIn-tracking will catch the duplicate before re-applying
 // it to the upstream TCP socket.
 func SealChunk(aead cipher.AEAD, direction uint32, seq uint64, plaintext []byte) []byte {
+	return SealChunkTo(nil, aead, direction, seq, plaintext)
+}
+
+// SealChunkTo is SealChunk with an optional pre-allocated destination
+// buffer. When dst has enough capacity for len(plaintext)+aead.Overhead()
+// no allocation happens; otherwise Seal reallocates as usual. Pass nil to
+// let Seal allocate — same behaviour as SealChunk.
+//
+// Typical use: caller passes a slice from a sync.Pool sized to the
+// worst-case chunk size, calls SealChunkTo, uses the returned slice,
+// then returns the backing array to the pool.
+func SealChunkTo(dst []byte, aead cipher.AEAD, direction uint32, seq uint64, plaintext []byte) []byte {
 	nonce := composeNonce(direction, seq)
-	return aead.Seal(nil, nonce, plaintext, nil)
+	return aead.Seal(dst[:0], nonce, plaintext, nil)
 }
 
 // OpenChunk reverses SealChunk. A FAILED authentication tag bubbles up as
 // an error and the caller MUST drop the chunk — never partially apply it,
 // since the bytes are unverified.
 func OpenChunk(aead cipher.AEAD, direction uint32, seq uint64, ciphertext []byte) ([]byte, error) {
+	return OpenChunkTo(nil, aead, direction, seq, ciphertext)
+}
+
+// OpenChunkTo is OpenChunk with an optional pre-allocated destination.
+// See SealChunkTo for the pool-friendly usage pattern.
+func OpenChunkTo(dst []byte, aead cipher.AEAD, direction uint32, seq uint64, ciphertext []byte) ([]byte, error) {
 	nonce := composeNonce(direction, seq)
-	return aead.Open(nil, nonce, ciphertext, nil)
+	return aead.Open(dst[:0], nonce, ciphertext, nil)
 }
 
 func composeNonce(direction uint32, seq uint64) []byte {

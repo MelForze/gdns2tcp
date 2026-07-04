@@ -8,7 +8,6 @@ package main
 import (
 	"context"
 	"crypto/cipher"
-	"encoding/base32"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"gdns2tcp/internal/codec"
+	"gdns2tcp/internal/dnshelpers"
 	"gdns2tcp/internal/protocol"
 	gproxy "gdns2tcp/internal/proxy"
 )
@@ -30,7 +30,26 @@ import (
 const defaultDNSPort = "53"
 
 type config struct {
-	domain        string
+	// domain is the canonical DNS domain — the one baked into HMAC
+	// signatures. For single-domain configs it also equals the QNAME
+	// suffix. For sharded configs it's the first entry of shardDomains.
+	domain string
+	// shardDomains is the full accepted set (canonical first). QNAMEs
+	// rotate through this list round-robin so per-domain resolver
+	// rate-limits accumulate rather than serialize on one zone.
+	shardDomains []string
+	// shardAuthDomains is protocol.AuthDomain(shardDomains[i]) precomputed
+	// once at parseFlags time — the shape JoinNameFast wants as suffix.
+	shardAuthDomains []string
+	// shardLongest is the longest domain in shardDomains — used for the
+	// worst-case budget in maxAxchgWritePlaintextBytes so no shard can
+	// overflow the 253-char QNAME limit.
+	shardLongest string
+	// shardRotor drives round-robin selection from apoll/aclose (which
+	// don't have a natural per-worker index). axchg workers hold their
+	// own local counter for cheaper contention-free rotation.
+	shardRotor *atomic.Uint64
+
 	pass          string
 	dnsServer     string
 	dnsPort       string
@@ -40,6 +59,32 @@ type config struct {
 	maxConn       int
 	retries       int
 	targetTimeout time.Duration
+}
+
+// longestBudgetDomain returns the domain the QNAME-length budget must
+// assume worst-case — parseFlags precomputes shardLongest, but test
+// fixtures build config{} directly, so fall back to cfg.domain there.
+func (c config) longestBudgetDomain() string {
+	if c.shardLongest != "" {
+		return c.shardLongest
+	}
+	return c.domain
+}
+
+// pickShardAuthDomain returns the next shard suffix for a non-worker
+// caller (apoll/aclose) by round-robining shardRotor. Single-domain
+// configs skip the atomic and just return the sole entry. Configs
+// constructed without parseFlags (test fixtures) fall back to computing
+// AuthDomain from cfg.domain directly.
+func (c config) pickShardAuthDomain() string {
+	if len(c.shardAuthDomains) == 0 {
+		return protocol.AuthDomain(c.domain)
+	}
+	if len(c.shardAuthDomains) == 1 || c.shardRotor == nil {
+		return c.shardAuthDomains[0]
+	}
+	idx := c.shardRotor.Add(1) % uint64(len(c.shardAuthDomains))
+	return c.shardAuthDomains[idx]
 }
 
 func main() {
@@ -55,15 +100,15 @@ func run() error {
 		return errors.New("domain is required")
 	}
 	if cfg.pass == "" {
-		return errors.New("pass is required")
+		return errors.New("password is required")
 	}
 	if cfg.dnsServer == "" {
-		ip, err := resolveDomainServer(cfg.domain)
+		addr, err := autoResolverAddr(cfg.domain)
 		if err != nil {
 			return err
 		}
-		cfg.dnsServer = ip
-		fmt.Printf("using DNS server %s:%s resolved from %s\n", cfg.dnsServer, cfg.dnsPort, cfg.domain)
+		cfg.dnsServer = addr
+		fmt.Printf("using DNS server %s:%s for %s\n", cfg.dnsServer, cfg.dnsPort, cfg.domain)
 	}
 	resolver := newTxtResolver(cfg)
 	fmt.Printf("polling %s for tunnel requests (max %d concurrent)\n", cfg.domain, cfg.maxConn)
@@ -100,10 +145,14 @@ func run() error {
 
 func parseFlags() config {
 	cfg := config{}
-	flag.StringVar(&cfg.domain, "domain", "", "authoritative gdns2tcp domain")
-	flag.StringVar(&cfg.pass, "pass", "", "shared encryption secret (must match server's -secret)")
-	flag.StringVar(&cfg.dnsServer, "dns-server", "", "DNS server address; empty resolves -domain and uses the first IP")
+	flag.StringVar(&cfg.domain, "domain", "", "authoritative gdns2tcp domain. Accepts a single name or CSV list (a.com,b.com,c.com) — the first is used as the canonical HMAC domain, all are rotated round-robin as QNAME suffixes to spread load across resolver per-zone rate-limits.")
+	flag.StringVar(&cfg.domain, "d", "", "short alias for -domain")
+	flag.StringVar(&cfg.pass, "password", "", "shared encryption secret (must match server's -password)")
+	flag.StringVar(&cfg.pass, "p", "", "short alias for -password")
+	flag.StringVar(&cfg.dnsServer, "dns-server", "", "DNS server address; empty uses the system resolver")
+	flag.StringVar(&cfg.dnsServer, "ds", "", "short alias for -dns-server")
 	flag.StringVar(&cfg.dnsPort, "dns-port", defaultDNSPort, "DNS server port; defaults to 53")
+	flag.StringVar(&cfg.dnsPort, "dp", defaultDNSPort, "short alias for -dns-port")
 	flag.BoolVar(&cfg.tcp, "tcp", false, "use TCP instead of UDP for DNS queries")
 	flag.DurationVar(&cfg.pollMin, "poll-min", 20*time.Millisecond, "minimum apoll/aread interval when active")
 	flag.DurationVar(&cfg.pollMax, "poll-max", 200*time.Millisecond, "maximum apoll/aread interval after consecutive idle responses")
@@ -112,7 +161,8 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.targetTimeout, "target-dial-timeout", 1*time.Second, "TCP dial timeout when the agent connects to the host the operator's SOCKS5 CONNECT asks for. Lower values speed up port-scan workloads through the tunnel (filtered ports release their cid sooner); raise if you legitimately tunnel to slow upstreams")
 	flag.Parse()
 
-	cfg.domain = strings.TrimSuffix(strings.TrimSpace(cfg.domain), ".")
+	cfg.domain, cfg.shardDomains, cfg.shardAuthDomains, cfg.shardLongest = protocol.ParseDomainCSV(cfg.domain)
+	cfg.shardRotor = new(atomic.Uint64)
 	cfg.dnsPort = strings.TrimSpace(cfg.dnsPort)
 	if cfg.dnsPort == "" {
 		cfg.dnsPort = defaultDNSPort
@@ -141,22 +191,50 @@ func parseFlags() config {
 	return cfg
 }
 
-func resolveDomainServer(domain string) (string, error) {
+// autoResolverAddr picks a DNS server address for the agent when -ds
+// wasn't provided. Tries /etc/resolv.conf first (Unix-family), then
+// falls back to resolving cfg.domain via the OS default resolver and
+// using that IP (works on Windows / any platform where resolv.conf
+// isn't present or readable).
+func autoResolverAddr(domain string) (string, error) {
+	if addr, err := resolvConfNameserver(); err == nil {
+		return addr, nil
+	}
+	// Fallback: ask the platform resolver where -domain points and
+	// use the first IPv4. Works on Windows too.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
 	if err != nil {
-		return "", fmt.Errorf("resolve DNS server from domain %s: %w", domain, err)
+		return "", fmt.Errorf("no /etc/resolv.conf and cannot resolve %s: %w; specify -dns-server explicitly", domain, err)
 	}
 	for _, ip := range ips {
-		if ip.To4() != nil {
-			return ip.String(), nil
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String(), nil
 		}
 	}
-	if len(ips) == 0 {
-		return "", fmt.Errorf("domain %s did not resolve", domain)
+	if len(ips) > 0 {
+		return ips[0].String(), nil
 	}
-	return ips[0].String(), nil
+	return "", fmt.Errorf("no IPs returned for %s; specify -dns-server explicitly", domain)
+}
+
+func resolvConfNameserver() (string, error) {
+	data, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "nameserver" {
+			return fields[1], nil
+		}
+	}
+	return "", errors.New("no nameserver line in /etc/resolv.conf")
 }
 
 // --- Tunnel handling -------------------------------------------------------
@@ -216,7 +294,11 @@ func handleTunnel(cfg config, resolver *txtResolver, cid, target string) {
 	// well beyond reverseTTL. Server still parses any uint64 via base
 	// 16, so a wraparound only causes the agent's query to overflow
 	// the 253-char limit (FORMERR + tunnel close), not corruption.
-	worstBuf := maxAxchgWritePlaintextBytes(cfg.domain, cfg.tcp, 8, 8) - 1
+	//
+	// For sharded configs we budget against the *longest* configured
+	// shard — a shorter shard would just leave headroom, but a longer
+	// one would silently overflow QNAME once the RR cursor lands there.
+	worstBuf := maxAxchgWritePlaintextBytes(cfg.longestBudgetDomain(), cfg.tcp, 8, 8) - 1
 	if worstBuf < 16 {
 		fmt.Fprintf(os.Stderr, "domain %q too long: axchg plaintext budget is %d bytes, need at least 16\n", cfg.domain, worstBuf)
 		_ = agentClose(cfg, resolver, ts, cid)
@@ -317,11 +399,27 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 	defer stop()
 
 	var workerWG sync.WaitGroup
-	for range tuning.workers {
+	for i := 0; i < tuning.workers; i++ {
 		workerWG.Add(1)
-		go func() {
+		go func(workerIdx int) {
 			defer workerWG.Done()
 			delay := cfg.pollMin
+			// Each worker holds a local shard cursor seeded with its
+			// own index, so N workers × M shards spread evenly across
+			// zones without any cross-worker contention. Single-domain
+			// configs collapse to a constant (shardAuthDomains[0]).
+			// Test fixtures may construct config{} without
+			// parseFlags — fall back to cfg.pickShardAuthDomain which
+			// derives from cfg.domain in that case.
+			shardIdx := workerIdx
+			pickShard := func() string {
+				if len(cfg.shardAuthDomains) == 0 {
+					return cfg.pickShardAuthDomain()
+				}
+				d := cfg.shardAuthDomains[shardIdx%len(cfg.shardAuthDomains)]
+				shardIdx++
+				return d
+			}
 			for {
 				var job awriteJob
 				haveJob := false
@@ -366,10 +464,11 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 					backpressureStart time.Time
 				)
 				for attempt := 0; attempt < axchgRetries; attempt++ {
+					shardAuth := pickShard()
 					if haveJob {
-						res, err = agentExchange(cfg, resolver, ts, cid, job.seq, job.data)
+						res, err = agentExchange(cfg, resolver, ts, cid, job.seq, job.data, shardAuth)
 					} else {
-						res, err = agentExchange(cfg, resolver, ts, cid, 0, nil)
+						res, err = agentExchange(cfg, resolver, ts, cid, 0, nil, shardAuth)
 					}
 					if err == nil {
 						break
@@ -444,7 +543,7 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 					delay = cfg.pollMin
 				}
 			}
-		}()
+		}(i)
 	}
 
 	// Upstream reader: target → writeJobs channel. Blocking Read; a second
@@ -465,32 +564,33 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 	}()
 	go func() {
 		var seq uint64
+		// Budget only changes when hexWidth(seq+1) rolls over the next
+		// power-of-16 boundary (seq = 15, 255, 4095, 65535, …). Caching
+		// the last (width, bufSize) pair skips the arithmetic + string-
+		// length work on the other ~99.9% of iterations.
+		var cachedSeqWidth int
+		var cachedBufSize int
 		for {
 			// Refuse to issue more queries once the per-tunnel counters
 			// approach 32 bits — the budget calc assumes 8-hex-char
 			// seq/nonce and an overflow would silently start emitting
 			// 9+ char labels, blowing the 253-char query name and
 			// causing the server to FORMERR every round-trip until the
-			// tunnel dies. Tear down cleanly instead. At 100K q/s with
-			// 96 workers this triggers after ~12 hours of continuous
-			// bulk on a single cid — well beyond realistic SOCKS5
-			// session lengths but possible for long-running pipes.
-			if seq+1 > 0xFFFFFFFF || ts.nonce.Load()+uint64(tuning.workers) > 0xFFFFFFFF {
+			// tunnel dies. Tear down cleanly instead.
+			if nonceGuardExceeded(seq, ts.nonce.Load(), tuning.workers) {
 				fmt.Fprintf(os.Stderr, "axchg cid=%s: seq/nonce approaching 32-bit cap, closing tunnel\n", cid)
 				stopAll()
 				return
 			}
-			// Dynamic seq width (predicted: next seq we'll assign).
-			// Conservative nonce width = 8 hex chars (32-bit cap, see
-			// worstBuf comment in handleTunnel); any worker can bump
-			// nonce arbitrarily far between our Read and the dispatch,
-			// so we don't shrink below the cap.
 			seqWidth := hexWidth(seq + 1)
-			bufSize := maxAxchgWritePlaintextBytes(cfg.domain, cfg.tcp, seqWidth, 8) - 1
-			if bufSize < 16 {
-				bufSize = 16
+			if seqWidth != cachedSeqWidth {
+				cachedSeqWidth = seqWidth
+				cachedBufSize = maxAxchgWritePlaintextBytes(cfg.longestBudgetDomain(), cfg.tcp, seqWidth, 8) - 1
+				if cachedBufSize < 16 {
+					cachedBufSize = 16
+				}
 			}
-			bufPtr := gproxy.GetBuf(bufSize)
+			bufPtr := gproxy.GetBuf(cachedBufSize)
 			n, err := upstream.Read(*bufPtr)
 			if n > 0 {
 				seq++
@@ -580,18 +680,46 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 // upstream until the first gap, advancing *nextSeq as it goes. Returns
 // the first upstream.Write error or nil. The map is mutated in place;
 // any entries beyond the gap remain for the caller to inspect.
+//
+// The contiguous chunks are gathered into a net.Buffers and issued as a
+// single writev(2) so a burst of 10-32 in-order chunks costs one syscall
+// instead of one per chunk. Falls back to Write when only one chunk is
+// ready (no need to allocate a net.Buffers for a single slice).
 func flushContiguous(pending map[uint64][]byte, nextSeq *uint64, upstream net.Conn) error {
-	for {
-		data, ok := pending[*nextSeq]
-		if !ok {
-			return nil
-		}
+	// Fast path: nothing to flush.
+	first, ok := pending[*nextSeq]
+	if !ok {
+		return nil
+	}
+	// Peek ahead to see how many contiguous chunks are ready. Single-chunk
+	// case skips the net.Buffers allocation entirely.
+	if _, hasNext := pending[*nextSeq+1]; !hasNext {
 		delete(pending, *nextSeq)
-		if _, err := upstream.Write(data); err != nil {
+		if _, err := upstream.Write(first); err != nil {
 			return err
 		}
 		*nextSeq++
+		return nil
 	}
+	// Multi-chunk case — gather and writev.
+	batch := net.Buffers{first}
+	seq := *nextSeq + 1
+	for {
+		data, ok := pending[seq]
+		if !ok {
+			break
+		}
+		batch = append(batch, data)
+		seq++
+	}
+	if _, err := batch.WriteTo(upstream); err != nil {
+		return err
+	}
+	for i := *nextSeq; i < seq; i++ {
+		delete(pending, i)
+	}
+	*nextSeq = seq
+	return nil
 }
 
 func drainExchange(ch <-chan exchangeResult) {
@@ -654,6 +782,19 @@ func maxAxchgWritePlaintextBytes(domain string, tcp bool, seqWidth, nonceWidth i
 // chosen over decimal because uint64 fits in 16 hex chars vs 20 decimal
 // — that 8-char savings translates to ~5 bytes more plaintext per chunk
 // at worst-case widths.
+// nonceGuardExceeded returns true when the per-tunnel counters are close
+// enough to overflowing the 32-bit budget assumption that we should tear
+// the tunnel down rather than emit queries that overflow the 253-char
+// QNAME limit. At 100K q/s × 96 workers this triggers after ~12 hours of
+// continuous bulk on a single cid — well beyond realistic SOCKS5 session
+// lengths but possible for long-running pipes.
+//
+// Exposed as a package-level helper so the exhaustion path can be
+// exercised in unit tests without spinning up a full tunnel.
+func nonceGuardExceeded(seq, currentNonce uint64, workers int) bool {
+	return seq+1 > 0xFFFFFFFF || currentNonce+uint64(workers) > 0xFFFFFFFF
+}
+
 func hexWidth(n uint64) int {
 	if n == 0 {
 		return 1
@@ -676,12 +817,16 @@ func isTimeout(err error) bool {
 
 // --- DNS RPC wrappers ------------------------------------------------------
 
-var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
+// b32 is the lowercase-alphabet base32 used to encode axchg ciphertext
+// into DNS labels. Encoder outputs are already lowercase (no strings.ToLower
+// copy needed); the matching decoder is dnshelpers.B32DecodeAny which
+// accepts either case in case a resolver upper-cases labels in transit.
+var b32 = dnshelpers.B32LowerNoPad
 
 // agentPoll asks the server "any pending opens?". Returns (cid, target,
 // nil) on a hit, ("", "", nil) on EMPTY, or an error.
 func agentPoll(cfg config, resolver *txtResolver) (cid, target string, err error) {
-	name := authenticatedName(cfg.pass, cfg.domain, "apoll", nil)
+	name := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "apoll", nil)
 	resp, err := resolver.query(name)
 	if err != nil {
 		return "", "", err
@@ -703,7 +848,10 @@ func agentPoll(cfg config, resolver *txtResolver) (cid, target string, err error
 	if !gproxy.ValidCID(cid) {
 		return "", "", fmt.Errorf("bad cid in OPEN: %q", cid)
 	}
-	rawTarget, err := b32.DecodeString(strings.ToUpper(parts[1]))
+	// Target is base32-encoded by the server; older servers send uppercase,
+	// newer ones lowercase. dnshelpers.B32DecodeAny handles both without
+	// paying a strings.ToUpper allocation on the common (lowercase) path.
+	rawTarget, err := dnshelpers.B32DecodeAny(parts[1])
 	if err != nil {
 		return "", "", fmt.Errorf("decode target: %w", err)
 	}
@@ -725,15 +873,28 @@ type exchangeResult struct {
 // chunk (or none) with a fresh aread pull. Returns the parsed exchangeResult
 // or an error; the caller decides what to retry.
 //
-// Wire: cid . writeSeq . [writeChunks...] . [x-tcp] . readNonce . smac . axchg . domain
-func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, writeSeq uint64, writeData []byte) (exchangeResult, error) {
+// Wire: cid . writeSeq . [writeChunks...] . [x-tcp] . readNonce . smac . axchg . <shard>
+// shardAuthDomain picks which configured shard suffix ends the QNAME.
+// HMAC/session MAC don't touch shardAuthDomain — they use ts.sessionKey
+// derived from canonical (cfg.domain), so any shard is auth-equivalent.
+func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, writeSeq uint64, writeData []byte, shardAuthDomain string) (exchangeResult, error) {
 	readNonce := ts.nextNonce()
 	args := make([]string, 0, 8)
 	args = append(args, cid, strconv.FormatUint(writeSeq, 16))
 	if writeSeq > 0 {
 		compressed := ts.compressor.Encode(writeData)
-		ct := gproxy.SealChunk(ts.aead, gproxy.DirClientToServer, writeSeq, compressed)
-		enc := strings.ToLower(b32.EncodeToString(ct))
+		// Seal into a pooled dst buffer so aead.Seal doesn't allocate a
+		// fresh ciphertext slice per chunk. `enc` is a fresh string that
+		// copies bytes out of the pooled scratch, so we can release
+		// immediately after EncodeToString returns. Use a closure so a
+		// hypothetical panic in Seal/Encode still returns the buffer.
+		ctBufPtr := gproxy.GetBuf(len(compressed) + 16)
+		var enc string
+		func() {
+			defer gproxy.PutBuf(ctBufPtr)
+			ct := gproxy.SealChunkTo((*ctBufPtr)[:0], ts.aead, gproxy.DirClientToServer, writeSeq, compressed)
+			enc = b32.EncodeToString(ct) // already lowercase — see b32 var doc
+		}()
 		args = append(args, codec.ChunkString(enc, 63)...)
 	}
 	if cfg.tcp {
@@ -741,7 +902,11 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 	}
 	args = append(args, strconv.FormatUint(readNonce, 16))
 	args = append(args, protocol.SessionMAC(ts.sessionKey, "axchg", readNonce))
-	name := protocol.JoinName(cfg.domain, "axchg", args)
+	// shardAuthDomain is pre-normalized by parseDomainCSV and "axchg"
+	// is already lowercase — skip protocol.AuthDomain + strings.ToLower
+	// per query. The shard varies per call (RR from workers/rotor);
+	// HMAC/session MAC live in args and are unaffected by suffix choice.
+	name := protocol.JoinNameFast(shardAuthDomain, "axchg", args)
 
 	segs, err := resolver.queryStringsNoRetry(name)
 	if err != nil {
@@ -792,7 +957,14 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 			if derr != nil {
 				return exchangeResult{}, fmt.Errorf("decode axchg payload: %w", derr)
 			}
-			pt, oerr := gproxy.OpenChunk(ts.aead, gproxy.DirServerToClient, parsedSeq, ct)
+			// Open into a pooled dst buffer; compressor.Decode below returns
+			// a fresh slice so `decompressed` doesn't reference the pool
+			// buffer after Decode returns. defer ensures the buffer is
+			// released on every return path (error, panic, or success)
+			// with no chance of a double-put.
+			ptBufPtr := gproxy.GetBuf(len(ct))
+			defer gproxy.PutBuf(ptBufPtr)
+			pt, oerr := gproxy.OpenChunkTo((*ptBufPtr)[:0], ts.aead, gproxy.DirServerToClient, parsedSeq, ct)
 			if oerr != nil {
 				return exchangeResult{}, fmt.Errorf("decrypt axchg payload: %w", oerr)
 			}
@@ -815,7 +987,10 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 // so a replay can't free new state; the server treats unknown-cid as a
 // successful no-op so retries on DNS timeout are safe.
 //
-// Wire: cid . nonce . smac . aclose . domain
+// Wire: cid . nonce . smac . aclose . <shard>
+// Shard suffix is picked round-robin from cfg.shardRotor (aclose isn't
+// worker-local so there's no per-worker cursor). Session MAC lives in
+// args and is unaffected by suffix choice.
 func agentClose(cfg config, resolver *txtResolver, ts *tunnelSession, cid string) error {
 	nonce := ts.nextNonce()
 	args := []string{
@@ -823,18 +998,23 @@ func agentClose(cfg config, resolver *txtResolver, ts *tunnelSession, cid string
 		strconv.FormatUint(nonce, 16),
 		protocol.SessionMAC(ts.sessionKey, "aclose", nonce),
 	}
-	name := protocol.JoinName(cfg.domain, "aclose", args)
+	name := protocol.JoinNameFast(cfg.pickShardAuthDomain(), "aclose", args)
 	_, err := resolver.query(name)
 	return err
 }
 
 // --- Authenticated name builder (used only by apoll, which has no cid yet) -
 
-func authenticatedName(secret, domain, command string, args []string) string {
+// authenticatedName builds an apoll-style QNAME. canonicalDomain drives
+// the HMAC (the server verifies against its canonical -domain too), and
+// shardAuthDomain picks which shard suffix ends the QNAME. For single-
+// domain configs the two are equivalent. `command` must already be
+// lowercase — JoinNameFast's contract.
+func authenticatedName(secret, canonicalDomain, shardAuthDomain, command string, args []string) string {
 	ts := protocol.CurrentTimestamp(time.Now())
-	token := protocol.AuthToken(secret, domain, command, ts, args)
+	token := protocol.AuthToken(secret, canonicalDomain, command, ts, args)
 	labels := make([]string, 0, len(args)+3)
 	labels = append(labels, args...)
 	labels = append(labels, ts, token)
-	return protocol.JoinName(domain, command, labels)
+	return protocol.JoinNameFast(shardAuthDomain, command, labels)
 }

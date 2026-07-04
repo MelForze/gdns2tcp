@@ -64,7 +64,16 @@ type ClientArtifactConfig struct {
 }
 
 type Server struct {
-	domain           string
+	// domain is the canonical domain: the one used to derive authDomain
+	// (which is baked into the HMAC of every authenticated request).
+	// Callers always sign under this name regardless of which shard
+	// domain they route the query through.
+	domain string
+	// domains is the full accepted set (canonical first, then shards).
+	// hasDomainSuffix / parseCommand walk this list to decide whether
+	// an inbound QNAME belongs to us. For single-domain configs it has
+	// exactly one entry equal to domain.
+	domains          []string
 	authDomain       string
 	secret           string
 	dataDir          string
@@ -124,7 +133,7 @@ type uploadState struct {
 }
 
 func New(cfg Config) (*Server, error) {
-	domain, err := normalizeDomain(cfg.Domain)
+	domain, domains, err := normalizeDomains(cfg.Domain)
 	if err != nil {
 		return nil, err
 	}
@@ -159,6 +168,7 @@ func New(cfg Config) (*Server, error) {
 
 	server := &Server{
 		domain:           domain,
+		domains:          domains,
 		authDomain:       protocol.AuthDomain(domain),
 		secret:           cfg.Secret,
 		dataDir:          absDataDir,
@@ -195,6 +205,13 @@ func (s *Server) Domain() string {
 	return s.domain
 }
 
+// Domains returns every accepted shard suffix, canonical first. For
+// single-domain configs the slice has exactly one entry equal to
+// Domain(). Callers must not mutate the returned slice.
+func (s *Server) Domains() []string {
+	return s.domains
+}
+
 func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	resp := new(dns.Msg)
 	resp.SetReply(r)
@@ -215,7 +232,8 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		}
 		return
 	}
-	if !hasDomainSuffix(q.Name, s.domain) {
+	matchedDomain, ok := hasAnyDomainSuffix(q.Name, s.domains)
+	if !ok {
 		resp.Rcode = dns.RcodeNameError
 		if err := w.WriteMsg(resp); err != nil {
 			s.logger.Printf("write DNS response: %v", err)
@@ -223,7 +241,7 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	answer := s.handleTXT(q.Name, clientID(w.RemoteAddr()))
+	answer := s.handleTXTOnDomain(q.Name, matchedDomain, clientID(w.RemoteAddr()))
 	resp.Answer = append(resp.Answer, &dns.TXT{
 		Hdr: dns.RR_Header{
 			Name:   q.Name,
@@ -238,8 +256,25 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	}
 }
 
+// handleTXT is the entry point used by direct-invocation tests. It
+// rediscovers the shard suffix itself, then delegates to
+// handleTXTOnDomain. Production traffic reaches handleTXTOnDomain
+// directly from ServeDNS, which has already computed matchedDomain.
 func (s *Server) handleTXT(name, client string) []string {
-	args, command, ok := parseCommand(name, s.domain)
+	matchedDomain, ok := hasAnyDomainSuffix(name, s.domains)
+	if !ok {
+		return []string{"Invalid gdns2tcp request."}
+	}
+	return s.handleTXTOnDomain(name, matchedDomain, client)
+}
+
+// handleTXTOnDomain dispatches a validated inbound query. matchedDomain
+// must be the shard suffix hasAnyDomainSuffix picked — parseCommand
+// uses it to trim the right suffix off the query name. HMAC checks
+// downstream always run against s.authDomain (canonical), so the shard
+// the client happened to route through has no effect on auth.
+func (s *Server) handleTXTOnDomain(name, matchedDomain, client string) []string {
+	args, command, ok := parseCommand(name, matchedDomain)
 	if !ok {
 		return []string{"Invalid gdns2tcp request."}
 	}
@@ -550,6 +585,10 @@ func (s *Server) downloadBatch(args []string, now time.Time) []string {
 	if end > len(state.chunks) {
 		end = len(state.chunks)
 	}
+	// Copy into a fresh []string — a subslice would pin the entire
+	// state.chunks backing array (potentially hundreds of MB for large
+	// uploads) alive for as long as any caller retains the returned
+	// slice, defeating the transferTTL eviction below.
 	batch := append([]string(nil), state.chunks[from:end]...)
 	state.expires = now.Add(transferTTL)
 	s.downloads[sid] = state
@@ -956,6 +995,58 @@ func normalizeDomain(domain string) (string, error) {
 	return domain + ".", nil
 }
 
+// normalizeDomains parses a CSV list of domains — the shape accepted by
+// the -domain flag. The first entry is the *canonical* domain (the one
+// baked into HMAC signatures via protocol.AuthDomain); every entry
+// (including canonical) is added to the accepted-suffix list used by
+// hasDomainSuffix / parseCommand to decide whether an inbound QNAME
+// belongs to us.
+//
+// Returns (canonical, all, err). Duplicates are dropped after
+// normalization. A single-domain input (no comma) is fully backward
+// compatible: canonical == all[0] == normalizeDomain(input).
+func normalizeDomains(csv string) (string, []string, error) {
+	raw := strings.Split(csv, ",")
+	all := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	var canonical string
+	for _, r := range raw {
+		if strings.TrimSpace(r) == "" {
+			continue
+		}
+		d, err := normalizeDomain(r)
+		if err != nil {
+			return "", nil, err
+		}
+		if _, dup := seen[d]; dup {
+			continue
+		}
+		seen[d] = struct{}{}
+		all = append(all, d)
+		if canonical == "" {
+			canonical = d
+		}
+	}
+	if canonical == "" {
+		return "", nil, errors.New("domain is required")
+	}
+	return canonical, all, nil
+}
+
+// hasAnyDomainSuffix returns (matchedDomain, true) if the QNAME belongs
+// to any of the configured accepted domains, or ("", false) otherwise.
+// Callers pass the matched suffix on to parseCommand so args are split
+// against the *actual* shard the query landed on.
+func hasAnyDomainSuffix(name string, domains []string) (string, bool) {
+	fqdn := strings.ToLower(dns.Fqdn(name))
+	for _, d := range domains {
+		if fqdn == d || strings.HasSuffix(fqdn, "."+d) {
+			return d, true
+		}
+	}
+	return "", false
+}
+
 func hasDomainSuffix(name, domain string) bool {
 	fqdn := strings.ToLower(dns.Fqdn(name))
 	return fqdn == domain || strings.HasSuffix(fqdn, "."+domain)
@@ -972,12 +1063,27 @@ func clientID(addr net.Addr) string {
 	return host
 }
 
+// parseCommand splits a QNAME into (args, command, ok) against the
+// matched domain suffix. Suffix matching and command extraction are
+// case-insensitive (resolvers may randomize label case per RFC 5452
+// 0x20 or upcase whole labels), but args are returned with their
+// original wire case preserved — some args carry base64 payload where
+// case is significant. HMAC/session-MAC on the server side lowercase
+// args internally for verification.
 func parseCommand(name, domain string) ([]string, string, bool) {
 	fqdn := dns.Fqdn(name)
-	if !hasDomainSuffix(fqdn, domain) {
+	fqdnLower := strings.ToLower(fqdn)
+	if fqdnLower != domain && !strings.HasSuffix(fqdnLower, "."+domain) {
 		return nil, "", false
 	}
-	prefix := strings.TrimSuffix(fqdn, domain)
+	// Compute the byte length of the suffix on the wire so we can strip
+	// it from the original-case fqdn without accidentally chopping into
+	// mixed-case content.
+	suffixLen := len(domain)
+	if fqdnLower != domain {
+		suffixLen++ // account for the leading dot in ".domain"
+	}
+	prefix := fqdn[:len(fqdn)-suffixLen]
 	prefix = strings.TrimSuffix(prefix, ".")
 	if prefix == "" {
 		return []string{""}, "", true

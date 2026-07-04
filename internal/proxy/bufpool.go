@@ -54,32 +54,35 @@ func GetBuf(size int) *[]byte {
 		empty := []byte{}
 		return &empty
 	}
+	var bp *[]byte
 	switch {
 	case size <= bufSizeSmall:
-		bp := poolSmall.Get().(*[]byte)
-		*bp = (*bp)[:size]
-		return bp
+		bp = poolSmall.Get().(*[]byte)
 	case size <= bufSizeMedium:
-		bp := poolMedium.Get().(*[]byte)
-		*bp = (*bp)[:size]
-		return bp
+		bp = poolMedium.Get().(*[]byte)
 	case size <= bufSizeLarge:
-		bp := poolLarge.Get().(*[]byte)
-		*bp = (*bp)[:size]
-		return bp
+		bp = poolLarge.Get().(*[]byte)
 	case size <= bufSizeBulk:
-		bp := poolBulk.Get().(*[]byte)
-		*bp = (*bp)[:size]
-		return bp
+		bp = poolBulk.Get().(*[]byte)
 	default:
 		one := make([]byte, size)
 		return &one
 	}
+	*bp = (*bp)[:size]
+	return bp
 }
 
 // PutBuf returns a buffer obtained from GetBuf. The routing key is cap();
 // the pointer itself is what goes back into sync.Pool, so no slice-header
 // escape per Put. Safe to call with nil.
+//
+// Callers MUST NOT call PutBuf twice on the same pointer. There is no
+// runtime guard: the previous sentinel-byte scheme was defeated both
+// by the caller-visible boundary case (size == class cap overwrites
+// the sentinel with legitimate data) and by the check-then-put race
+// (two goroutines racing PutBuf both saw the sentinel and both Put'd).
+// Use `defer PutBuf(bp)` and set the local variable to nil after any
+// hand-off; single-ownership is the guard.
 func PutBuf(bp *[]byte) {
 	if bp == nil {
 		return

@@ -30,6 +30,25 @@ func ReserveDNSIDLocked(pending map[uint16]chan []byte, nextID *uint16, ch chan 
 	return 0, errors.New("dns transaction id space exhausted")
 }
 
+// ChunkString splits value into consecutive chunks of at most size runes.
+// Used everywhere we need to fit a base32/base64 payload into 63-character
+// DNS labels (or into TXT character-strings of at most 254 bytes each).
+// Returns nil for size <= 0.
+func ChunkString(value string, size int) []string {
+	if size <= 0 {
+		return nil
+	}
+	chunks := make([]string, 0, (len(value)+size-1)/size)
+	for start := 0; start < len(value); start += size {
+		end := start + size
+		if end > len(value) {
+			end = len(value)
+		}
+		chunks = append(chunks, value[start:end])
+	}
+	return chunks
+}
+
 // DeletePendingIfOwnedLocked removes a pending registration, but only
 // if the slot still belongs to the caller. This guards the race where
 // another goroutine (e.g. readLoop closing all pendings on conn death)

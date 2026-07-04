@@ -8,74 +8,104 @@ records.
 - **Unix client** (Go) — ~3 MB stripped, no CGO, no external dependencies
 - **Windows client** (PowerShell 5.1+) — single self-contained script
 
-All payloads are gzip-compressed, AES-256-CBC encrypted with PBKDF2-SHA256
-(100k iterations), and HMAC-SHA256 authenticated. Every DNS query carries an
-HMAC token tied to the current minute.
+Payloads are gzip+AES-256-CBC (PBKDF2-SHA256, 100k iterations) with
+HMAC-SHA256. Every DNS query carries a per-minute HMAC token.
 
 ---
 
 ## Quick start
 
-The steps below take you from a fresh clone to a working file transfer.
-All commands assume the working directory is the repo root and that the
-server runs on a host reachable on UDP+TCP port 53.
-
-### 1. Build everything
+### 1. Build
 
 ```sh
-make clients servers
+make clients servers     # cross-compile everything into ./clients + ./servers
+make build               # current platform → ./gdns2tcp, ./gdns2tcp-client, ./gdns2tcp-client-proxy
 ```
 
-Produces:
+### 2. Delegate the DNS zone
 
-- `clients/gdns2tcp-client-linux-amd64`, `…-linux-arm64`,
-  `…-darwin-amd64`, `…-darwin-arm64`, `gdns2tcp-client.ps1`,
-  and matching `gdns2tcp-client-proxy-*` agent binaries
-- `servers/gdns2tcp-server-linux-amd64`, `…-linux-arm64`,
-  `…-darwin-amd64`, `…-darwin-arm64`
+The parent zone must delegate the subzone to the host running gdns2tcp:
 
-For only the current platform:
+| Type | Name | Value |
+|---|---|---|
+| `NS` | `files.example.com.` | `ns1.example.com.` |
+| `A`  | `ns1.example.com.` | `11.11.11.11` |
+
+gdns2tcp answers **only TXT queries** for names under `-domain` —
+everything else is NXDOMAIN. Resolvers follow the parent delegation to
+find the IP, then send TXT queries directly on UDP+TCP port 53.
 
 ```sh
-make build      # → ./gdns2tcp, ./gdns2tcp-client, ./gdns2tcp-client-proxy
+dig +short NS files.example.com
+dig +short TXT EnCoDiNg.test.files.example.com    # → "base64" (or "base32")
 ```
 
-### 2. Run the server
+For local/private testing without real DNS, add `-ds <server-ip>` to
+every client to bypass the system resolver.
+
+#### Multi-domain sharding (optional)
+
+Public resolvers (`1.1.1.1`, `8.8.8.8`, …) rate-limit queries **per
+authoritative zone**. Delegating several zones to the same nameserver
+and passing them as a CSV list to `-domain` lets clients rotate QNAME
+suffixes round-robin, so each shard eats its own rate-limit budget.
+
+Zone records add one line per shard; the same A-record for `ns1`
+serves all of them:
+
+| Type | Name | Value |
+|---|---|---|
+| `NS` | `files.example.com.`  | `ns1.example.com.` |
+| `NS` | `files1.example.com.` | `ns1.example.com.` |
+| `NS` | `files2.example.com.` | `ns1.example.com.` |
+| `A`  | `ns1.example.com.`    | `11.11.11.11` |
+
+The **first** domain in the CSV is *canonical* — HMAC signatures are
+always computed under it, so a query routed through any shard still
+authenticates. Non-canonical shards are pure suffix rotation; there is
+no per-shard state.
+
+### 3. Run the server
 
 ```sh
-sudo ./servers/gdns2tcp-server-linux-amd64 -domain files.example.com -secret "change-me"
+sudo ./gdns2tcp -domain files.example.com -p "change-me"
+
+# multi-domain sharding: canonical + 2 shards
+sudo ./gdns2tcp -domain files.example.com,files1.example.com,files2.example.com -p "change-me"
 ```
 
-The server listens on **both UDP and TCP** at `0.0.0.0:53` and serves
-client binaries from `./clients` automatically. Pick the matching server
-binary for your OS/arch, or use `./gdns2tcp` if you ran `make build`.
-Binding to port 53 requires root.
+Listens on UDP+TCP port 53 and serves client binaries from `./clients`.
+Port 53 requires root.
 
-### 3. Fetch the client over DNS
+Clients (`gdns2tcp-client`, `gdns2tcp-client-proxy`) accept the same
+CSV form for their `-domain` flag; single-domain configs remain fully
+backward compatible.
 
-The server publishes its own client binaries through public DNS endpoints
-(no secret required) so a fresh host can bootstrap. Replace `<server-ip>`
-with the host running gdns2tcp. Pick one snippet below.
+### 4. Fetch a client over DNS
 
-**Linux / macOS** — auto-detects OS+arch. Uses only default utilities
-(`dig`, `base64`, `shasum`). Fetches 14 chunks per query via the batched
-`clb-` endpoint and runs 16 batches in parallel via background jobs:
+The server publishes its own client binaries under public DNS endpoints —
+no secret required. `S=<dns-server>` is optional: leave unset to use the
+system resolver, set to hit a specific server directly (useful before
+delegation is live or on private networks).
+
+**Linux / macOS** (needs `dig`, `base64`, `shasum`):
 
 ```sh
-D=files.example.com S=<server-ip> B=14 P=16 sh <<'EOF'
+D=files.example.com S= B=14 P=16 sh <<'EOF'
+# S="" → system resolver; S=192.0.2.10 → send queries straight to that IP
 os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="$os-$a"
 NL=$(printf '\n')
 qm(){ for i in 1 2 3 4 5; do
-        o=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d "\"$NL ")
+        o=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT | tr -d "\"$NL ")
         [ -n "$o" ] && { printf %s "$o"; return; }
         sleep 0.4
     done
     echo "no TXT for $1" >&2; return 1
 }
 qb(){ for i in 1 2 3 4 5; do
-        raw=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d \" | tr "$NL" ' ')
+        raw=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT | tr -d \" | tr "$NL" ' ')
         s=$(printf %s "$raw" | awk '{print $1}')
         d=$(printf %s "$raw" | awk '{for(i=2;i<=NF;i++) printf "%s",$i}')
         if [ -n "$s" ] && [ -n "$d" ] && [ "${s%${s#s:}}" = "s:" ]; then
@@ -109,16 +139,17 @@ chmod +x "$NAME"; echo "saved ./$NAME"
 EOF
 ```
 
-**Windows PowerShell** — requires `nslookup`. Uses TCP (`-vc`) so the larger
-batched responses are not capped by Windows' default 512-byte UDP DNS buffer:
+**Windows PowerShell** — uses TCP DNS (`nslookup -vc`) to bypass the
+512-byte UDP cap. `$S=""` uses the system resolver; set it to an IP to
+target a specific server:
 
 ```powershell
-$D="files.example.com"; $S="<server-ip>"; $B=14
-function qm($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
+$D="files.example.com"; $S=""; $B=14
+function qm($n){ for($i=1;$i -le 5;$i++){ $r = if ($S) { nslookup -vc -type=TXT $n $S 2>$null } else { nslookup -vc -type=TXT $n 2>$null }
   $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
   if($m.Count){ return (($m | %{ $_.Groups[1].Value }) -join "") }
   Start-Sleep -Milliseconds 400 }; throw "no TXT for $n" }
-function qb($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
+function qb($n){ for($i=1;$i -le 5;$i++){ $r = if ($S) { nslookup -vc -type=TXT $n $S 2>$null } else { nslookup -vc -type=TXT $n 2>$null }
   $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
   if($m.Count -ge 2 -and $m[0].Groups[1].Value.StartsWith("s:")){
     $expected = $m[0].Groups[1].Value.Substring(2).ToLower()
@@ -146,119 +177,71 @@ if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){
 "Saved $out"
 ```
 
-After this step you have an executable client in the current directory:
-`gdns2tcp-client-<os>-<arch>` or `gdns2tcp-client.ps1`.
-
-### 4. List files on the server
-
-#### Linux / macOS
+### 5. Transfer files
 
 ```sh
-./gdns2tcp-client-linux-amd64 -domain files.example.com -pass "change-me" -mode list
+# Linux / macOS
+./gdns2tcp-client-linux-amd64 -d files.example.com -p "change-me" --list
+./gdns2tcp-client-linux-amd64 -d files.example.com -p "change-me" --upload ./sample.txt
+./gdns2tcp-client-linux-amd64 -d files.example.com -p "change-me" --download sample.txt -out ./sample.copy.txt
 ```
 
-#### Windows
-
 ```powershell
+# Windows
 .\gdns2tcp-client.ps1 -Domain files.example.com -Pass "change-me" -Mode List
-```
-
-### 5. Upload a file to the server
-
-#### Linux / macOS
-
-```sh
-./gdns2tcp-client-linux-amd64 -domain files.example.com -pass "change-me" -mode upload -in ./sample.txt
-```
-
-#### Windows
-
-```powershell
 .\gdns2tcp-client.ps1 -Domain files.example.com -Pass "change-me" -Mode Upload -InFile .\sample.txt
-```
-
-### 6. Download a file from the server
-
-#### Linux / macOS
-
-```sh
-./gdns2tcp-client-linux-amd64 -domain files.example.com -pass "change-me" -mode download -filename sample.txt -out ./sample.copy.txt
-```
-
-#### Windows
-
-```powershell
 .\gdns2tcp-client.ps1 -Domain files.example.com -Pass "change-me" -Mode Download -Filename sample.txt -OutFile .\sample.copy.txt
 ```
 
-Add `-tcp` (Go) or `-Tcp` (PowerShell) to force DNS over TCP — useful when
-intermediate resolvers truncate large UDP responses or block UDP/53.
+Add `-tcp` (Go) or `-Tcp` (PowerShell) if UDP is blocked or truncates.
 
 ---
 
 ## Reverse SOCKS5 — browse the agent's network
 
-The reverse mode turns gdns2tcp into a way to **see what the agent sees**: an
-internal-network machine runs `gdns2tcp-client-proxy` (the *agent*), polls
-the public server through DNS, and dials upstream services locally. Your
-host connects to the server's SOCKS5 listener as a normal SOCKS5 proxy — no
-DNS client involved — and traffic emerges from the agent's vantage point.
+An agent inside a private network polls the public server through DNS
+and dials upstream services locally. You connect to the server's SOCKS5
+listener; traffic exits from the agent.
 
 ```
 operator ── TCP/SOCKS5 ──> server:9050 ── DNS tunnel ──> agent ──> upstream
-(your host)                (rendezvous)                  (inside)   (target net)
 ```
 
-The server holds plaintext bytes only briefly (just queueing for the next
-agent poll); the agent↔server DNS traffic is encrypted with AES-256-GCM
-keyed by `(secret, cid)`. Multiple concurrent SOCKS5 sessions are
-multiplexed via 16-hex `cid` per tunnel.
+Agent↔server DNS is AES-256-GCM under `(secret, cid)`. Sessions
+multiplex via 16-hex `cid` per tunnel.
 
 ### Enable on the server
 
-Add `-allow-proxy` to your server invocation. Off by default:
-
 ```sh
-sudo ./servers/gdns2tcp-server-linux-amd64 -domain files.example.com -secret "change-me" -allow-proxy
+sudo ./gdns2tcp -domain files.example.com -p "change-me" -allow-proxy
 ```
 
-This enables the agent endpoints. The TCP SOCKS5 listener binds on
-**`127.0.0.1:9050`** only after the first authenticated agent `apoll`.
-Use `-socks-listen 0.0.0.0:9050` only when you intentionally want to expose
-it to remote operators; pair public binds with `-socks-no-auth=false` if you
-want RFC 1929 username/password authentication (`gdns2tcp` / the `-secret`
-value).
+The SOCKS5 listener binds `127.0.0.1:9050` after the first authenticated
+agent poll. To expose it publicly use `-socks-listen 0.0.0.0:9050`
+paired with `-socks-no-auth=false` (RFC 1929 user=`gdns2tcp` /
+password=`-p` value).
 
-| Flag | Default | Description |
-|---|---|---|
-| `-allow-proxy` | `false` | enable reverse SOCKS5 + agent endpoints |
-| `-socks-listen` | `127.0.0.1:9050` | TCP address for the operator-facing SOCKS5 listener |
-| `-socks-no-auth` | `true` | disable SOCKS5 username/password auth; pass `-socks-no-auth=false` to require auth |
-| `-proxy-max-conn` | `64` | global cap on concurrent tunnel connections |
-| `-proxy-buf-bytes` | `1048576` | per-tunnel buffer cap in each direction |
+### Fetch the agent binary
 
-### Fetch the agent binary over DNS
-
-The agent is distributed under `client-proxy-<os>-<arch>` aliases (Linux
-amd64/arm64, macOS amd64/arm64, Windows amd64/arm64 `.exe`).
-
-**Linux / macOS** — auto-detects OS+arch:
+Same bootstrap pattern as the file client — swap the alias from
+`$os-$arch` to `client-proxy-$os-$arch`. `S=<dns-server>` is optional
+(see the file-client fetch above).
 
 ```sh
-D=files.example.com S=<server-ip> B=14 P=16 sh <<'EOF'
+D=files.example.com S= B=14 P=16 sh <<'EOF'
 os=$(uname -s | tr A-Z a-z); a=$(uname -m)
 case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
 A="client-proxy-$os-$a"
 NL=$(printf '\n')
 qm(){ for i in 1 2 3 4 5; do
-        o=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d "\"$NL ")
+        o=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT | tr -d "\"$NL ")
         [ -n "$o" ] && { printf %s "$o"; return; }
         sleep 0.4
     done
     echo "no TXT for $1" >&2; return 1
 }
 qb(){ for i in 1 2 3 4 5; do
-        raw=$(dig +short +time=5 +tries=1 +tcp @$S "$1" TXT | tr -d \" | tr "$NL" ' ')
+        raw=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT | tr -d \" | tr "$NL" ' ')
         s=$(printf %s "$raw" | awk '{print $1}')
         d=$(printf %s "$raw" | awk '{for(i=2;i<=NF;i++) printf "%s",$i}')
         if [ -n "$s" ] && [ -n "$d" ] && [ "${s%${s#s:}}" = "s:" ]; then
@@ -292,57 +275,81 @@ chmod +x "$NAME"; echo "saved ./$NAME"
 EOF
 ```
 
-**Windows PowerShell** — pulls `client-proxy-windows-amd64.exe` (or `arm64`):
-
 ```powershell
-$D="files.example.com"; $S="<server-ip>"; $B=14
+# Windows — uses Resolve-DnsName when available, falls back to nslookup -vc.
+# $S="" = system resolver; set to an IP to target a specific server.
+$D="files.example.com"; $S=""; $B=14
 $ARCH = if ([System.Environment]::Is64BitOperatingSystem) { "amd64" } else { "arm64" }
 $A = "client-proxy-windows-$ARCH"
-function qm($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
-  $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
-  if($m.Count){ return (($m | %{ $_.Groups[1].Value }) -join "") }
-  Start-Sleep -Milliseconds 400 }; throw "no TXT for $n" }
-function qb($n){ for($i=1;$i -le 5;$i++){ $r=nslookup -vc -type=TXT $n $S 2>$null
-  $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
-  if($m.Count -ge 2 -and $m[0].Groups[1].Value.StartsWith("s:")){
-    $expected = $m[0].Groups[1].Value.Substring(2).ToLower()
-    $data = ($m | Select-Object -Skip 1 | %{ $_.Groups[1].Value }) -join ""
-    $bytes = [System.Text.Encoding]::ASCII.GetBytes($data)
-    $actual = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | %{ "{0:x2}" -f $_ })
-    if($expected -eq $actual){ return $data }
+$ProgressPreference='SilentlyContinue'
+$rdn = $null -ne (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)
+function qraw($n){
+  if($rdn){
+    $p = @{Name=$n; Type='TXT'; TcpOnly=$true; DnsOnly=$true; NoHostsFile=$true; QuickTimeout=$true; ErrorAction='Stop'}
+    if ($S) { $p['Server'] = $S }
+    $r = Resolve-DnsName @p
+    return @(foreach($rec in $r){ if($rec.Strings){ $rec.Strings } })
   }
-  Start-Sleep -Milliseconds 400 }; throw "batch verify failed for $n" }
-$man=qm "client-$A.$D"; $p=$man.Split('|')
-$name=$p[0]; $n=[int]$p[1]; $sha=$p[2].ToLower()
+  $r = if ($S) { nslookup -vc -type=TXT $n $S 2>$null } else { nslookup -vc -type=TXT $n 2>$null }
+  return @([regex]::Matches(($r -join "`n"),'"([^"]*)"') | %{ $_.Groups[1].Value })
+}
+function qm($n){ for($k=1;$k -le 5;$k++){
+  try { $m = qraw $n; if($m.Count){ return ($m -join "") } } catch {}
+  Start-Sleep -Milliseconds 400 }
+  throw "no TXT for $n (is TCP:53 through the configured resolver reachable?)" }
+function qb($n){ for($k=1;$k -le 5;$k++){
+  try {
+    $m = qraw $n
+    if($m.Count -ge 2 -and $m[0].StartsWith("s:")){
+      $expected = $m[0].Substring(2).ToLower()
+      $data = ($m | Select-Object -Skip 1) -join ""
+      $bytes = [System.Text.Encoding]::ASCII.GetBytes($data)
+      $actual = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | %{ "{0:x2}" -f $_ })
+      if($expected -eq $actual){ return $data }
+    }
+  } catch {}
+  Start-Sleep -Milliseconds 400 }
+  throw "batch verify failed for $n (is TCP:53 through the configured resolver reachable?)" }
+$manifestName="client-$A.$D"
+$man=qm $manifestName; $p=@($man.Split('|')); [int]$n=0
+if($p.Count -ne 3 -or [string]::IsNullOrWhiteSpace($p[0]) -or
+   -not [int]::TryParse($p[1],[ref]$n) -or $n -lt 1 -or
+   $p[2] -notmatch '^[0-9a-fA-F]{64}$'){
+  throw "Unexpected TXT response for ${manifestName}: $man. Check D and NS delegation."
+}
+$name=[IO.Path]::GetFileName($p[0])
+if($name -ne $p[0]){ throw "Unsafe artifact filename in manifest: $($p[0])" }
+$sha=$p[2].ToLowerInvariant()
 $total = [int][Math]::Ceiling($n / $B)
-$b64=''; $i=0; $j=0
+$b64 = [System.Text.StringBuilder]::new($n * 260)
+$i=0; $j=0; $tick=[DateTime]::UtcNow
+Write-Host "Fetching $name ($total batches over TCP:53 via $(if($rdn){'Resolve-DnsName'}else{'nslookup'}))..."
 while ($i -lt $n) {
     $c = [Math]::Min($B, $n - $i)
-    $b64 += qb "$i.$c.clb-$A.$D"
+    [void]$b64.Append((qb "$i.$c.clb-$A.$D"))
     $i += $c; $j++
-    Write-Progress -Activity "Fetching agent" -Status "$j of $total batches" -PercentComplete ([Math]::Min(100, [Math]::Round($j * 100 / $total, 1)))
+    if(([DateTime]::UtcNow - $tick).TotalMilliseconds -ge 500){
+        Write-Host -NoNewline ("`r  {0}/{1} batches" -f $j, $total)
+        $tick = [DateTime]::UtcNow
+    }
 }
-Write-Progress -Activity "Fetching agent" -Completed
+Write-Host ("`r  {0}/{0} batches done" -f $total)
 $out=Join-Path (Get-Location) $name
-[IO.File]::WriteAllBytes($out, [Convert]::FromBase64String($b64))
+[IO.File]::WriteAllBytes($out, [Convert]::FromBase64String($b64.ToString()))
 if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){
     Remove-Item $out -Force; throw "sha256 mismatch" }
 "Saved $out"
 ```
 
-### Run the agent (on the internal-network machine)
+### Run the agent
 
 ```sh
-# Linux / macOS
-./gdns2tcp-client-proxy-linux-amd64 -domain files.example.com -pass "change-me"
+./gdns2tcp-client-proxy-linux-amd64 -d files.example.com -p "change-me"
 ```
 
 ```powershell
-# Windows
-.\gdns2tcp-client-proxy-windows-amd64.exe -domain files.example.com -pass "change-me"
+.\gdns2tcp-client-proxy-windows-amd64.exe -d files.example.com -p "change-me"
 ```
 
-The agent has no flags for the SOCKS5 port — it doesn't listen at all. It
-just polls the server and dials whatever target the operator's SOCKS5
-session asks for.
-
+The agent doesn't listen — it polls the server and dials whatever
+target the operator's SOCKS5 CONNECT requests.

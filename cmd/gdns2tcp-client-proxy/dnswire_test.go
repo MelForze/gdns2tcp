@@ -54,6 +54,63 @@ func TestBuildTXTQueryLabelLimit(t *testing.T) {
 	}
 }
 
+// TestExchangeUDPOneShot covers the fallback single-shot UDP path used
+// when the persistent udpPool isn't available (e.g. system resolver).
+func TestExchangeUDPOneShot(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 4096)
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		resp := make([]byte, 12)
+		copy(resp[:2], buf[:n])
+		resp[2] = 0x80
+		binary.BigEndian.PutUint16(resp[6:8], 0)
+		_, _ = pc.WriteTo(resp, addr)
+	}()
+	q, _ := buildTXTQuery("x.example.com", 9)
+	resp, err := exchangeUDP(pc.LocalAddr().String(), q, time.Second)
+	if err != nil {
+		t.Fatalf("exchangeUDP: %v", err)
+	}
+	if len(resp) < 12 {
+		t.Fatal("resp too short")
+	}
+}
+
+func TestExchangeUDPDialFail(t *testing.T) {
+	// Empty addr triggers Dial error.
+	if _, err := exchangeUDP("", []byte{0, 0}, 100*time.Millisecond); err == nil {
+		t.Fatal("expected dial error")
+	}
+}
+
+// TestExchangeTCPOneShot covers the fallback single-shot TCP path.
+func TestExchangeTCPOneShot(t *testing.T) {
+	addr, stop := fakeTCPDNS(t)
+	defer stop()
+	q, _ := buildTXTQuery("x.example.com", 3)
+	resp, err := exchangeTCP(addr, q, time.Second)
+	if err != nil {
+		t.Fatalf("exchangeTCP: %v", err)
+	}
+	if len(resp) < 12 {
+		t.Fatal("resp too short")
+	}
+}
+
+func TestExchangeTCPDialFail(t *testing.T) {
+	if _, err := exchangeTCP("127.0.0.1:1", []byte{0, 0}, 100*time.Millisecond); err == nil {
+		t.Fatal("expected dial error")
+	}
+}
+
 func TestUDPPoolExchange(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

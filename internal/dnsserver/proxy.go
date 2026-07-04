@@ -3,7 +3,6 @@ package dnsserver
 import (
 	"bytes"
 	"crypto/cipher"
-	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"gdns2tcp/internal/codec"
+	"gdns2tcp/internal/dnshelpers"
 	"gdns2tcp/internal/protocol"
 	gproxy "gdns2tcp/internal/proxy"
 )
@@ -756,7 +756,7 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 			continue
 		}
 
-		targetB32 := strings.ToLower(reverseB32().EncodeToString([]byte(rc.target)))
+		targetB32 := dnshelpers.B32LowerNoPad.EncodeToString([]byte(rc.target))
 		return []string{"OPEN " + cid + " " + targetB32}
 	}
 }
@@ -830,6 +830,9 @@ func (s *Server) proxyAgentRead(args []string, now time.Time) []string {
 		take = maxRead - 1
 	}
 	rawBuf := gproxy.GetBuf(take)
+	// defer rather than eager release so a panic in compressor.Encode or
+	// SealChunkTo doesn't leak the pooled buffer.
+	defer gproxy.PutBuf(rawBuf)
 	_, _ = rc.opToAgent.Read(*rawBuf)
 	rc.seqOpToA++
 	seq := rc.seqOpToA
@@ -838,8 +841,12 @@ func (s *Server) proxyAgentRead(args []string, now time.Time) []string {
 	rc.mu.Unlock()
 
 	plaintext := rc.compressor.Encode(*rawBuf)
-	gproxy.PutBuf(rawBuf)
-	ct := gproxy.SealChunk(rc.aead, gproxy.DirServerToClient, seq, plaintext)
+	// Seal into a pooled dst buffer — base64.EncodeToString below allocates
+	// its own string, so `b64` doesn't reference the pool buffer once
+	// EncodeToString returns; the defer releases the scratch on all paths.
+	ctBufPtr := gproxy.GetBuf(len(plaintext) + 16)
+	defer gproxy.PutBuf(ctBufPtr)
+	ct := gproxy.SealChunkTo((*ctBufPtr)[:0], rc.aead, gproxy.DirServerToClient, seq, plaintext)
 	b64 := base64.StdEncoding.EncodeToString(ct)
 	out := []string{"DATA " + strconv.FormatUint(seq, 16)}
 	out = append(out, codec.ChunkString(b64, codec.TXTChunkSize)...)
@@ -903,12 +910,19 @@ func (s *Server) proxyAgentWrite(args []string, now time.Time) []string {
 	}
 	rc.mu.Unlock()
 
-	encoded := strings.ToUpper(strings.Join(dataLabels, ""))
-	ciphertext, err := reverseB32().DecodeString(encoded)
+	// Agents send lowercase base32; some resolvers upper-case DNS labels
+	// in transit. B32DecodeAny picks the right decoder without an extra
+	// strings.ToUpper allocation on the hot chunk-write path.
+	encoded := strings.Join(dataLabels, "")
+	ciphertext, err := dnshelpers.B32DecodeAny(encoded)
 	if err != nil {
 		return []string{"ERR " + err.Error()}
 	}
-	plaintext, err := gproxy.OpenChunk(rc.aead, gproxy.DirClientToServer, seq, ciphertext)
+	// Open into a pooled dst; compressor.Decode below returns a fresh
+	// slice so we can release the plaintext scratch after Decode reads it.
+	ptBufPtr := gproxy.GetBuf(len(ciphertext))
+	plaintext, err := gproxy.OpenChunkTo((*ptBufPtr)[:0], rc.aead, gproxy.DirClientToServer, seq, ciphertext)
+	defer gproxy.PutBuf(ptBufPtr)
 	if err != nil {
 		return []string{"ERR open"}
 	}
@@ -1106,12 +1120,19 @@ func (s *Server) applyAxchgWrite(rc *reverseConn, seq uint64, dataLabels []strin
 	}
 	rc.mu.Unlock()
 
-	encoded := strings.ToUpper(strings.Join(dataLabels, ""))
-	ciphertext, err := reverseB32().DecodeString(encoded)
+	// Agents send lowercase base32; some resolvers upper-case DNS labels
+	// in transit. B32DecodeAny picks the right decoder without an extra
+	// strings.ToUpper allocation on the hot chunk-write path.
+	encoded := strings.Join(dataLabels, "")
+	ciphertext, err := dnshelpers.B32DecodeAny(encoded)
 	if err != nil {
 		return "ERR " + err.Error()
 	}
-	plaintext, err := gproxy.OpenChunk(rc.aead, gproxy.DirClientToServer, seq, ciphertext)
+	// Open into a pooled dst; compressor.Decode below returns a fresh
+	// slice so we can release the plaintext scratch after Decode reads it.
+	ptBufPtr := gproxy.GetBuf(len(ciphertext))
+	plaintext, err := gproxy.OpenChunkTo((*ptBufPtr)[:0], rc.aead, gproxy.DirClientToServer, seq, ciphertext)
+	defer gproxy.PutBuf(ptBufPtr)
 	if err != nil {
 		return "ERR open"
 	}
@@ -1187,6 +1208,8 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 		take = maxRead - 1
 	}
 	rawBuf := gproxy.GetBuf(take)
+	// See collectAgentRead for the panic-safe defer pattern rationale.
+	defer gproxy.PutBuf(rawBuf)
 	_, _ = rc.opToAgent.Read(*rawBuf)
 	rc.seqOpToA++
 	seq := rc.seqOpToA
@@ -1195,8 +1218,10 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	rc.mu.Unlock()
 
 	plaintext := rc.compressor.Encode(*rawBuf)
-	gproxy.PutBuf(rawBuf) // raw was copied into compressor's output; release now
-	ct := gproxy.SealChunk(rc.aead, gproxy.DirServerToClient, seq, plaintext)
+	// Same pool-friendly seal pattern as collectAgentRead.
+	ctBufPtr2 := gproxy.GetBuf(len(plaintext) + 16)
+	defer gproxy.PutBuf(ctBufPtr2)
+	ct := gproxy.SealChunkTo((*ctBufPtr2)[:0], rc.aead, gproxy.DirServerToClient, seq, plaintext)
 	b64 := base64.StdEncoding.EncodeToString(ct)
 	out := []string{"DATA " + strconv.FormatUint(seq, 16)}
 	out = append(out, codec.ChunkString(b64, codec.TXTChunkSize)...)
@@ -1423,9 +1448,6 @@ func socks5WriteReply(conn net.Conn, status byte) error {
 	return err
 }
 
-func reverseB32() *base32.Encoding {
-	return base32.StdEncoding.WithPadding(base32.NoPadding)
-}
 
 // tuneTCPConn applies the TCP_NODELAY + SO_KEEPALIVE pair to a connection
 // when it's a *net.TCPConn (the common case here — SOCKS5 operators dial

@@ -22,7 +22,7 @@ import (
 )
 
 const defaultDNSPort = "53"
-const defaultMaxDownloadBytes int64 = 32 << 20
+const defaultMaxDownloadBytes int64 = 100 << 20
 
 const (
 	// defaultChunkSize is the default and maximum encoded upload chunk size
@@ -43,7 +43,19 @@ const (
 )
 
 type config struct {
-	domain           string
+	// domain is the canonical domain used for HMAC. For single-domain
+	// configs it also equals the QNAME suffix. For CSV configs it is
+	// the first entry.
+	domain string
+	// shardDomains / shardAuthDomains / shardLongest / shardRotor
+	// mirror the agent's fanout state. QNAMEs rotate through the
+	// shards round-robin per DNS query (parallel download workers
+	// share the atomic counter).
+	shardDomains     []string
+	shardAuthDomains []string
+	shardLongest     string
+	shardRotor       *atomic.Uint64
+
 	mode             string
 	pass             string
 	inFile           string
@@ -58,7 +70,12 @@ type config struct {
 	parallelism      int
 	batch            int
 	noResume         bool
-	cacheDir         string // override for tests; production callers leave empty to use defaultResumeRoot()
+	cacheDir         string
+
+	listMode     bool
+	uploadFile   string
+	downloadFile string
+	testMode     bool
 }
 
 type txtResolver struct {
@@ -163,17 +180,20 @@ func main() {
 // validateConfig checks that the flags required for the requested mode are
 // present. It is called once by run() before any network activity, so the
 // user receives a clear error message without waiting for DNS.
-func validateConfig(mode string, cfg config) error {
+func validateConfig(cfg config) error {
 	if cfg.domain == "" {
 		return errors.New("domain is required")
 	}
-	switch strings.ToLower(mode) {
+	if cfg.mode == "" {
+		return errors.New("specify --list, --upload <file>, --download <file>, or --test")
+	}
+	switch cfg.mode {
 	case "list", "upload", "download":
 		if cfg.pass == "" {
-			return errors.New("pass is required")
+			return errors.New("password is required")
 		}
 	}
-	switch strings.ToLower(mode) {
+	switch cfg.mode {
 	case "upload":
 		if strings.TrimSpace(cfg.inFile) == "" {
 			return errors.New("input file is required")
@@ -188,16 +208,11 @@ func validateConfig(mode string, cfg config) error {
 
 func run() error {
 	cfg := parseFlags()
-	if err := validateConfig(cfg.mode, cfg); err != nil {
+	if err := validateConfig(cfg); err != nil {
 		return err
 	}
-	if cfg.dnsServer == "" {
-		server, err := resolveDomainServer(cfg.domain)
-		if err != nil {
-			return err
-		}
-		cfg.dnsServer = server
-		fmt.Printf("using DNS server %s:%s resolved from %s\n", cfg.dnsServer, cfg.dnsPort, cfg.domain)
+	if cfg.dnsServer != "" {
+		fmt.Printf("using DNS server %s:%s\n", cfg.dnsServer, cfg.dnsPort)
 	}
 	resolver := &txtResolver{
 		server:  cfg.dnsServer,
@@ -228,14 +243,19 @@ func run() error {
 
 func parseFlags() config {
 	cfg := config{}
-	flag.StringVar(&cfg.domain, "domain", "", "authoritative gdns2tcp domain")
-	flag.StringVar(&cfg.mode, "mode", "", "operation: test, list, upload, download")
-	flag.StringVar(&cfg.pass, "pass", "", "shared encryption secret")
-	flag.StringVar(&cfg.inFile, "in", "", "local file to upload")
+	flag.StringVar(&cfg.domain, "domain", "", "authoritative gdns2tcp domain. Accepts a single name or CSV list (a.com,b.com,c.com) — the first is used as the canonical HMAC domain, all are rotated round-robin as QNAME suffixes to spread load across resolver per-zone rate-limits.")
+	flag.StringVar(&cfg.domain, "d", "", "short alias for -domain")
+	flag.StringVar(&cfg.pass, "password", "", "shared encryption secret")
+	flag.StringVar(&cfg.pass, "p", "", "short alias for -password")
+	flag.BoolVar(&cfg.listMode, "list", false, "list files on the server")
+	flag.StringVar(&cfg.uploadFile, "upload", "", "local file to upload")
+	flag.StringVar(&cfg.downloadFile, "download", "", "remote filename to download")
+	flag.BoolVar(&cfg.testMode, "test", false, "test connection to the server")
 	flag.StringVar(&cfg.outFile, "out", "", "local output file for downloads")
-	flag.StringVar(&cfg.filename, "filename", "", "remote filename to download")
-	flag.StringVar(&cfg.dnsServer, "dns-server", "", "DNS server address; empty resolves -domain and uses the first IP")
+	flag.StringVar(&cfg.dnsServer, "dns-server", "", "DNS server address; empty uses the system resolver")
+	flag.StringVar(&cfg.dnsServer, "ds", "", "short alias for -dns-server")
 	flag.StringVar(&cfg.dnsPort, "dns-port", defaultDNSPort, "DNS server port; defaults to 53")
+	flag.StringVar(&cfg.dnsPort, "dp", defaultDNSPort, "short alias for -dns-port")
 	flag.IntVar(&cfg.chunkSize, "chunk-size", defaultChunkSize, "maximum encoded upload chunk size")
 	flag.IntVar(&cfg.retries, "retries", 3, "DNS query attempts before failing")
 	flag.Int64Var(&cfg.maxDownloadBytes, "max-download-bytes", defaultMaxDownloadBytes, "maximum decompressed download size")
@@ -245,8 +265,22 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.noResume, "no-resume", false, "disable resume from local cache and always fetch all chunks")
 	flag.Parse()
 
-	cfg.domain = strings.TrimSuffix(strings.TrimSpace(cfg.domain), ".")
-	cfg.mode = strings.TrimSpace(cfg.mode)
+	cfg.domain, cfg.shardDomains, cfg.shardAuthDomains, cfg.shardLongest = protocol.ParseDomainCSV(cfg.domain)
+	cfg.shardRotor = new(atomic.Uint64)
+
+	switch {
+	case cfg.listMode:
+		cfg.mode = "list"
+	case cfg.uploadFile != "":
+		cfg.mode = "upload"
+		cfg.inFile = cfg.uploadFile
+	case cfg.downloadFile != "":
+		cfg.mode = "download"
+		cfg.filename = cfg.downloadFile
+	case cfg.testMode:
+		cfg.mode = "test"
+	}
+
 	cfg.dnsPort = strings.TrimSpace(cfg.dnsPort)
 	if cfg.dnsPort == "" {
 		cfg.dnsPort = defaultDNSPort
@@ -267,27 +301,6 @@ func parseFlags() config {
 		cfg.batch = maxDownloadBatch
 	}
 	return cfg
-}
-
-func resolveDomainServer(domain string) (string, error) {
-	if domain == "" {
-		return "", errors.New("domain is required")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
-	if err != nil {
-		return "", fmt.Errorf("resolve DNS server from domain %s: %w", domain, err)
-	}
-	if len(ips) == 0 {
-		return "", fmt.Errorf("domain %s did not resolve to an IP address", domain)
-	}
-	for _, ip := range ips {
-		if ip.To4() != nil {
-			return ip.String(), nil
-		}
-	}
-	return ips[0].String(), nil
 }
 
 func (r *txtResolver) query(name string) (string, error) {
@@ -375,7 +388,7 @@ func testConnection(resolver *txtResolver, domain string) (string, error) {
 }
 
 func listFiles(resolver *txtResolver, cfg config) error {
-	first, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, "c", nil))
+	first, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "c", nil))
 	if err != nil {
 		return err
 	}
@@ -390,7 +403,7 @@ func listFiles(resolver *txtResolver, cfg config) error {
 		return err
 	}
 	for page := 0; page < pages; page++ {
-		value, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, "c", []string{strconv.Itoa(page)}))
+		value, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "c", []string{strconv.Itoa(page)}))
 		if err != nil {
 			return err
 		}
@@ -437,13 +450,13 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 	if err != nil {
 		return err
 	}
-	effectiveChunkSize, err := effectiveUploadChunkSize(cfg.domain, sid, cfg.chunkSize)
+	effectiveChunkSize, err := effectiveUploadChunkSize(cfg.longestBudgetDomain(), sid, cfg.chunkSize)
 	if err != nil {
 		return err
 	}
 	chunks := codec.ChunkString(encoded, effectiveChunkSize)
 	initArgs := append([]string{sid, strconv.Itoa(len(chunks)), strconv.Itoa(effectiveChunkSize), encoding}, filenameLabels...)
-	initName := authenticatedName(cfg.pass, cfg.domain, "uinit", initArgs)
+	initName := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "uinit", initArgs)
 	if len(initName) > 253 {
 		return fmt.Errorf("DNS upload init name is %d characters (limit 253); use a shorter filename or domain", len(initName))
 	}
@@ -464,7 +477,7 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 		wireChunk := dnsSafeChunk(chunks[index], encoding)
 		labels := codec.ChunkString(wireChunk, 63)
 		requestArgs := append([]string{sid, strconv.Itoa(index)}, labels...)
-		requestName := authenticatedName(cfg.pass, cfg.domain, "u", requestArgs)
+		requestName := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "u", requestArgs)
 		if len(requestName) > 253 {
 			return fmt.Errorf("DNS query name for chunk %d is %d characters (limit 253); reduce -chunk-size or use a shorter domain", index, len(requestName))
 		}
@@ -511,7 +524,7 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 		return err
 	}
 	initArgs := append([]string{sid}, filenameLabels...)
-	initName := authenticatedName(cfg.pass, cfg.domain, "dinit", initArgs)
+	initName := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "dinit", initArgs)
 	if len(initName) > 253 {
 		return fmt.Errorf("DNS download init name is %d characters (limit 253); use a shorter filename or domain", len(initName))
 	}
@@ -591,9 +604,9 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 			defer func() { <-sem; wg.Done() }()
 			var name string
 			if batchSize == 1 {
-				name = authenticatedName(cfg.pass, cfg.domain, "d", []string{sid, strconv.Itoa(from)})
+				name = authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "d", []string{sid, strconv.Itoa(from)})
 			} else {
-				name = authenticatedName(cfg.pass, cfg.domain, "db", []string{sid, strconv.Itoa(from), strconv.Itoa(count)})
+				name = authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "db", []string{sid, strconv.Itoa(from), strconv.Itoa(count)})
 			}
 			batchResults[k], batchErrors[k] = resolver.query(name)
 			if batchErrors[k] == nil {
@@ -634,7 +647,7 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 }
 
 func fetchDownloadSourceSHA256(resolver *txtResolver, cfg config, sid string, chunkCount int) (string, bool) {
-	resp, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, "dmeta", []string{sid}))
+	resp, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "dmeta", []string{sid}))
 	if err != nil {
 		return "", false
 	}
@@ -741,7 +754,7 @@ func effectiveUploadChunkSize(domain, sid string, requested int) (int, error) {
 	for size := requested; size >= minChunkSize; size-- {
 		dummy := strings.Repeat("a", size)
 		args := append([]string{sid, "999999"}, codec.ChunkString(dummy, 63)...)
-		name := authenticatedNameWithTimestamp("secret", domain, "u", args, protocol.CurrentTimestamp(time.Now()))
+		name := authenticatedNameWithTimestamp("secret", domain, protocol.AuthDomain(domain), "u", args, protocol.CurrentTimestamp(time.Now()))
 		if len(name) <= 253 {
 			return size, nil
 		}
@@ -757,14 +770,44 @@ func dnsSafeChunk(chunk, encoding string) string {
 	return safe
 }
 
-func authenticatedName(secret, domain, command string, args []string) string {
-	return authenticatedNameWithTimestamp(secret, domain, command, args, protocol.CurrentTimestamp(time.Now()))
+// authenticatedName builds a signed QNAME. canonicalDomain drives the
+// HMAC (server verifies against its own canonical -domain), while
+// shardAuthDomain (AuthDomain-normalized) picks the suffix that ends
+// the QNAME. For single-domain configs the two are equivalent.
+func authenticatedName(secret, canonicalDomain, shardAuthDomain, command string, args []string) string {
+	return authenticatedNameWithTimestamp(secret, canonicalDomain, shardAuthDomain, command, args, protocol.CurrentTimestamp(time.Now()))
 }
 
-func authenticatedNameWithTimestamp(secret, domain, command string, args []string, timestamp string) string {
-	token := protocol.AuthToken(secret, domain, command, timestamp, args)
+func authenticatedNameWithTimestamp(secret, canonicalDomain, shardAuthDomain, command string, args []string, timestamp string) string {
+	token := protocol.AuthToken(secret, canonicalDomain, command, timestamp, args)
 	labels := make([]string, 0, len(args)+3)
 	labels = append(labels, args...)
 	labels = append(labels, timestamp, token)
-	return protocol.JoinName(domain, command, labels)
+	// command must already be lowercase — JoinNameFast's contract.
+	return protocol.JoinNameFast(shardAuthDomain, command, labels)
+}
+
+// longestBudgetDomain returns the longest configured shard domain, or
+// canonical as a fallback for configs constructed without parseFlags
+// (test fixtures). Used by the QNAME-length budget calc so no shard
+// can silently overflow the 253-char limit.
+func (c config) longestBudgetDomain() string {
+	if c.shardLongest != "" {
+		return c.shardLongest
+	}
+	return c.domain
+}
+
+// pickShardAuthDomain returns the next shard AuthDomain suffix by
+// round-robining shardRotor. Single-domain / fallback configs skip
+// the atomic and return AuthDomain(cfg.domain).
+func (c config) pickShardAuthDomain() string {
+	if len(c.shardAuthDomains) == 0 {
+		return protocol.AuthDomain(c.domain)
+	}
+	if len(c.shardAuthDomains) == 1 || c.shardRotor == nil {
+		return c.shardAuthDomains[0]
+	}
+	idx := c.shardRotor.Add(1) % uint64(len(c.shardAuthDomains))
+	return c.shardAuthDomains[idx]
 }
