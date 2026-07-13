@@ -213,6 +213,9 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if cfg.maxConn != 32 {
 		t.Fatalf("default max-conn drift: %d", cfg.maxConn)
 	}
+	if cfg.retriesSet {
+		t.Fatal("default retries must not be marked explicit")
+	}
 }
 
 // TestParseFlagsClamps verifies the runtime sanitization.
@@ -232,6 +235,9 @@ func TestParseFlagsClamps(t *testing.T) {
 	}
 	if cfg.retries < 1 {
 		t.Fatalf("retries should clamp to ≥1, got %d", cfg.retries)
+	}
+	if !cfg.retriesSet {
+		t.Fatal("explicit -retries was not recorded")
 	}
 	if cfg.dnsPort != "53" {
 		t.Fatalf("empty dns-port should default to 53, got %q", cfg.dnsPort)
@@ -274,6 +280,43 @@ func TestResolvConfNameserver(t *testing.T) {
 	}
 	if addr == "" {
 		t.Fatal("expected non-empty resolver address")
+	}
+}
+
+func TestAuthoritativeProbeAndTuning(t *testing.T) {
+	dnsIP, dnsPort, _, secret := startEmbeddedServer(t)
+	cfg := config{
+		domain:    "files.test",
+		pass:      secret,
+		dnsServer: dnsIP,
+		dnsPort:   dnsPort,
+		retries:   1,
+	}
+	resolver := newTxtResolver(cfg)
+	t.Cleanup(resolver.close)
+	authoritative, err := resolver.probeAuthoritative("encoding.test.files.test")
+	if err != nil {
+		t.Fatalf("probeAuthoritative: %v", err)
+	}
+	if !authoritative {
+		t.Fatal("direct gdns2tcp response was not detected as authoritative")
+	}
+
+	unknown := tuningForCfg(config{})
+	if unknown.workers != udpTuning.workers {
+		t.Fatalf("unknown test fixture path should preserve direct defaults: %d", unknown.workers)
+	}
+	direct := tuningForCfg(config{dnsPathKnown: true, dnsAuthoritative: true})
+	if direct.workers != udpTuning.workers {
+		t.Fatalf("direct UDP tuning workers=%d, want %d", direct.workers, udpTuning.workers)
+	}
+	recursiveUDP := tuningForCfg(config{dnsPathKnown: true})
+	if recursiveUDP.workers != recursiveUDPTuning.workers {
+		t.Fatalf("recursive UDP tuning workers=%d, want %d", recursiveUDP.workers, recursiveUDPTuning.workers)
+	}
+	recursiveTCP := tuningForCfg(config{dnsPathKnown: true, tcp: true})
+	if recursiveTCP.workers != recursiveTCPTuning.workers {
+		t.Fatalf("recursive TCP tuning workers=%d, want %d", recursiveTCP.workers, recursiveTCPTuning.workers)
 	}
 }
 

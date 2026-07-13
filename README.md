@@ -31,9 +31,11 @@ The parent zone must delegate the subzone to the host running gdns2tcp:
 | `NS` | `files.example.com.` | `ns1.example.com.` |
 | `A`  | `ns1.example.com.` | `11.11.11.11` |
 
-gdns2tcp answers **only TXT queries** for names under `-domain` —
-everything else is NXDOMAIN. Resolvers follow the parent delegation to
-find the IP, then send TXT queries directly on UDP+TCP port 53.
+gdns2tcp answers TXT queries for names under `-domain` and marks those
+responses authoritative (`AA`). Other record types below the delegated zone
+receive authoritative NODATA rather than NXDOMAIN, so recursive resolvers do
+not negatively cache a valid tunnel name. Resolvers follow the parent
+delegation and send tunnel TXT queries on UDP+TCP port 53.
 
 ```sh
 dig +short NS files.example.com
@@ -370,12 +372,18 @@ if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){
 ### Run the agent
 
 ```sh
-./gdns2tcp-client-proxy-linux-amd64 -d files.example.com -p "change-me"
+./gdns2tcp-client-proxy-linux-amd64 -d files.example.com -p "change-me" -ds 11.11.11.11
 ```
 
 ```powershell
-.\gdns2tcp-client-proxy-windows-amd64.exe -d files.example.com -p "change-me"
+.\gdns2tcp-client-proxy-windows-amd64.exe -d files.example.com -p "change-me" -ds 11.11.11.11
 ```
 
 The agent doesn't listen — it polls the server and dials whatever
 target the operator's SOCKS5 CONNECT requests.
+
+The proxy agent probes the selected DNS path at startup. A direct
+authoritative `-ds` uses the full worker fan-out. A system or public recursive
+resolver automatically uses a conservative profile and extra retries to avoid
+rate-limit-driven tunnel resets. Direct `-ds <gdns2tcp-server-ip>` remains the
+recommended mode for long-lived LDAP, SSH and bulk-transfer sessions.

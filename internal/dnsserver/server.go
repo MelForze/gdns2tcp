@@ -325,16 +325,27 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	q := r.Question[0]
-	if q.Qtype != dns.TypeTXT {
+	matchedDomain, ok := hasAnyDomainSuffix(q.Name, s.domains)
+	if !ok {
 		resp.Rcode = dns.RcodeNameError
 		if err := w.WriteMsg(resp); err != nil {
 			s.logger.Printf("write DNS response: %v", err)
 		}
 		return
 	}
-	matchedDomain, ok := hasAnyDomainSuffix(q.Name, s.domains)
-	if !ok {
-		resp.Rcode = dns.RcodeNameError
+
+	// This process is the authoritative endpoint for every configured shard.
+	// Recursive resolvers use AA to distinguish a real delegated answer from
+	// a lame/non-authoritative response. Omitting it made high-volume proxy
+	// traffic work reliably only when clients bypassed recursion with -ds.
+	resp.Authoritative = true
+
+	if q.Qtype != dns.TypeTXT {
+		// Names below the dynamic tunnel zone exist for TXT. A query for a
+		// different type is therefore NODATA (NOERROR with an empty answer),
+		// not NXDOMAIN. Returning NXDOMAIN here lets recursive resolvers
+		// negatively cache the name and suppress later TXT traffic.
+		resp.Rcode = dns.RcodeSuccess
 		if err := w.WriteMsg(resp); err != nil {
 			s.logger.Printf("write DNS response: %v", err)
 		}

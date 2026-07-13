@@ -514,6 +514,29 @@ func TestTCPPoolExchange(t *testing.T) {
 	}
 }
 
+func TestProbeAuthoritativeRejectsRecursiveStyleResponse(t *testing.T) {
+	addr, stop := fakeTCPDNS(t)
+	defer stop()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newTxtResolver(config{
+		dnsServer: host,
+		dnsPort:   port,
+		tcp:       true,
+		retries:   1,
+	})
+	defer r.close()
+	authoritative, err := r.probeAuthoritative("encoding.test.example.com")
+	if err != nil {
+		t.Fatalf("probeAuthoritative: %v", err)
+	}
+	if authoritative {
+		t.Fatal("response without AA was misclassified as direct authoritative DNS")
+	}
+}
+
 // TestTCPPoolMultiplexedIDs runs concurrent exchanges and verifies each gets
 // back the ID assigned by the pool, proving the pending-by-ID dispatch in
 // readLoop.

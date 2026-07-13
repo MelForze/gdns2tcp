@@ -548,15 +548,20 @@ func TestServeDNS(t *testing.T) {
 		}
 	})
 
-	// Non-TXT question → RcodeNameError
+	// A name in the dynamic zone exists for TXT, so other types are
+	// authoritative NODATA rather than NXDOMAIN. This prevents a recursive
+	// resolver from negatively caching the name across record types.
 	t.Run("NonTXTQuestion", func(t *testing.T) {
 		req := new(dns.Msg)
 		req.Id = dns.Id()
 		req.Question = []dns.Question{{Name: "example.test.", Qtype: dns.TypeA, Qclass: dns.ClassINET}}
 		w := &mockWriter{remote: remote}
 		s.ServeDNS(w, req)
-		if w.msg == nil || w.msg.Rcode != dns.RcodeNameError {
-			t.Fatalf("expected RcodeNameError, got %v", w.msg)
+		if w.msg == nil || w.msg.Rcode != dns.RcodeSuccess || len(w.msg.Answer) != 0 {
+			t.Fatalf("expected authoritative NODATA, got %v", w.msg)
+		}
+		if !w.msg.Authoritative {
+			t.Fatal("in-zone NODATA response is missing AA")
 		}
 	})
 
@@ -570,6 +575,9 @@ func TestServeDNS(t *testing.T) {
 		if w.msg == nil || w.msg.Rcode != dns.RcodeNameError {
 			t.Fatalf("expected RcodeNameError, got %v", w.msg)
 		}
+		if w.msg.Authoritative {
+			t.Fatal("out-of-zone NXDOMAIN must not claim authority")
+		}
 	})
 
 	// Valid TXT for test command → Answer contains "base64" or "base32"
@@ -581,6 +589,9 @@ func TestServeDNS(t *testing.T) {
 		s.ServeDNS(w, req)
 		if w.msg == nil || len(w.msg.Answer) == 0 {
 			t.Fatal("expected answer")
+		}
+		if !w.msg.Authoritative {
+			t.Fatal("valid in-zone TXT response is missing AA")
 		}
 		txt, ok := w.msg.Answer[0].(*dns.TXT)
 		if !ok || len(txt.Txt) == 0 {

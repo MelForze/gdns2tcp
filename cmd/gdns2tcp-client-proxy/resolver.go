@@ -106,6 +106,34 @@ func (r *txtResolver) queryStrings(name string) ([]string, error) {
 }
 
 func (r *txtResolver) queryOnce(name string) ([]string, error) {
+	resp, id, err := r.exchangeName(name)
+	if err != nil {
+		return nil, err
+	}
+	return parseTXTSegments(resp, id)
+}
+
+// probeAuthoritative sends one ordinary protocol query and inspects AA in the
+// validated response. Recursive resolvers clear AA in replies to their
+// clients; the gdns2tcp authoritative endpoint sets it. The result controls
+// worker fan-out so a system/public resolver is not flooded like a direct
+// server connection.
+func (r *txtResolver) probeAuthoritative(name string) (bool, error) {
+	resp, id, err := r.exchangeName(name)
+	if err != nil {
+		return false, err
+	}
+	if _, err := parseTXTSegments(resp, id); err != nil {
+		return false, err
+	}
+	return resp[2]&0x04 != 0, nil
+}
+
+// exchangeName performs one raw DNS exchange and returns both the response
+// and the transaction ID assigned by the selected pool. Query parsing stays
+// in the caller so startup can inspect header metadata without duplicating
+// the hot-path transport selection.
+func (r *txtResolver) exchangeName(name string) ([]byte, uint16, error) {
 	timeout := r.timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -113,7 +141,7 @@ func (r *txtResolver) queryOnce(name string) ([]string, error) {
 	// r.server was trimmed at construction — a plain length check suffices
 	// and avoids O(n) TrimSpace on every query.
 	if r.server == "" {
-		return nil, errors.New("dns-server is required")
+		return nil, 0, errors.New("dns-server is required")
 	}
 	// ID=0 is fine on pool paths — reserveDNSIDLocked overwrites q[0:2]
 	// with a per-conn counter. Only the fallback exchangeTCP/exchangeUDP
@@ -122,7 +150,7 @@ func (r *txtResolver) queryOnce(name string) ([]string, error) {
 	defer putDNSQueryBuf(qbufPtr)
 	q, err := buildTXTQueryInto(*qbufPtr, name, 0)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	*qbufPtr = q
 	var resp []byte
@@ -139,7 +167,7 @@ func (r *txtResolver) queryOnce(name string) ([]string, error) {
 		resp, err = exchangeUDP(r.hostPort, q, timeout)
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return parseTXTSegments(resp, binary.BigEndian.Uint16(q[:2]))
+	return resp, binary.BigEndian.Uint16(q[:2]), nil
 }

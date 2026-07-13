@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -60,7 +61,14 @@ type config struct {
 	pollMax       time.Duration
 	maxConn       int
 	retries       int
+	retriesSet    bool
 	targetTimeout time.Duration
+
+	// Populated by the startup probe. A direct authoritative server can
+	// sustain the full worker fan-out; a recursive resolver needs a
+	// conservative profile to avoid rate limits and transient SERVFAILs.
+	dnsPathKnown     bool
+	dnsAuthoritative bool
 }
 
 // longestBudgetDomain returns the domain the QNAME-length budget must
@@ -110,9 +118,29 @@ func run() error {
 			return err
 		}
 		cfg.dnsServer = addr
-		fmt.Printf("using DNS server %s:%s for %s\n", cfg.dnsServer, cfg.dnsPort, cfg.domain)
 	}
 	resolver := newTxtResolver(cfg)
+	defer resolver.close()
+
+	probeName := "encoding.test." + cfg.domain
+	authoritative, probeErr := resolver.probeAuthoritative(probeName)
+	cfg.dnsPathKnown = true
+	cfg.dnsAuthoritative = probeErr == nil && authoritative
+	if cfg.dnsAuthoritative {
+		fmt.Printf("using direct authoritative DNS server %s:%s for %s\n", cfg.dnsServer, cfg.dnsPort, cfg.domain)
+	} else {
+		// Three quick SERVFAIL replies from a busy recursive resolver used to
+		// tear down an otherwise healthy TCP tunnel in under a second. Keep a
+		// user-supplied retry count intact, but use a safer automatic default.
+		if !cfg.retriesSet && cfg.retries < 5 {
+			cfg.retries = 5
+			resolver.retries = cfg.retries
+		}
+		fmt.Fprintf(os.Stderr, "warning: DNS server %s:%s is not authoritative for %s; using conservative resolver mode (%d retries). For reliable high-volume tunnels, pass -ds with the gdns2tcp server IP.\n", cfg.dnsServer, cfg.dnsPort, cfg.domain, cfg.retries)
+		if probeErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: authoritative DNS probe failed: %v\n", probeErr)
+		}
+	}
 	fmt.Printf("polling %s for tunnel requests (max %d concurrent)\n", cfg.domain, cfg.maxConn)
 
 	var live atomic.Int64
@@ -164,6 +192,11 @@ func parseFlags() config {
 	flag.IntVar(&cfg.retries, "retries", 3, "DNS query attempts before failing")
 	flag.DurationVar(&cfg.targetTimeout, "target-dial-timeout", 1*time.Second, "TCP dial timeout when the agent connects to the host the operator's SOCKS5 CONNECT asks for. Lower values speed up port-scan workloads through the tunnel (filtered ports release their cid sooner); raise if you legitimately tunnel to slow upstreams")
 	flag.Parse()
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "retries" {
+			cfg.retriesSet = true
+		}
+	})
 
 	cfg.domain, cfg.shardDomains, cfg.shardAuthDomains, cfg.shardLongest = protocol.ParseDomainCSV(cfg.domain)
 	cfg.shardRotor = new(atomic.Uint64)
@@ -216,7 +249,7 @@ func installUsage() {
 				{
 					Title: "DNS transport",
 					Flags: []clihelp.Flag{
-						{Names: "-dns-server, -ds <ip>", Description: "DNS server address; empty auto-discovers a resolver"},
+						{Names: "-dns-server, -ds <ip>", Description: "DNS server address; use the authoritative gdns2tcp IP for full throughput"},
 						{Names: "-dns-port, -dp <port>", Description: "DNS server port (default " + defaultDNSPort + ")"},
 						{Names: "-tcp", Description: "use TCP instead of UDP for DNS queries"},
 						{Names: "-retries <n>", Description: "DNS query attempts before failing (default 3)"},
@@ -245,6 +278,7 @@ func installUsage() {
 			},
 			[]string{
 				"Run this on the target side; the operator connects to the server's SOCKS listener.",
+				"Without -ds, recursive DNS is auto-detected and uses a conservative worker profile; direct authoritative DNS is recommended for long-lived tunnels.",
 				"Go's flag parser accepts both -flag and --flag forms.",
 			},
 		)
@@ -404,15 +438,13 @@ func dialFailureStatus(err error) string {
 	return "refused"
 }
 
-// axchgRetries is how many times a worker retries a single axchg round-trip
-// before tearing down the tunnel. 1–5% UDP loss is normal on residential
-// and cellular WAN; without retries, a bulk download trips
-// `connection closed` mid-stream the first time a packet drops. Each retry
-// resends the exact same nonce and QNAME, so the server's response cache can
-// return the retained outbound chunk byte-for-byte. Safe for write-bearing
-// exchanges because the server also fast-paths duplicate seqs
-// (seq ≤ seqAgentIn → ACK without re-applying).
-const axchgRetries = 3
+// cfg.retries controls how many times a worker retries one axchg round-trip
+// before tearing down the tunnel. 1–5% UDP loss is normal on residential and
+// cellular WAN; without retries, a bulk download trips `connection closed`
+// mid-stream on the first dropped packet. Each retry resends the exact same
+// nonce and QNAME, so the server's response cache can return the retained
+// outbound chunk byte-for-byte. Write-bearing retries are also safe because
+// the server fast-paths duplicate sequences without applying them twice.
 
 // errServerSeq is the typed sentinel for the server's "ERR seq" response
 // (agent's awrite seq is too far ahead of the server's drain). Workers
@@ -457,9 +489,28 @@ var (
 		reorderCap:      32 * 4,
 		backpressureCap: 5 * time.Minute,
 	}
+	// Recursive resolvers frequently rate-limit the 32/96-worker direct
+	// profile. Keep enough parallelism for interactive and LDAP traffic while
+	// staying below typical per-client burst limits.
+	recursiveUDPTuning = tunnelTuning{
+		workers:         12,
+		reorderCap:      12 * 4,
+		backpressureCap: 5 * time.Minute,
+	}
+	recursiveTCPTuning = tunnelTuning{
+		workers:         8,
+		reorderCap:      8 * 4,
+		backpressureCap: 5 * time.Minute,
+	}
 )
 
 func tuningForCfg(cfg config) tunnelTuning {
+	if cfg.dnsPathKnown && !cfg.dnsAuthoritative {
+		if cfg.tcp {
+			return recursiveTCPTuning
+		}
+		return recursiveUDPTuning
+	}
 	if cfg.tcp {
 		return tcpTuning
 	}
@@ -631,7 +682,7 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 					gproxy.PutBuf(job.bufPtr)
 				}
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "axchg cid=%s (%d attempts): %v\n", cid, axchgRetries, err)
+					fmt.Fprintf(os.Stderr, "axchg cid=%s (%d attempts): %v\n", cid, cfg.retries, err)
 					stopAll()
 					return
 				}
@@ -734,6 +785,11 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 				case <-internalStop:
 					return
 				default:
+				}
+				if errors.Is(err, io.EOF) {
+					fmt.Fprintf(os.Stderr, "upstream EOF cid=%s\n", cid)
+				} else {
+					fmt.Fprintf(os.Stderr, "upstream read cid=%s: %v\n", cid, err)
 				}
 				// Upstream EOF (or error). Close writeJobs so workers
 				// finish in-flight chunks instead of being killed mid-
