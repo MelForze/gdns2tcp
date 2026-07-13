@@ -1,9 +1,38 @@
 package codec
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestStreamingFileCodecs(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	encoded := filepath.Join(dir, "encoded.txt")
+	decoded := filepath.Join(dir, "decoded.bin")
+	want := bytes.Repeat([]byte{0, 1, 2, 3, 4, 250, 251, 252}, 8192)
+	if err := os.WriteFile(src, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, encoding := range []string{"base64", "base32"} {
+		if _, err := EncodeDNSFile(src, encoded, encoding); err != nil {
+			t.Fatalf("EncodeDNSFile(%s): %v", encoding, err)
+		}
+		if _, err := DecodeDNSFile(encoded, decoded, encoding); err != nil {
+			t.Fatalf("DecodeDNSFile(%s): %v", encoding, err)
+		}
+		got, err := os.ReadFile(decoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("streaming %s mismatch", encoding)
+		}
+	}
+}
 
 func TestChunkString(t *testing.T) {
 	got := ChunkString("abcdef", 2)

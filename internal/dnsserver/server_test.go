@@ -7,6 +7,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -53,6 +54,7 @@ func newTestServer(t *testing.T, configure ...func(*Config)) *Server {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(s.Shutdown)
 	return s
 }
 
@@ -199,7 +201,7 @@ func fetchDownloadMeta(t *testing.T, s *Server, sid string) (int, string) {
 		t.Fatalf("dmeta %s: %v", sid, resp)
 	}
 	parts := strings.Split(resp[0], "|")
-	if len(parts) != 2 {
+	if len(parts) != 2 && len(parts) != 3 {
 		t.Fatalf("dmeta malformed: %q", resp[0])
 	}
 	count, err := strconv.Atoi(parts[0])
@@ -438,12 +440,13 @@ func TestExpiredUploadCleanupRemovesPartialFile(t *testing.T) {
 	chunks := protectedUploadChunks(t, []byte("partial payload"), "base64", 80)
 	startUpload(t, s, "expireme", filename, chunks, 80, "base64")
 
-	path := filepath.Join(s.dataDir, filename)
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("partial file missing before cleanup: %v", err)
-	}
 	s.mu.Lock()
 	state := s.uploads["expireme"]
+	spoolPath := state.spoolPath
+	if _, err := os.Stat(spoolPath); err != nil {
+		s.mu.Unlock()
+		t.Fatalf("partial spool missing before cleanup: %v", err)
+	}
 	state.expires = time.Now().Add(-time.Minute)
 	s.uploads["expireme"] = state
 	s.cleanupExpiredLocked(time.Now())
@@ -453,8 +456,11 @@ func TestExpiredUploadCleanupRemovesPartialFile(t *testing.T) {
 	if exists {
 		t.Fatal("expired upload state still present")
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("partial file still exists: %v", err)
+	if _, err := os.Stat(spoolPath); !os.IsNotExist(err) {
+		t.Fatalf("partial spool still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.dataDir, filename)); !os.IsNotExist(err) {
+		t.Fatalf("incomplete upload was published as final file: %v", err)
 	}
 }
 
@@ -965,7 +971,31 @@ func TestUploadInitDuplicateSID(t *testing.T) {
 	args := append([]string{sid, "5", "60", "base64"}, filenameLabels(t, "dup2.txt")...)
 	got := s.handleTXT(signedName("uinit", args), "127.0.0.1")
 	if len(got) != 1 || got[0] != "Transfer already exists." {
-		t.Fatalf("expected 'Transfer already exists.', got %v", got)
+		t.Fatalf("expected conflicting uinit to be rejected, got %v", got)
+	}
+}
+
+func TestUploadFinalChunkTombstoneIsIdempotent(t *testing.T) {
+	s := newTestServer(t)
+	sid := "uploadtombstone1"
+	data := []byte("a completed final chunk may be retried after a lost DNS reply")
+	chunks := protectedUploadChunks(t, data, "base64", 60)
+	startUpload(t, s, sid, "tombstone.txt", chunks, 60, "base64")
+	for index := 0; index < len(chunks)-1; index++ {
+		if got := sendUploadChunk(t, s, sid, index, chunks[index]); got != strconv.Itoa(index+1) {
+			t.Fatalf("chunk %d response=%q", index, got)
+		}
+	}
+	finalIndex := len(chunks) - 1
+	if got := sendUploadChunk(t, s, sid, finalIndex, chunks[finalIndex]); got != "-1" {
+		t.Fatalf("first final chunk response=%q", got)
+	}
+	if got := sendUploadChunk(t, s, sid, finalIndex, chunks[finalIndex]); got != "-1" {
+		t.Fatalf("duplicate final chunk response=%q, want -1", got)
+	}
+	stored, err := os.ReadFile(filepath.Join(s.dataDir, "tombstone.txt"))
+	if err != nil || !bytes.Equal(stored, data) {
+		t.Fatalf("published upload changed after duplicate final chunk: %q, %v", stored, err)
 	}
 }
 
@@ -1027,8 +1057,8 @@ func TestDownloadInitDuplicateSID(t *testing.T) {
 	// Second dinit with the same SID
 	args := append([]string{sid}, filenameLabels(t, "dup.txt")...)
 	got := s.handleTXT(signedName("dinit", args), "127.0.0.1")
-	if len(got) != 1 || got[0] != "Transfer already exists." {
-		t.Fatalf("expected 'Transfer already exists.', got %v", got)
+	if len(got) != 1 || got[0] != "1" {
+		t.Fatalf("expected idempotent dinit count, got %v", got)
 	}
 }
 
@@ -1171,10 +1201,10 @@ func TestFinishUploadWriteError(t *testing.T) {
 		}
 	}
 
-	// Close the underlying file so the Write in finishUpload fails
+	// Close the underlying spool so accepting the final chunk fails.
 	s.mu.Lock()
 	state := s.uploads[sid]
-	state.file.Close()
+	state.spool.Close()
 	s.uploads[sid] = state
 	s.mu.Unlock()
 
@@ -1191,8 +1221,10 @@ func TestFinishUploadWriteError(t *testing.T) {
 // Download cache tests
 // ---------------------------------------------------------------------------
 
-// cacheKey resolves the cache key for a file as the server stores it:
-// filepath.EvalSymlinks resolves macOS /var → /private/var and similar.
+// cacheKey resolves the content-addressed cache key used by the streaming
+// spool cache.  The source digest is intentionally part of the key so an
+// active transfer can keep serving the old bytes while a modified source gets
+// a new cache entry.
 func cacheKey(t *testing.T, s *Server, filename string) string {
 	t.Helper()
 	raw := filepath.Join(s.dataDir, filename)
@@ -1200,7 +1232,11 @@ func cacheKey(t *testing.T, s *Server, filename string) string {
 	if err != nil {
 		t.Fatalf("EvalSymlinks(%q): %v", raw, err)
 	}
-	return real
+	_, digest, err := hashFile(real)
+	if err != nil {
+		t.Fatalf("hashFile(%q): %v", real, err)
+	}
+	return downloadCacheKey(real, digest)
 }
 
 func TestDownloadCacheHit(t *testing.T) {
@@ -1272,9 +1308,10 @@ func TestDownloadCacheMtimeInvalidation(t *testing.T) {
 	}
 
 	count2 := startDownload(t, s, "mtimesid02", filename)
+	updatedKey := cacheKey(t, s, filename)
 
 	s.mu.Lock()
-	secondMtime := s.downloadCache[key].mtime
+	secondMtime := s.downloadCache[updatedKey].mtime
 	s.mu.Unlock()
 
 	if firstMtime.Equal(secondMtime) {
@@ -1322,9 +1359,10 @@ func TestDownloadCacheContentInvalidationWithSameMtime(t *testing.T) {
 	}
 
 	count := startDownload(t, s, "hashsid02", filename)
+	updatedKey := cacheKey(t, s, filename)
 	s.mu.Lock()
-	secondDigest := s.downloadCache[key].sha256
-	secondMtime := s.downloadCache[key].mtime
+	secondDigest := s.downloadCache[updatedKey].sha256
+	secondMtime := s.downloadCache[updatedKey].mtime
 	s.mu.Unlock()
 
 	if !firstMtime.Equal(secondMtime) {
@@ -1343,36 +1381,141 @@ func TestDownloadCacheContentInvalidationWithSameMtime(t *testing.T) {
 }
 
 func TestDownloadCacheEviction(t *testing.T) {
-	s := newTestServer(t)
-
-	// Write and initiate downloads for maxDownloadCacheEntries+1 distinct files.
-	total := maxDownloadCacheEntries + 1
-	firstKey := ""
-	for i := 0; i < total; i++ {
-		name := fmt.Sprintf("evict%02d.txt", i)
-		if err := os.WriteFile(filepath.Join(s.dataDir, name), []byte(fmt.Sprintf("payload %d", i)), 0o600); err != nil {
+	payload := []byte("same-sized eviction payload")
+	quota := cacheBuildReservation(int64(len(payload)))
+	s := newTestServer(t, func(cfg *Config) { cfg.CacheMaxBytes = quota })
+	for _, name := range []string{"evict-first.txt", "evict-second.txt"} {
+		if err := os.WriteFile(filepath.Join(s.dataDir, name), payload, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if i == 0 {
-			firstKey = cacheKey(t, s, name)
-		}
-		startDownload(t, s, fmt.Sprintf("evictsid%03d", i), name)
+	}
+	firstKey := cacheKey(t, s, "evict-first.txt")
+	secondKey := cacheKey(t, s, "evict-second.txt")
+	startDownload(t, s, "evictsid001", "evict-first.txt")
+	args := append([]string{"evictsid002"}, filenameLabels(t, "evict-second.txt")...)
+	blocked := s.handleTXT(signedName("dinit", args), "127.0.0.1")
+	if len(blocked) != 1 || blocked[0] != "Server download preparation error." {
+		t.Fatalf("second active build exceeded hard quota: %v", blocked)
 	}
 
+	// Expiring the first transfer makes its LRU spool eligible, after which the
+	// same request can reserve build space without exceeding the hard quota.
+	s.mu.Lock()
+	state := s.downloads["evictsid001"]
+	state.expires = time.Now().Add(-time.Minute)
+	s.downloads["evictsid001"] = state
+	s.cleanupExpiredLocked(time.Now())
+	s.mu.Unlock()
+	startDownload(t, s, "evictsid002", "evict-second.txt")
 	s.mu.Lock()
 	_, firstStillCached := s.downloadCache[firstKey]
-	cacheSize := len(s.downloadCache)
-	orderLen := len(s.downloadCacheOrder)
+	_, secondStillCached := s.downloadCache[secondKey]
 	s.mu.Unlock()
-
 	if firstStillCached {
-		t.Fatal("expected first file to be evicted (FIFO) when cap exceeded")
+		t.Fatal("inactive LRU cache entry should be evicted under byte quota")
 	}
-	if cacheSize > maxDownloadCacheEntries {
-		t.Fatalf("cache size %d exceeds cap %d", cacheSize, maxDownloadCacheEntries)
+	if !secondStillCached {
+		t.Fatal("active cache entry must not be evicted")
 	}
-	if orderLen != cacheSize {
-		t.Fatalf("downloadCacheOrder length %d != cache map size %d", orderLen, cacheSize)
+}
+
+func TestDownloadCacheSingleflightIncludesSnapshotAndQuota(t *testing.T) {
+	payload := bytes.Repeat([]byte("singleflight-cache"), 4096)
+	quota := cacheBuildReservation(int64(len(payload)))
+	s := newTestServer(t, func(cfg *Config) { cfg.CacheMaxBytes = quota })
+	path := filepath.Join(s.dataDir, "singleflight.bin")
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callers = 8
+	type result struct {
+		key string
+		err error
+	}
+	results := make(chan result, callers)
+	start := make(chan struct{})
+	for range callers {
+		go func() {
+			<-start
+			key, _, err := s.prepareDownloadCache(path, info, time.Now().UTC())
+			results <- result{key: key, err: err}
+		}()
+	}
+	close(start)
+	var key string
+	for range callers {
+		got := <-results
+		if got.err != nil {
+			t.Fatalf("concurrent cache preparation: %v", got.err)
+		}
+		if key == "" {
+			key = got.key
+		} else if got.key != key {
+			t.Fatalf("singleflight returned different keys: %q and %q", key, got.key)
+		}
+	}
+	s.mu.Lock()
+	entry := s.downloadCache[key]
+	reserved := s.downloadCacheReserved
+	builds := len(s.downloadCacheBuilds)
+	s.mu.Unlock()
+	if entry.active != callers || reserved != 0 || builds != 0 {
+		t.Fatalf("cache state after singleflight: active=%d reserved=%d builds=%d", entry.active, reserved, builds)
+	}
+}
+
+func TestNewReconcilesOrphanTransferSpools(t *testing.T) {
+	dataDir := t.TempDir()
+	cacheDir := filepath.Join(dataDir, "cache")
+	if err := os.Mkdir(cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{
+		filepath.Join(cacheDir, ".gdns2tcp-source-dead"),
+		filepath.Join(cacheDir, "orphan.b64"),
+		filepath.Join(dataDir, ".gdns2tcp-upload-dead.wire"),
+	}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("orphan"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.DataDir = dataDir
+		cfg.CacheDir = cacheDir
+	})
+	_ = s
+	for _, path := range paths {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("orphan %s was not reconciled: %v", path, err)
+		}
+	}
+}
+
+func TestDownloadBatchDebouncesCacheMetadataWrites(t *testing.T) {
+	s := newTestServer(t)
+	filename := "meta-debounce.bin"
+	if err := os.WriteFile(filepath.Join(s.dataDir, filename), bytes.Repeat([]byte("x"), 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	startDownload(t, s, "metawritesid", filename)
+	s.mu.Lock()
+	state := s.downloads["metawritesid"]
+	entry := s.downloadCache[state.cacheKey]
+	beforeSave := entry.lastMetaSave
+	s.mu.Unlock()
+	if got := fetchDownloadBatch(t, s, "metawritesid", 0, 4); len(got) == 0 {
+		t.Fatal("empty download batch")
+	}
+	s.mu.Lock()
+	afterSave := s.downloadCache[state.cacheKey].lastMetaSave
+	s.mu.Unlock()
+	if !afterSave.Equal(beforeSave) {
+		t.Fatalf("metadata was rewritten inside debounce interval: before=%v after=%v", beforeSave, afterSave)
 	}
 }
 
@@ -1563,6 +1706,33 @@ func TestClientBatchUnknownAlias(t *testing.T) {
 	got := s.clientBatch("nonexistent", []string{"0", "4"}, "127.0.0.1")
 	if len(got) != 1 || got[0] != "Client artifact is not configured." {
 		t.Fatalf("expected not-configured response, got %v", got)
+	}
+}
+
+func TestClientArtifactProgressUsesBitmapAndExpires(t *testing.T) {
+	s, total := newClientArtifactServer(t)
+	client := "192.0.2.10"
+	if got := s.clientChunk("win", []string{"0"}, client); len(got) != 1 {
+		t.Fatalf("client chunk response=%v", got)
+	}
+	key := client + "|win"
+	s.mu.Lock()
+	progress, ok := s.clientTransfers[key]
+	if !ok {
+		s.mu.Unlock()
+		t.Fatal("client transfer progress was not recorded")
+	}
+	if len(progress.seen) != (total+7)/8 || progress.seenCount != 1 {
+		s.mu.Unlock()
+		t.Fatalf("progress bitmap bytes=%d count=%d, want bytes=%d count=1", len(progress.seen), progress.seenCount, (total+7)/8)
+	}
+	progress.lastSeen = time.Now().Add(-clientTransferTTL - time.Second)
+	s.clientTransfers[key] = progress
+	s.cleanupExpiredLocked(time.Now())
+	_, retained := s.clientTransfers[key]
+	s.mu.Unlock()
+	if retained {
+		t.Fatal("expired client artifact progress was retained")
 	}
 }
 
@@ -2470,6 +2640,184 @@ func TestSignalOneReaderWakesExactlyOne(t *testing.T) {
 	// (they'll wake via closeAllReadersLocked).
 	s.reverseCloseConn(s.cidForReverseConn(rc), rc, "test cleanup")
 	wg.Wait()
+}
+
+func TestReverseModernPollLeaseAndOpenAcknowledgement(t *testing.T) {
+	s := proxyTestServer(t)
+	op, peer := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = peer.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pollID := "0123456789abcdef"
+	first := s.handleTXT(signedName("apoll", []string{pollID}), "127.0.0.1")
+	if len(first) != 1 || !strings.HasPrefix(first[0], "OPEN "+cid+" ") {
+		t.Fatalf("first modern poll = %v", first)
+	}
+	second := s.handleTXT(signedName("apoll", []string{pollID}), "127.0.0.1")
+	if len(second) != 1 || second[0] != first[0] {
+		t.Fatalf("duplicate poll must retain the same lease: first=%v second=%v", first, second)
+	}
+	other := s.handleTXT(signedName("apoll", []string{"fedcba9876543210"}), "127.0.0.1")
+	if len(other) != 1 || other[0] != "EMPTY" {
+		t.Fatalf("a different poll must not steal an active lease: %v", other)
+	}
+
+	// Expiry requeues the cid for another agent instead of stranding the
+	// operator's pending SOCKS request.
+	rc.mu.Lock()
+	rc.leaseExpires = time.Now().Add(-time.Second)
+	rc.mu.Unlock()
+	s.proxyCleanupExpiredLocked(time.Now())
+	other = s.handleTXT(signedName("apoll", []string{"fedcba9876543210"}), "127.0.0.1")
+	if len(other) != 1 || !strings.HasPrefix(other[0], "OPEN "+cid+" ") {
+		t.Fatalf("expired lease was not requeued: %v", other)
+	}
+
+	ack := s.handleTXT(signedName("aopen", []string{cid, "fedcba9876543210", "ok"}), "127.0.0.1")
+	if len(ack) != 1 || ack[0] != "OK" {
+		t.Fatalf("aopen response=%v", ack)
+	}
+	select {
+	case <-rc.openReady:
+		if rc.openStatus != 0x00 {
+			t.Fatalf("open status=%#x", rc.openStatus)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("aopen did not release the SOCKS wait")
+	}
+	duplicate := s.handleTXT(signedName("aopen", []string{cid, "fedcba9876543210", "ok"}), "127.0.0.1")
+	if len(duplicate) != 1 || duplicate[0] != "OK" {
+		t.Fatalf("duplicate aopen must be idempotent, got %v", duplicate)
+	}
+}
+
+func TestProxyAgentExchangeCachesLostResponseUntilReadACK(t *testing.T) {
+	s := proxyTestServer(t)
+	op, peer := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = peer.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	s.reverse.pending = nil
+	delete(s.reverse.pendCids, rc)
+	s.reverse.mu.Unlock()
+	rc.mu.Lock()
+	_, _ = rc.opToAgent.Write([]byte("must not vanish when the DNS reply is lost"))
+	rc.mu.Unlock()
+
+	nonce := uint64(1)
+	args := []string{cid, "0", strconv.FormatUint(nonce, 16), protocol.SessionMAC(rc.sessionKey, "axchg", nonce)}
+	first := s.proxyAgentExchange(args, time.Now())
+	if len(first) < 2 || !strings.HasPrefix(first[1], "DATA ") {
+		t.Fatalf("first axchg response=%v", first)
+	}
+	second := s.proxyAgentExchange(args, time.Now())
+	if strings.Join(second, "|") != strings.Join(first, "|") {
+		t.Fatalf("duplicate axchg did not return cached response: first=%v second=%v", first, second)
+	}
+	rc.mu.Lock()
+	entry := rc.responseCache[nonce]
+	if entry == nil || !entry.ready || entry.readSeq != 1 || entry.readHead != "" {
+		rc.mu.Unlock()
+		t.Fatalf("response cache retained unexpected payload state: %#v", entry)
+	}
+	if rc.seqOpToA != 1 || len(rc.outbound) != 1 {
+		rc.mu.Unlock()
+		t.Fatalf("duplicate axchg drained data again: seq=%d outbound=%d", rc.seqOpToA, len(rc.outbound))
+	}
+	// Simulate bounded response-cache eviction before a delayed TCP retry. The
+	// nonce remains in the replay window, so the retry must recover from the
+	// ACK-retained outbound data instead of becoming a false auth failure.
+	delete(rc.responseCache, nonce)
+	rc.mu.Unlock()
+	third := s.proxyAgentExchange(args, time.Now())
+	if strings.Join(third, "|") != strings.Join(first, "|") {
+		t.Fatalf("evicted duplicate did not recover retained data: first=%v retry=%v", first, third)
+	}
+	rc.mu.Lock()
+	if rc.seqOpToA != 1 || len(rc.outbound) != 1 {
+		rc.mu.Unlock()
+		t.Fatalf("evicted duplicate drained data again: seq=%d outbound=%d", rc.seqOpToA, len(rc.outbound))
+	}
+	rc.mu.Unlock()
+
+	ackNonce := uint64(2)
+	ackArgs := []string{cid, "0", "a-1", strconv.FormatUint(ackNonce, 16), protocol.SessionMAC(rc.sessionKey, "axchg", ackNonce)}
+	_ = s.proxyAgentExchange(ackArgs, time.Now())
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if len(rc.outbound) != 0 || rc.readAck != 1 {
+		t.Fatalf("read ACK did not release retained outbound data: ack=%d outbound=%d", rc.readAck, len(rc.outbound))
+	}
+}
+
+func TestConcurrentAxchgReadReservationsRespectBufferCap(t *testing.T) {
+	const capBytes = 8192
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.ProxyMaxConn = 1
+		cfg.ProxyBufBytes = capBytes
+	})
+	op, peer := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = peer.Close() })
+	_, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.mu.Lock()
+	_, _ = rc.opToAgent.Write(bytes.Repeat([]byte("x"), capBytes))
+	rc.mu.Unlock()
+
+	const workers = 32
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = s.collectAxchgRead(rc, 1024, time.Now().UTC(), false)
+		}()
+	}
+	wg.Wait()
+	rc.mu.Lock()
+	retained := rc.outboundPlainBytes
+	reserved := rc.outboundReservedBytes
+	buffered := rc.opToAgent.Len()
+	inFlight := rc.outboundInFlight
+	entries := len(rc.outbound)
+	rc.mu.Unlock()
+	if retained+reserved+buffered > capBytes {
+		t.Fatalf("buffer cap exceeded: retained=%d reserved=%d buffered=%d cap=%d", retained, reserved, buffered, capBytes)
+	}
+	if inFlight != 0 || entries > maxOutboundUnacked {
+		t.Fatalf("unfinished/oversized outbound state: inFlight=%d entries=%d", inFlight, entries)
+	}
+}
+
+func TestReversePumpHonorsSmallBufferCapacity(t *testing.T) {
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.AllowProxy = true
+		cfg.ProxyMaxConn = 1
+		cfg.ProxyBufBytes = 1
+	})
+	op, peer := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = peer.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.reversePumpOperator(cid, rc)
+	_ = peer.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Write([]byte("x")); err != nil {
+		t.Fatalf("operator write with a one-byte buffer blocked: %v", err)
+	}
+	resp := s.proxyAgentRead(sessionAreadArgs(cid, rc.sessionKey, 1, false), time.Now())
+	if len(resp) < 2 || !strings.HasPrefix(resp[0], "DATA ") {
+		t.Fatalf("small-buffer read response=%v", resp)
+	}
 }
 
 // TestProxyAgentExchangePureRead covers the simplest axchg path: pure read,

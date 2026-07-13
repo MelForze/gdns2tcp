@@ -1,3 +1,73 @@
+<#
+.SYNOPSIS
+gdns2tcp PowerShell file-transfer client.
+
+.DESCRIPTION
+Runs one of four modes against an authoritative gdns2tcp DNS zone: Test, List,
+Upload, or Download. Domain and Mode are always required. Pass is required for
+List, Upload, and Download. Use DnsServer/DnsPort/Tcp when you want to bypass
+the system resolver or force TCP DNS.
+
+.PARAMETER Domain
+Authoritative gdns2tcp DNS zone, for example files.example.com.
+
+.PARAMETER Mode
+Operation to run: Test, List, Upload, or Download.
+
+.PARAMETER Pass
+Shared secret. Required for List, Upload, and Download.
+
+.PARAMETER InFile
+Local file path for Upload.
+
+.PARAMETER Filename
+Remote filename for Download.
+
+.PARAMETER OutFile
+Local output path for Download. Defaults to Filename.
+
+.PARAMETER DnsServer
+DNS server address. Empty uses the system resolver.
+
+.PARAMETER DnsPort
+DNS server port. Default: 53.
+
+.PARAMETER Tcp
+Use TCP instead of UDP for DNS queries.
+
+.PARAMETER ChunkSize
+Maximum encoded upload chunk size. Default: 180.
+
+.PARAMETER MaxDownloadBytes
+Maximum decompressed download size. Default: 268435456.
+
+.PARAMETER Parallelism
+Concurrent DNS queries during parallel downloads. Default: 32.
+
+.PARAMETER BatchSize
+Chunks requested per DNS response during parallel downloads. Default: 14.
+
+.PARAMETER Retries
+DNS query attempts before failing. Default: 3.
+
+.PARAMETER RetryDelaySeconds
+Delay between retry attempts. Default: 2.
+
+.PARAMETER LogPath
+Optional log file path.
+
+.EXAMPLE
+./gdns2tcp-client.ps1 -Domain files.example.com -Mode Test -DnsServer 203.0.113.10
+
+.EXAMPLE
+./gdns2tcp-client.ps1 -Domain files.example.com -Mode List -Pass $env:GDNS_PASS
+
+.EXAMPLE
+./gdns2tcp-client.ps1 -Domain files.example.com -Mode Upload -Pass $env:GDNS_PASS -InFile .\payload.bin
+
+.EXAMPLE
+./gdns2tcp-client.ps1 -Domain files.example.com -Mode Download -Pass $env:GDNS_PASS -Filename payload.bin -OutFile .\payload.bin -Tcp
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -9,16 +79,18 @@ param(
     [string]$Mode,
 
     [Parameter()]
-    [string]$InFile = '',
+    [Alias('password')]
+    [string]$Pass = '',
 
     [Parameter()]
-    [string]$OutFile = '',
+    [Alias('in')]
+    [string]$InFile = '',
 
     [Parameter()]
     [string]$Filename = '',
 
     [Parameter()]
-    [string]$Pass = '',
+    [string]$OutFile = '',
 
     [Parameter()]
     [string]$DnsServer = '',
@@ -28,6 +100,7 @@ param(
     [int]$DnsPort = 53,
 
     [Parameter()]
+    [Alias('chunk-size')]
     [ValidateRange(32, 180)]
     [int]$ChunkSize = 180,
 
@@ -43,8 +116,9 @@ param(
     [string]$LogPath = '',
 
     [Parameter()]
+    [Alias('max-download-bytes')]
     [ValidateRange(1, 2147483647)]
-    [int64]$MaxDownloadBytes = 33554432,
+    [int64]$MaxDownloadBytes = 268435456,
 
     [Parameter()]
     [switch]$Tcp,
@@ -153,6 +227,7 @@ function Invoke-NativeDnsTool {
         }
         'host' {
             $arguments = @('-t', 'TXT', $Name)
+            if ($Tcp) { $arguments += '-T' }
             if ($DnsPort -ne 53) {
                 $arguments += @('-p', [string]$DnsPort)
             }
@@ -162,6 +237,7 @@ function Invoke-NativeDnsTool {
         }
         'nslookup' {
             $arguments = @('-type=TXT')
+            if ($Tcp) { $arguments += '-vc' }
             if ($DnsPort -ne 53) {
                 $arguments += "-port=$DnsPort"
             }
@@ -347,6 +423,7 @@ function Import-DownloadCSharp {
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -356,6 +433,60 @@ using System.Threading.Tasks;
 
 public static class Gdns2TcpDownload {
     private static readonly char[] B32 = "abcdefghijklmnopqrstuvwxyz234567".ToCharArray();
+    private const int TcpDnsPoolSize = 16;
+
+    private sealed class TcpDnsSlot {
+        public readonly object Gate = new object();
+        public TcpClient Client;
+        public NetworkStream Stream;
+        public string Server;
+        public int Port;
+    }
+
+    private static readonly TcpDnsSlot[] TcpDnsPool = CreateTcpDnsPool();
+    private static int TcpDnsCursor = -1;
+
+    private static TcpDnsSlot[] CreateTcpDnsPool() {
+        var slots = new TcpDnsSlot[TcpDnsPoolSize];
+        for (int i = 0; i < slots.Length; i++) slots[i] = new TcpDnsSlot();
+        return slots;
+    }
+
+    private static TcpDnsSlot NextTcpDnsSlot() {
+        int cursor = Interlocked.Increment(ref TcpDnsCursor) & int.MaxValue;
+        return TcpDnsPool[cursor % TcpDnsPool.Length];
+    }
+
+    private static void CloseTcpDnsSlot(TcpDnsSlot slot) {
+        try { if (slot.Stream != null) slot.Stream.Dispose(); } catch {}
+        try { if (slot.Client != null) slot.Client.Close(); } catch {}
+        slot.Stream = null;
+        slot.Client = null;
+        slot.Server = null;
+        slot.Port = 0;
+    }
+
+    private static void EnsureTcpDnsSlot(TcpDnsSlot slot, string server, int port, int timeoutMs) {
+        if (slot.Client != null && slot.Stream != null &&
+            string.Equals(slot.Server, server, StringComparison.OrdinalIgnoreCase) && slot.Port == port) return;
+        CloseTcpDnsSlot(slot);
+        var tcp = new TcpClient();
+        IAsyncResult connect = tcp.BeginConnect(server, port, null, null);
+        try {
+            if (!connect.AsyncWaitHandle.WaitOne(timeoutMs)) {
+                tcp.Close();
+                throw new TimeoutException("TCP DNS connect timeout");
+            }
+            tcp.EndConnect(connect);
+        } finally { connect.AsyncWaitHandle.Close(); }
+        tcp.ReceiveTimeout = timeoutMs;
+        tcp.SendTimeout = timeoutMs;
+        tcp.NoDelay = true;
+        slot.Client = tcp;
+        slot.Stream = tcp.GetStream();
+        slot.Server = server;
+        slot.Port = port;
+    }
 
     private static string BuildAuthToken(string secret, string domain, string command, string ts, string[] args) {
         var parts = new List<string>(args.Length + 4);
@@ -363,7 +494,12 @@ public static class Gdns2TcpDownload {
         parts.Add(domain.ToLowerInvariant().TrimEnd('.'));
         parts.Add(command);
         parts.Add(ts);
-        parts.AddRange(args);
+        // DNS names are case-insensitive and the Go protocol canonicalises
+        // every argument to lowercase before calculating the HMAC.  Keep
+        // the native fast path byte-for-byte compatible with requests sent
+        // through New-AuthenticatedName (notably when a resolver changes
+        // label case in transit).
+        for (int i = 0; i < args.Length; i++) parts.Add(args[i].ToLowerInvariant());
         using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret))) {
             byte[] h = hmac.ComputeHash(Encoding.UTF8.GetBytes(string.Join("|", parts)));
             var sb = new StringBuilder(26);
@@ -470,32 +606,42 @@ public static class Gdns2TcpDownload {
 
     private static string QueryOnceTcp(string name, string server, int port, int timeoutMs, ushort id) {
         byte[] q = BuildQuery(name, id);
-        using (var tcp = new System.Net.Sockets.TcpClient()) {
-            tcp.Connect(server, port);
-            tcp.ReceiveTimeout = timeoutMs;
-            tcp.SendTimeout = timeoutMs;
-            var ns = tcp.GetStream();
-            // DNS over TCP: 2-byte big-endian length prefix
-            ns.WriteByte((byte)(q.Length >> 8));
-            ns.WriteByte((byte)(q.Length & 0xFF));
-            ns.Write(q, 0, q.Length);
-            ns.Flush();
-            byte[] lenBuf = new byte[2];
-            int nread = 0;
-            while (nread < 2) {
-                int got = ns.Read(lenBuf, nread, 2 - nread);
-                if (got <= 0) throw new Exception("TCP connection closed before length prefix");
-                nread += got;
+        TcpDnsSlot slot = NextTcpDnsSlot();
+        lock (slot.Gate) {
+            try {
+                EnsureTcpDnsSlot(slot, server, port, timeoutMs);
+                NetworkStream ns = slot.Stream;
+                // DNS over TCP: 2-byte big-endian length prefix. A slot is
+                // locked for the whole request/response, so frames cannot
+                // interleave while independent slots still run in parallel.
+                ns.WriteByte((byte)(q.Length >> 8));
+                ns.WriteByte((byte)(q.Length & 0xFF));
+                ns.Write(q, 0, q.Length);
+                ns.Flush();
+                byte[] lenBuf = new byte[2];
+                int nread = 0;
+                while (nread < 2) {
+                    int got = ns.Read(lenBuf, nread, 2 - nread);
+                    if (got <= 0) throw new Exception("TCP connection closed before length prefix");
+                    nread += got;
+                }
+                int rlen = (lenBuf[0] << 8) | lenBuf[1];
+                if (rlen < 12) throw new Exception("TCP DNS response length is invalid");
+                byte[] resp = new byte[rlen];
+                nread = 0;
+                while (nread < rlen) {
+                    int got = ns.Read(resp, nread, rlen - nread);
+                    if (got <= 0) throw new Exception("TCP connection closed before response body");
+                    nread += got;
+                }
+                return ParseTxt(resp, id);
+            } catch {
+                // A timeout, partial frame or remote close makes stream
+                // alignment unknowable. Discard only this slot; the outer
+                // retry loop can reconnect it without disturbing other work.
+                CloseTcpDnsSlot(slot);
+                throw;
             }
-            int rlen = (lenBuf[0] << 8) | lenBuf[1];
-            byte[] resp = new byte[rlen];
-            nread = 0;
-            while (nread < rlen) {
-                int got = ns.Read(resp, nread, rlen - nread);
-                if (got <= 0) throw new Exception("TCP connection closed before response body");
-                nread += got;
-            }
-            return ParseTxt(resp, id);
         }
     }
 
@@ -514,15 +660,21 @@ public static class Gdns2TcpDownload {
         if (batchSize < 1) batchSize = 1;
         int nBatches = (count + batchSize - 1) / batchSize;
         var results = new string[nBatches];
-        var sem = new SemaphoreSlim(concurrency, concurrency);
-        var tasks = new Task[nBatches];
-        for (int i = 0; i < nBatches; i++) {
-            int batchIdx = i;
-            int from = i * batchSize;
-            int batchCount = Math.Min(batchSize, count - from);
-            tasks[batchIdx] = Task.Run(() => {
-                sem.Wait();
-                try {
+        int workerCount = Math.Min(Math.Max(1, concurrency), nBatches);
+        var tasks = new Task[workerCount];
+        var errorLock = new object();
+        int nextBatch = -1;
+        Exception failure = null;
+        for (int worker = 0; worker < workerCount; worker++) {
+            tasks[worker] = Task.Run(() => {
+                while (true) {
+                    lock (errorLock) {
+                        if (failure != null) return;
+                    }
+                    int batchIdx = Interlocked.Increment(ref nextBatch);
+                    if (batchIdx >= nBatches) return;
+                    int from = batchIdx * batchSize;
+                    int batchCount = Math.Min(batchSize, count - from);
                     ushort id = (ushort)((batchIdx % 65534) + 1);
                     Exception last = null;
                     for (int att = 0; att < retries; att++) {
@@ -534,22 +686,25 @@ public static class Gdns2TcpDownload {
                                 ? QueryOnceTcp(qname, server, port, timeoutMs, id)
                                 : QueryOnceUdp(qname, server, port, timeoutMs, id);
                             Interlocked.Add(ref CompletedChunks, batchCount);
-                            return;
+                            last = null;
+                            break;
                         } catch (Exception ex) {
                             last = ex;
                             if (att < retries - 1) Thread.Sleep(retryDelayMs);
                         }
                     }
-                    throw last;
-                } finally { sem.Release(); }
+                    if (last != null) {
+                        lock (errorLock) {
+                            if (failure == null) failure = last;
+                        }
+                        return;
+                    }
+                }
             });
         }
-        try { Task.WaitAll(tasks); }
-        catch (AggregateException ae) {
-            var m = new List<string>();
-            foreach (var ex in ae.InnerExceptions) m.Add(ex.Message);
-            throw new Exception("parallel chunk download: " + string.Join("; ", m));
-        }
+        Task.WaitAll(tasks);
+        if (failure != null)
+            throw new Exception("parallel chunk download: " + failure.Message, failure);
         return results;
     }
 
@@ -564,6 +719,237 @@ public static class Gdns2TcpDownload {
         return Task.Run(() => DownloadChunks(
             secret, domain, sid, count, server, port, timeoutMs,
             retries, retryDelayMs, concurrency, tcp, batchSize));
+    }
+
+    // Streaming counterpart to DownloadChunks.  Responses are written at
+    // their fixed chunk offsets into one preallocated base64 spool; only one
+    // batch string is retained per worker, not the entire artifact.
+    public static void DownloadChunksToSpool(
+        string secret, string domain, string sid, int count, long encodedSize,
+        string spoolPath, string server, int port, int timeoutMs, int retries,
+        int retryDelayMs, int concurrency, bool tcp, int batchSize)
+    {
+        if (encodedSize <= 0) throw new ArgumentException("encodedSize");
+        if (batchSize < 1) batchSize = 1;
+        int nBatches = (count + batchSize - 1) / batchSize;
+        int workerCount = Math.Min(Math.Max(1, concurrency), nBatches);
+        var tasks = new Task[workerCount];
+        var writeLock = new object();
+        var errorLock = new object();
+        int nextBatch = -1;
+        Exception failure = null;
+        using (var spool = new FileStream(spoolPath, FileMode.Create, FileAccess.Write, FileShare.None)) {
+            spool.SetLength(encodedSize);
+            for (int worker = 0; worker < workerCount; worker++) {
+                tasks[worker] = Task.Run(() => {
+                    while (true) {
+                        lock (errorLock) {
+                            if (failure != null) return;
+                        }
+                        int batchIdx = Interlocked.Increment(ref nextBatch);
+                        if (batchIdx >= nBatches) return;
+                        int from = batchIdx * batchSize;
+                        int batchCount = Math.Min(batchSize, count - from);
+                        ushort id = (ushort)((batchIdx % 65534) + 1);
+                        Exception last = null;
+                        for (int att = 0; att < retries; att++) {
+                            try {
+                                string qname = batchSize == 1
+                                    ? BuildName(secret, domain, sid, from.ToString())
+                                    : BuildBatchName(secret, domain, sid, from, batchCount);
+                                string data = tcp
+                                    ? QueryOnceTcp(qname, server, port, timeoutMs, id)
+                                    : QueryOnceUdp(qname, server, port, timeoutMs, id);
+                                long offset = (long)from * 254L;
+                                int expected = (int)Math.Min((long)batchCount * 254L, encodedSize - offset);
+                                if (data.Length != expected) throw new Exception("DNS batch length mismatch");
+                                byte[] bytes = Encoding.ASCII.GetBytes(data);
+                                lock (writeLock) {
+                                    spool.Position = offset;
+                                    spool.Write(bytes, 0, bytes.Length);
+                                }
+                                Interlocked.Add(ref CompletedChunks, batchCount);
+                                last = null;
+                                break;
+                            } catch (Exception ex) {
+                                last = ex;
+                                if (att < retries - 1) Thread.Sleep(retryDelayMs);
+                            }
+                        }
+                        if (last != null) {
+                            lock (errorLock) {
+                                if (failure == null) failure = last;
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+            Task.WaitAll(tasks);
+            if (failure != null)
+                throw new Exception("parallel chunk download: " + failure.Message, failure);
+        }
+    }
+
+    public static Task BeginDownloadChunksToSpool(
+        string secret, string domain, string sid, int count, long encodedSize,
+        string spoolPath, string server, int port, int timeoutMs, int retries,
+        int retryDelayMs, int concurrency, bool tcp, int batchSize)
+    {
+        CompletedChunks = 0;
+        return Task.Run(() => DownloadChunksToSpool(
+            secret, domain, sid, count, encodedSize, spoolPath, server, port,
+            timeoutMs, retries, retryDelayMs, concurrency, tcp, batchSize));
+    }
+
+    private static byte[] Pbkdf2Sha256(byte[] password, byte[] salt, int iterations, int length) {
+        using (var hmac = new HMACSHA256(password)) {
+            var output = new byte[length]; int generated = 0, block = 1;
+            while (generated < length) {
+                var saltBlock = new byte[salt.Length + 4];
+                Array.Copy(salt, saltBlock, salt.Length);
+                saltBlock[salt.Length] = (byte)(block >> 24);
+                saltBlock[salt.Length + 1] = (byte)(block >> 16);
+                saltBlock[salt.Length + 2] = (byte)(block >> 8);
+                saltBlock[salt.Length + 3] = (byte)block;
+                byte[] u = hmac.ComputeHash(saltBlock);
+                byte[] t = (byte[])u.Clone();
+                for (int i = 2; i <= iterations; i++) {
+                    u = hmac.ComputeHash(u);
+                    for (int j = 0; j < t.Length; j++) t[j] ^= u[j];
+                }
+                int copy = Math.Min(t.Length, length - generated);
+                Array.Copy(t, 0, output, generated, copy); generated += copy; block++;
+            }
+            return output;
+        }
+    }
+
+    // Decode the base64 DNS spool, authenticate/decrypt GDT2, and gunzip
+    // straight into outputPath.  No full payload-sized managed array exists.
+    public static void DecodeSpoolToOutput(string spoolPath, string secret, string outputPath, long maxBytes) {
+        string protectedPath = outputPath + ".protected-" + Guid.NewGuid().ToString("N");
+        try {
+            using (var input = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var decoded = new FileStream(protectedPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var transform = new FromBase64Transform(FromBase64TransformMode.IgnoreWhiteSpaces))
+            using (var crypto = new CryptoStream(decoded, transform, CryptoStreamMode.Write)) {
+                var buf = new byte[65536]; int n;
+                while ((n = input.Read(buf, 0, buf.Length)) > 0) crypto.Write(buf, 0, n);
+                crypto.FlushFinalBlock();
+            }
+            using (var protectedFile = new FileStream(protectedPath, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                if (protectedFile.Length < 84) throw new Exception("Protected payload is too short");
+                byte[] header = new byte[36]; ReadExactly(protectedFile, header, 0, header.Length);
+                if (Encoding.ASCII.GetString(header, 0, 4) != "GDT2") throw new Exception("Unsupported protected payload");
+                byte[] expectedMac = new byte[32]; ReadExactly(protectedFile, expectedMac, 0, expectedMac.Length);
+                byte[] salt = new byte[16]; Array.Copy(header, 4, salt, 0, 16);
+                byte[] iv = new byte[16]; Array.Copy(header, 20, iv, 0, 16);
+                byte[] material = Pbkdf2Sha256(Encoding.UTF8.GetBytes(secret), salt, 100000, 64);
+                byte[] encKey = new byte[32], macKey = new byte[32];
+                Array.Copy(material, 0, encKey, 0, 32); Array.Copy(material, 32, macKey, 0, 32);
+                byte[] actualMac;
+                using (var hmac = new HMACSHA256(macKey))
+                using (var sink = new CryptoStream(Stream.Null, hmac, CryptoStreamMode.Write)) {
+                    sink.Write(header, 0, header.Length);
+                    var buf = new byte[65536]; int n;
+                    while ((n = protectedFile.Read(buf, 0, buf.Length)) > 0) sink.Write(buf, 0, n);
+                    sink.FlushFinalBlock(); actualMac = hmac.Hash;
+                }
+                if (!FixedTimeEquals(expectedMac, actualMac)) throw new Exception("Protected payload authentication failed");
+                protectedFile.Position = 68;
+                using (var aes = Aes.Create()) {
+                    aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7; aes.KeySize = 256; aes.Key = encKey; aes.IV = iv;
+                    using (var decrypt = new CryptoStream(protectedFile, aes.CreateDecryptor(), CryptoStreamMode.Read))
+                    using (var gzip = new System.IO.Compression.GZipStream(decrypt, System.IO.Compression.CompressionMode.Decompress))
+                    using (var output = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
+                        var buf = new byte[65536]; int n; long written = 0;
+                        while ((n = gzip.Read(buf, 0, buf.Length)) > 0) {
+                            written += n;
+                            if (written > maxBytes) throw new Exception("Decompressed download exceeds configured limit");
+                            output.Write(buf, 0, n);
+                        }
+                    }
+                }
+            }
+        } finally { try { if (File.Exists(protectedPath)) File.Delete(protectedPath); } catch {} }
+    }
+
+    private static void ReadExactly(Stream stream, byte[] buffer, int offset, int count) {
+        while (count > 0) { int n = stream.Read(buffer, offset, count); if (n <= 0) throw new EndOfStreamException(); offset += n; count -= n; }
+    }
+    private static bool FixedTimeEquals(byte[] a, byte[] b) {
+        if (a == null || b == null || a.Length != b.Length) return false;
+        int diff = 0; for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i]; return diff == 0;
+    }
+
+    // Builds the existing GDT2 container from a file via gzip/CBC/HMAC
+    // spools, then emits DNS base64/base32 without materialising the file.
+    public static long PrepareUploadToSpool(string inputPath, string secret, string encoding, string spoolPath) {
+        string root = Path.GetDirectoryName(spoolPath);
+        string gzipPath = Path.Combine(root, ".gdns2tcp-gzip-" + Guid.NewGuid().ToString("N"));
+        string cipherPath = Path.Combine(root, ".gdns2tcp-cipher-" + Guid.NewGuid().ToString("N"));
+        string protectedPath = Path.Combine(root, ".gdns2tcp-protected-" + Guid.NewGuid().ToString("N"));
+        try {
+            using (var input = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var gzipFile = new FileStream(gzipPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var gzip = new System.IO.Compression.GZipStream(gzipFile, System.IO.Compression.CompressionMode.Compress)) {
+                input.CopyTo(gzip);
+            }
+            byte[] salt = new byte[16], iv = new byte[16];
+            using (var rng = RandomNumberGenerator.Create()) { rng.GetBytes(salt); rng.GetBytes(iv); }
+            byte[] material = Pbkdf2Sha256(Encoding.UTF8.GetBytes(secret), salt, 100000, 64);
+            byte[] encKey = new byte[32], macKey = new byte[32];
+            Array.Copy(material, 0, encKey, 0, 32); Array.Copy(material, 32, macKey, 0, 32);
+            using (var aes = Aes.Create()) {
+                aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7; aes.KeySize = 256; aes.Key = encKey; aes.IV = iv;
+                using (var gzipInput = new FileStream(gzipPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (var cipherFile = new FileStream(cipherPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                using (var encrypt = new CryptoStream(cipherFile, aes.CreateEncryptor(), CryptoStreamMode.Write)) {
+                    gzipInput.CopyTo(encrypt); encrypt.FlushFinalBlock();
+                }
+            }
+            byte[] header = new byte[36]; Encoding.ASCII.GetBytes("GDT2").CopyTo(header, 0);
+            Array.Copy(salt, 0, header, 4, 16); Array.Copy(iv, 0, header, 20, 16);
+            byte[] mac;
+            using (var hmac = new HMACSHA256(macKey))
+            using (var sink = new CryptoStream(Stream.Null, hmac, CryptoStreamMode.Write))
+            using (var cipherInput = new FileStream(cipherPath, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                sink.Write(header, 0, header.Length); cipherInput.CopyTo(sink); sink.FlushFinalBlock(); mac = hmac.Hash;
+            }
+            using (var protectedOut = new FileStream(protectedPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var cipherInput = new FileStream(cipherPath, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                protectedOut.Write(header, 0, header.Length); protectedOut.Write(mac, 0, mac.Length); cipherInput.CopyTo(protectedOut);
+            }
+            if (string.Equals(encoding, "base32", StringComparison.OrdinalIgnoreCase)) {
+                EncodeBase32File(protectedPath, spoolPath);
+            } else if (string.Equals(encoding, "base64", StringComparison.OrdinalIgnoreCase)) {
+                using (var src = new FileStream(protectedPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (var dst = new FileStream(spoolPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (var transform = new ToBase64Transform())
+                using (var output = new CryptoStream(dst, transform, CryptoStreamMode.Write)) {
+                    src.CopyTo(output); output.FlushFinalBlock();
+                }
+            } else throw new Exception("Unsupported DNS encoding " + encoding);
+            return new FileInfo(spoolPath).Length;
+        } finally {
+            try { if (File.Exists(gzipPath)) File.Delete(gzipPath); } catch {}
+            try { if (File.Exists(cipherPath)) File.Delete(cipherPath); } catch {}
+            try { if (File.Exists(protectedPath)) File.Delete(protectedPath); } catch {}
+        }
+    }
+
+    private static void EncodeBase32File(string srcPath, string dstPath) {
+        const string alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+        using (var src = new FileStream(srcPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var dst = new StreamWriter(new FileStream(dstPath, FileMode.Create, FileAccess.Write, FileShare.None), Encoding.ASCII)) {
+            int value = 0, bits = 0, next;
+            while ((next = src.ReadByte()) >= 0) {
+                value = (value << 8) | next; bits += 8;
+                while (bits >= 5) { bits -= 5; dst.Write(alphabet[(value >> bits) & 31]); }
+            }
+            if (bits > 0) dst.Write(alphabet[(value << (5 - bits)) & 31]);
+        }
     }
 }
 '@ -ErrorAction Stop
@@ -913,7 +1299,10 @@ function New-AuthToken {
     [void]$parts.Add($Command.ToLowerInvariant())
     [void]$parts.Add($Timestamp)
     foreach ($arg in @($Args)) {
-        [void]$parts.Add($arg)
+        # protocol.AuthToken canonicalises each DNS label.  Base64 upload
+        # chunks contain mixed case, so signing their original spelling made
+        # PowerShell uploads fail as soon as the payload contained A-Z.
+        [void]$parts.Add($arg.ToLowerInvariant())
     }
     [byte[]]$hash = New-HmacSha256Text -Key $Pass -Message ($parts -join '|')
     [byte[]]$shortHash = Copy-ByteRange -Bytes $hash -Offset 0 -Count 16
@@ -1149,70 +1538,61 @@ function Invoke-Upload {
     $sid = New-TransferId
     $filenameLabels = @(ConvertTo-FilenameLabels -Name ([System.IO.Path]::GetFileName($inputPath)))
 
-    Write-Log -Level 'INFO' -Message "Compressing and encrypting $inputPath."
-    [byte[]]$compressed = Compress-File -Path $inputPath
-    [byte[]]$protected = Protect-Bytes -Secret $Pass -Plaintext $compressed
-    $encoded = ConvertTo-WireEncoding -Bytes $protected -Encoding $encoding
-    if ($encoding -eq 'base32') {
-        $encoded = $encoded.ToLowerInvariant()
-    }
+    $spoolPath = Join-Path ([System.IO.Path]::GetTempPath()) ("gdns2tcp-upload-" + [guid]::NewGuid().ToString('N') + '.txt')
+    $spool = $null
+    try {
+        Write-Log -Level 'INFO' -Message "Compressing and encrypting $inputPath to a disk spool."
+        Import-DownloadCSharp
+        [int64]$encodedSize = [Gdns2TcpDownload]::PrepareUploadToSpool($inputPath, $Pass, $encoding, $spoolPath)
+        $effectiveChunkSize = Get-UploadChunkSize -Sid $sid -Requested $ChunkSize
+        [int]$chunkCount = [Math]::Ceiling($encodedSize / [double]$effectiveChunkSize)
+        if ($chunkCount -le 0) { throw 'Upload has no encoded chunks.' }
+        Write-Log -Level 'INFO' -Message "Prepared $chunkCount DNS chunks."
 
-    $effectiveChunkSize = Get-UploadChunkSize -Sid $sid -Requested $ChunkSize
-    $chunks = @(Split-StringFixed -Value $encoded -Size $effectiveChunkSize)
-    Write-Log -Level 'INFO' -Message "Prepared $($chunks.Count) DNS chunks."
+        $initArgs = @($sid, [string]$chunkCount, [string]($effectiveChunkSize), $encoding) + $filenameLabels
+        $initName = New-AuthenticatedName -Command 'uinit' -Args $initArgs
+        if ($initName.Length -gt 253) { throw "DNS upload init name is $($initName.Length) characters (limit 253). Use a shorter filename or domain." }
+        $initResponse = Invoke-TxtQueryOne -Name $initName
+        if ($initResponse -ne 'Ready to file uploading') { throw "Upload initialization failed: $initResponse" }
 
-    $initArgs = @($sid, [string]($chunks.Count), [string]($effectiveChunkSize), $encoding) + $filenameLabels
-    $initName = New-AuthenticatedName -Command 'uinit' -Args $initArgs
-    if ($initName.Length -gt 253) {
-        throw "DNS upload init name is $($initName.Length) characters (limit 253). Use a shorter filename or domain."
-    }
-    $initResponse = Invoke-TxtQueryOne -Name $initName
-    if ($initResponse -ne 'Ready to file uploading') {
-        throw "Upload initialization failed: $initResponse"
-    }
-
-    $uploadStart = Get-Date
-    [int]$chunkIndex = 0
-    while ($true) {
-        if ($chunkIndex -eq -1) {
-            break
-        }
-        if ($chunkIndex -lt 0) {
-            throw "Server signaled upload failure with code $chunkIndex."
-        }
-        if ($chunkIndex -ge $chunks.Count) {
-            throw "Server requested chunk $chunkIndex outside prepared range."
-        }
-
-        $safeChunk = ConvertTo-DnsSafeChunk -Chunk $chunks[$chunkIndex] -Encoding $encoding
-        $labels = @(Split-StringFixed -Value $safeChunk -Size 63)
-        $request = New-AuthenticatedName -Command 'u' -Args (@($sid, [string]($chunkIndex)) + $labels)
-        if ($request.Length -gt 253) {
-            throw "DNS query name for chunk $chunkIndex is $($request.Length) characters (limit 253). Reduce -ChunkSize or use a shorter domain."
-        }
-        $response = Invoke-TxtQueryOne -Name $request
-
-        [int]$nextIndex = 0
-        if (-not [int]::TryParse($response, [ref]$nextIndex)) {
-            throw "Server returned an upload error: $response"
-        }
-        $chunkIndex = $nextIndex
-        $completed = if ($chunkIndex -lt 0) { $chunks.Count } else { $chunkIndex }
-        $percent = [Math]::Min(100, [Math]::Round(($completed / $chunks.Count) * 100, 1))
-        $elapsed = ((Get-Date) - $uploadStart).TotalSeconds
-        $status = "$completed of $($chunks.Count) chunks"
-        if ($elapsed -gt 0.5 -and $completed -gt 0) {
-            $bps = $completed * $effectiveChunkSize / $elapsed
-            $status += '  ' + (Format-TransferRate -BytesPerSecond $bps)
-            if ($completed -lt $chunks.Count -and $bps -gt 0) {
-                $remSec = [int][Math]::Round(($chunks.Count - $completed) * $effectiveChunkSize / $bps)
-                $status += '  ETA ' + (Format-ETA -Seconds $remSec)
+        $spool = [System.IO.File]::OpenRead($spoolPath)
+        $uploadStart = Get-Date
+        [int]$chunkIndex = 0
+        while ($true) {
+            if ($chunkIndex -eq -1) { break }
+            if ($chunkIndex -lt 0) { throw "Server signaled upload failure with code $chunkIndex." }
+            if ($chunkIndex -ge $chunkCount) { throw "Server requested chunk $chunkIndex outside prepared range." }
+            [int64]$offset = [int64]$chunkIndex * $effectiveChunkSize
+            [int]$want = [int][Math]::Min($effectiveChunkSize, $encodedSize - $offset)
+            [byte[]]$buffer = New-Object byte[] $want
+            $spool.Position = $offset
+            [int]$read = 0
+            while ($read -lt $want) {
+                $n = $spool.Read($buffer, $read, $want - $read)
+                if ($n -le 0) { throw "Unexpected end of upload spool at chunk $chunkIndex." }
+                $read += $n
             }
+            $safeChunk = ConvertTo-DnsSafeChunk -Chunk ([System.Text.Encoding]::ASCII.GetString($buffer)) -Encoding $encoding
+            $labels = @(Split-StringFixed -Value $safeChunk -Size 63)
+            $request = New-AuthenticatedName -Command 'u' -Args (@($sid, [string]($chunkIndex)) + $labels)
+            if ($request.Length -gt 253) { throw "DNS query name for chunk $chunkIndex is $($request.Length) characters (limit 253). Reduce -ChunkSize or use a shorter domain." }
+            $response = Invoke-TxtQueryOne -Name $request
+            [int]$nextIndex = 0
+            if (-not [int]::TryParse($response, [ref]$nextIndex)) { throw "Server returned an upload error: $response" }
+            $chunkIndex = $nextIndex
+            $completed = if ($chunkIndex -lt 0) { $chunkCount } else { $chunkIndex }
+            $elapsed = ((Get-Date) - $uploadStart).TotalSeconds
+            $status = "$completed of $chunkCount chunks"
+            if ($elapsed -gt 0.5 -and $completed -gt 0) { $status += '  ' + (Format-TransferRate -BytesPerSecond ($completed * $effectiveChunkSize / $elapsed)) }
+            Write-Progress -Activity 'Uploading file' -Status $status -PercentComplete ([Math]::Min(100, [Math]::Round(($completed / $chunkCount) * 100, 1)))
         }
-        Write-Progress -Activity 'Uploading file' -Status $status -PercentComplete $percent
+        Write-Progress -Activity 'Uploading file' -Completed
+        Write-Log -Level 'INFO' -Message 'Upload completed.'
     }
-    Write-Progress -Activity 'Uploading file' -Completed
-    Write-Log -Level 'INFO' -Message 'Upload completed.'
+    finally {
+        if ($null -ne $spool) { $spool.Dispose() }
+        if ([System.IO.File]::Exists($spoolPath)) { Remove-Item -LiteralPath $spoolPath -Force }
+    }
 }
 
 function Invoke-Download {
@@ -1234,84 +1614,78 @@ function Invoke-Download {
     if (-not [int]::TryParse($chunkCountText, [ref]$chunkCount) -or $chunkCount -le 0) {
         throw "Download initialization failed: $chunkCountText"
     }
+    $metaText = Invoke-TxtQueryOne -Name (New-AuthenticatedName -Command 'dmeta' -Args @($sid))
+    $meta = $metaText.Split('|')
+    if ($meta.Count -ne 3) { throw "Download metadata is malformed: $metaText" }
+    [int]$metaChunks = 0; [int64]$encodedSize = 0
+    if (-not [int]::TryParse($meta[0], [ref]$metaChunks) -or $metaChunks -ne $chunkCount) { throw "Download metadata chunk count mismatch." }
+    if ($meta[1] -notmatch '^[a-fA-F0-9]{64}$') { throw 'Download metadata digest is malformed.' }
+    if (-not [int64]::TryParse($meta[2], [ref]$encodedSize) -or $encodedSize -le 0) { throw 'Download metadata encoded size is malformed.' }
+    [int64]$maxEncoded = if ($MaxDownloadBytes -gt [int64]::MaxValue / 2) { [int64]::MaxValue } else { $MaxDownloadBytes * 2 }
+    if ($encodedSize -gt $maxEncoded) { throw "Encoded download exceeds $MaxDownloadBytes byte limit." }
+    [int64]$expectedChunks = [int64][Math]::Ceiling($encodedSize / 254.0)
+    if ($expectedChunks -ne $chunkCount) { throw 'Download metadata size does not match chunk count.' }
     Write-Log -Level 'INFO' -Message "Downloading $Filename in $chunkCount chunks."
 
-    $chunkPattern = '^[A-Za-z0-9+/=]+$'
-    $builder = [System.Text.StringBuilder]::new($chunkCount * 254)
+    $spoolPath = Join-Path ([System.IO.Path]::GetTempPath()) ("gdns2tcp-download-" + [guid]::NewGuid().ToString('N') + '.b64')
+    $tempOutput = Join-Path ([System.IO.Path]::GetDirectoryName($outputPath)) ('.gdns2tcp-output-' + [guid]::NewGuid().ToString('N'))
     $parallelDone = $false
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($DnsServer)) {
+            try {
+                Import-DownloadCSharp
+                $proto = if ($Tcp) { 'TCP' } else { 'UDP' }
+                Write-Log -Level 'INFO' -Message "Downloading to a disk spool over $proto (up to $Parallelism concurrent, $BatchSize chunks per query)."
+                $dlStart = Get-Date
+                $task = [Gdns2TcpDownload]::BeginDownloadChunksToSpool(
+                    $Pass, $script:DomainName, $sid, $chunkCount, $encodedSize, $spoolPath,
+                    $DnsServer, $DnsPort, 5000, $Retries, ($RetryDelaySeconds * 1000), $Parallelism, $Tcp.IsPresent, $BatchSize
+                )
+                while (-not $task.IsCompleted) {
+                    $done = [Gdns2TcpDownload]::CompletedChunks
+                    $elapsed = ((Get-Date) - $dlStart).TotalSeconds
+                    $percent = [Math]::Min(100, [Math]::Round(($done / $chunkCount) * 100, 1))
+                    $status = "$done of $chunkCount chunks"
+                    if ($elapsed -gt 0.5 -and $done -gt 0) { $status += '  ' + (Format-TransferRate -BytesPerSecond ($done * 254 / $elapsed)) }
+                    Write-Progress -Activity 'Downloading file' -Status $status -PercentComplete $percent
+                    Start-Sleep -Milliseconds 250
+                }
+                $task.GetAwaiter().GetResult()
+                Write-Progress -Activity 'Downloading file' -Completed
+                $parallelDone = $true
+            }
+            catch { Write-Log -Level 'WARN' -Message "Parallel download failed, retrying sequentially: $_" }
+        }
 
-    if (-not [string]::IsNullOrWhiteSpace($DnsServer)) {
-        try {
-            Import-DownloadCSharp
-            $proto = if ($Tcp) { 'TCP' } else { 'UDP' }
-            Write-Log -Level 'INFO' -Message "Downloading $chunkCount chunks in parallel over $proto (up to $Parallelism concurrent, $BatchSize chunks per query)."
-            $dlStart = Get-Date
-            $task = [Gdns2TcpDownload]::BeginDownloadChunks(
-                $Pass, $script:DomainName, $sid, $chunkCount,
-                $DnsServer, $DnsPort, 5000,
-                $Retries, ($RetryDelaySeconds * 1000), $Parallelism, $Tcp.IsPresent, $BatchSize
-            )
-            while (-not $task.IsCompleted) {
-                $done = [Gdns2TcpDownload]::CompletedChunks
-                $elapsed = ((Get-Date) - $dlStart).TotalSeconds
-                $percent = [Math]::Min(100, [Math]::Round(($done / $chunkCount) * 100, 1))
-                $status = "$done of $chunkCount chunks"
-                if ($elapsed -gt 0.5 -and $done -gt 0) {
-                    $bps = $done * 254 / $elapsed
-                    $status += '  ' + (Format-TransferRate -BytesPerSecond $bps)
-                    if ($done -lt $chunkCount -and $bps -gt 0) {
-                        $remSec = [int][Math]::Round(($chunkCount - $done) * 254 / $bps)
-                        $status += '  ETA ' + (Format-ETA -Seconds $remSec)
-                    }
+        if (-not $parallelDone) {
+            $stream = [System.IO.FileStream]::new($spoolPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+            try {
+                $stream.SetLength($encodedSize)
+                $downloadStart = Get-Date
+                for ($i = 0; $i -lt $chunkCount; $i++) {
+                    $chunk = Invoke-TxtQueryOne -Name (New-AuthenticatedName -Command 'd' -Args @($sid, [string]($i)))
+                    [int64]$offset = [int64]$i * 254
+                    [int]$want = [int][Math]::Min(254, $encodedSize - $offset)
+                    if ($chunk.Length -ne $want -or $chunk -match '\s' -or $chunk -notmatch '^[A-Za-z0-9+/=]+$') { throw "Server returned invalid chunk ${i}." }
+                    [byte[]]$bytes = [System.Text.Encoding]::ASCII.GetBytes($chunk)
+                    $stream.Position = $offset; $stream.Write($bytes, 0, $bytes.Length)
+                    $elapsed = ((Get-Date) - $downloadStart).TotalSeconds
+                    Write-Progress -Activity 'Downloading file' -Status "$($i + 1) of $chunkCount chunks" -PercentComplete ([Math]::Round((($i + 1) / $chunkCount) * 100, 1))
                 }
-                Write-Progress -Activity 'Downloading file' -Status $status -PercentComplete $percent
-                Start-Sleep -Milliseconds 250
             }
-            [string[]]$batchResults = $task.Result
-            for ($i = 0; $i -lt $batchResults.Length; $i++) {
-                $batch = $batchResults[$i]
-                if ($batch -match '\s' -or $batch -notmatch $chunkPattern) {
-                    throw ("Server returned an error for batch starting at chunk {0}: {1}" -f ($i * $BatchSize), $batch)
-                }
-                [void]$builder.Append($batch)
-            }
-            Write-Progress -Activity 'Downloading file' -Completed
-            $parallelDone = $true
+            finally { $stream.Dispose(); Write-Progress -Activity 'Downloading file' -Completed }
         }
-        catch {
-            Write-Log -Level 'WARN' -Message "Parallel download failed, retrying sequentially: $_"
-            $builder = [System.Text.StringBuilder]::new($chunkCount * 254)
-        }
+
+        Import-DownloadCSharp
+        [Gdns2TcpDownload]::DecodeSpoolToOutput($spoolPath, $Pass, $tempOutput, $MaxDownloadBytes)
+        if ((Get-FileHash -LiteralPath $tempOutput -Algorithm SHA256).Hash.ToLowerInvariant() -ne $meta[1].ToLowerInvariant()) { throw 'Download source digest mismatch.' }
+        [System.IO.File]::Move($tempOutput, $outputPath)
+        Write-Log -Level 'INFO' -Message "Download written to $outputPath."
     }
-
-    if (-not $parallelDone) {
-        $downloadStart = Get-Date
-        for ($i = 0; $i -lt $chunkCount; $i++) {
-            $chunk = Invoke-TxtQueryOne -Name (New-AuthenticatedName -Command 'd' -Args @($sid, [string]($i)))
-            if ($chunk -match '\s' -or $chunk -notmatch $chunkPattern) {
-                throw "Server returned an error for chunk ${i}: $chunk"
-            }
-            [void]$builder.Append($chunk)
-            $elapsed = ((Get-Date) - $downloadStart).TotalSeconds
-            $percent = [Math]::Round((($i + 1) / $chunkCount) * 100, 1)
-            $status = "$($i + 1) of $chunkCount chunks"
-            if ($elapsed -gt 0.5 -and $i -gt 0) {
-                $bps = ($i + 1) * 254 / $elapsed
-                $status += '  ' + (Format-TransferRate -BytesPerSecond $bps)
-                if ($bps -gt 0) {
-                    $remSec = [int][Math]::Round(($chunkCount - $i - 1) * 254 / $bps)
-                    $status += '  ETA ' + (Format-ETA -Seconds $remSec)
-                }
-            }
-            Write-Progress -Activity 'Downloading file' -Status $status -PercentComplete $percent
-        }
-        Write-Progress -Activity 'Downloading file' -Completed
+    finally {
+        if ([System.IO.File]::Exists($spoolPath)) { Remove-Item -LiteralPath $spoolPath -Force }
+        if ([System.IO.File]::Exists($tempOutput)) { Remove-Item -LiteralPath $tempOutput -Force }
     }
-
-    [byte[]]$protected = ConvertFrom-WireEncoding -Text $builder.ToString() -Encoding 'base64'
-    [byte[]]$compressed = Unprotect-Bytes -Secret $Pass -Protected $protected
-    Expand-GzipBytes -Bytes $compressed -Path $outputPath -LimitBytes $MaxDownloadBytes
-    Write-Log -Level 'INFO' -Message "Download written to $outputPath."
 }
 
 try {

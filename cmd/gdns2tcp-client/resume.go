@@ -6,46 +6,56 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
+	"sort"
+	"sync"
+	"time"
 )
 
-// resumeCache persists already-fetched download batches on disk so an
-// interrupted download can pick up where it left off. It is layered above the
-// existing chunk protocol: the server is told to re-prepare the file via
-// `dinit` on every run; the cache only short-circuits the per-batch DNS
-// queries for batches whose base64 payload is already on disk.
+// resumeCache keeps a single preallocated encoded spool plus a compact bitmap
+// of completed DNS batches.  The old one-file-per-batch scheme created tens
+// of thousands of files for a moderately sized download and also rebuilt the
+// full payload in RAM before decrypting it.
 type resumeCache struct {
-	dir     string
-	enabled bool
+	dir      string
+	enabled  bool
+	lockPath string
+	lock     *resumeFileLock
+
+	mu         sync.Mutex
+	spool      *os.File
+	spoolPath  string
+	bitmapPath string
+	bitmap     []byte
+	meta       resumeMeta
+}
+
+type resumeCacheDir struct {
+	path     string
+	bytes    int64
+	modified time.Time
 }
 
 type resumeMeta struct {
 	ChunkCount   int    `json:"chunk_count"`
 	BatchSize    int    `json:"batch_size"`
+	BatchCount   int    `json:"batch_count"`
+	EncodedSize  int64  `json:"encoded_size"`
 	SourceSHA256 string `json:"source_sha256"`
 }
 
-// newResumeCache returns a cache scoped to the (domain, filename) pair. When
-// enabled is false (or no cache root is available), the returned cache
-// silently no-ops: callers do not need to special-case the disabled path.
 func newResumeCache(root, domain, filename string, enabled bool) *resumeCache {
 	if !enabled || root == "" {
 		return &resumeCache{enabled: false}
 	}
 	sum := sha256.Sum256([]byte(domain + "|" + filename))
 	id := hex.EncodeToString(sum[:])[:16]
-	return &resumeCache{
-		dir:     filepath.Join(root, id),
-		enabled: true,
-	}
+	dir := filepath.Join(root, id)
+	return &resumeCache{dir: dir, lockPath: dir + ".lock", enabled: true}
 }
 
-// defaultResumeRoot returns <UserCacheDir>/gdns2tcp or "" if the OS does not
-// expose a per-user cache directory (rare; e.g. unset $HOME inside a
-// container). An empty return value disables the cache cleanly.
 func defaultResumeRoot() string {
 	base, err := os.UserCacheDir()
 	if err != nil || base == "" {
@@ -54,108 +64,313 @@ func defaultResumeRoot() string {
 	return filepath.Join(base, "gdns2tcp")
 }
 
-// loadCompleted returns the map of batchIdx → base64 payload for batches
-// already present on disk. If meta.json's recorded shape or source digest does
-// not match the current dinit/dmeta, the entire cache directory is wiped and an
-// empty map is returned so the download proceeds from scratch.
-func (c *resumeCache) loadCompleted(chunkCount, batchSize int, sourceSHA256 string) (map[int]string, error) {
-	if !c.enabled {
-		return map[int]string{}, nil
-	}
-	if sourceSHA256 == "" {
-		_ = os.RemoveAll(c.dir)
-		return map[int]string{}, nil
-	}
-	metaPath := filepath.Join(c.dir, "meta.json")
-	raw, err := os.ReadFile(metaPath)
-	if errors.Is(err, os.ErrNotExist) {
-		// No meta yet — either fresh start or interrupted before meta wrote.
-		// Either way, ignore any stray batch-* files for safety.
-		_ = os.RemoveAll(c.dir)
-		return map[int]string{}, nil
-	}
-	if err != nil {
-		return map[int]string{}, nil
-	}
-	var meta resumeMeta
-	if err := json.Unmarshal(raw, &meta); err != nil {
-		_ = os.RemoveAll(c.dir)
-		return map[int]string{}, nil
-	}
-	if meta.ChunkCount != chunkCount || meta.BatchSize != batchSize || meta.SourceSHA256 != sourceSHA256 {
-		_ = os.RemoveAll(c.dir)
-		return map[int]string{}, nil
-	}
+// pruneResumeCache keeps abandoned resumable transfers from slowly filling a
+// user's cache.  Only direct children of root are considered, so a malformed
+// or unrelated path can never make this routine walk outside gdns2tcp's own
+// cache namespace.  Active transfers touch their directory on open and are
+// therefore retained unless the quota cannot be met otherwise.
+func pruneResumeCache(root string, maxBytes int64, ttl time.Duration) error {
+	return pruneResumeCacheFor(root, maxBytes, ttl, 0, "")
+}
 
-	entries, err := os.ReadDir(c.dir)
-	if err != nil {
-		return map[int]string{}, nil
+func pruneResumeCacheFor(root string, maxBytes int64, ttl time.Duration, reserveBytes int64, preserve string) error {
+	if root == "" || maxBytes <= 0 || ttl <= 0 {
+		return nil
 	}
-	batchRE := regexp.MustCompile(`^batch-(\d+)$`)
-	completed := make(map[int]string, len(entries))
-	for _, e := range entries {
-		m := batchRE.FindStringSubmatch(e.Name())
-		if m == nil {
+	if reserveBytes > maxBytes {
+		return fmt.Errorf("resume entry needs %d bytes, cache quota is %d", reserveBytes, maxBytes)
+	}
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	var total int64
+	var preserveBytes int64
+	dirs := make([]resumeCacheDir, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
 			continue
 		}
-		idx, err := strconv.Atoi(m[1])
+		path := filepath.Join(root, entry.Name())
+		bytes, modified, sizeErr := resumeDirStats(path)
+		if sizeErr != nil {
+			continue
+		}
+		if path != preserve && now.Sub(modified) > ttl {
+			if removeResumeCacheDir(path) {
+				continue
+			}
+		}
+		if path == preserve {
+			preserveBytes = bytes
+		}
+		total += bytes
+		dirs = append(dirs, resumeCacheDir{path: path, bytes: bytes, modified: modified})
+	}
+	if reserveBytes > preserveBytes {
+		total += reserveBytes - preserveBytes
+	}
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].modified.Before(dirs[j].modified) })
+	for _, entry := range dirs {
+		if total <= maxBytes {
+			break
+		}
+		if entry.path == preserve {
+			continue
+		}
+		if removeResumeCacheDir(entry.path) {
+			total -= entry.bytes
+		}
+	}
+	if total > maxBytes {
+		return fmt.Errorf("resume cache quota unavailable: need %d bytes, limit %d", total, maxBytes)
+	}
+	return nil
+}
+
+func removeResumeCacheDir(path string) bool {
+	lock, err := acquireResumeFileLock(path+".lock", true)
+	if err != nil {
+		return false
+	}
+	defer lock.release()
+	return os.RemoveAll(path) == nil
+}
+
+func resumeDirStats(root string) (int64, time.Time, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	bytes := int64(0)
+	modified := info.ModTime()
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		fileInfo, err := entry.Info()
 		if err != nil {
-			continue
+			return err
 		}
-		data, err := os.ReadFile(filepath.Join(c.dir, e.Name()))
-		if err != nil {
-			continue
+		bytes += fileInfo.Size()
+		if fileInfo.ModTime().After(modified) {
+			modified = fileInfo.ModTime()
 		}
-		completed[idx] = string(data)
+		return nil
+	})
+	return bytes, modified, err
+}
+
+// open validates/reuses a previous spool or atomically creates a fresh one.
+// It returns the completed batch indexes represented in the bitmap.
+func (c *resumeCache) open(chunkCount, batchSize int, sourceSHA256 string, encodedSize int64) (map[int]struct{}, error) {
+	completed := make(map[int]struct{})
+	if !c.enabled {
+		return completed, nil
+	}
+	if chunkCount <= 0 || batchSize <= 0 || sourceSHA256 == "" || encodedSize <= 0 {
+		return nil, errors.New("invalid resume metadata")
+	}
+	if err := c.acquireLock(); err != nil {
+		return nil, err
+	}
+	batchCount := (chunkCount + batchSize - 1) / batchSize
+	want := resumeMeta{ChunkCount: chunkCount, BatchSize: batchSize, BatchCount: batchCount, EncodedSize: encodedSize, SourceSHA256: sourceSHA256}
+	if err := os.MkdirAll(c.dir, 0o700); err != nil {
+		return nil, err
+	}
+	c.spoolPath = filepath.Join(c.dir, "payload.b64")
+	c.bitmapPath = filepath.Join(c.dir, "batches.bitmap")
+	metaPath := filepath.Join(c.dir, "meta.json")
+
+	valid := false
+	if raw, err := os.ReadFile(metaPath); err == nil {
+		var current resumeMeta
+		if json.Unmarshal(raw, &current) == nil && current == want {
+			if info, statErr := os.Stat(c.spoolPath); statErr == nil && info.Size() == encodedSize {
+				if bitmap, readErr := os.ReadFile(c.bitmapPath); readErr == nil && len(bitmap) == bitmapBytes(batchCount) {
+					c.bitmap = bitmap
+					valid = true
+				}
+			}
+		}
+	}
+	if !valid {
+		if err := c.clearFiles(); err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(c.dir, 0o700); err != nil {
+			return nil, err
+		}
+		c.bitmap = make([]byte, bitmapBytes(batchCount))
+		if err := writeFileAtomic(metaPath, mustJSON(want)); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(c.bitmapPath, c.bitmap, 0o600); err != nil {
+			return nil, err
+		}
+	}
+	f, err := os.OpenFile(c.spoolPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if !valid {
+		if err := f.Truncate(encodedSize); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	}
+	c.spool = f
+	c.meta = want
+	_ = os.Chtimes(c.dir, time.Now(), time.Now())
+	for batch := 0; batch < batchCount; batch++ {
+		if c.completedLocked(batch) {
+			completed[batch] = struct{}{}
+		}
 	}
 	return completed, nil
 }
 
-// saveMeta writes the meta.json file describing the current download's shape.
-// Called once at the start of a run after chunkCount, batchSize, and source
-// digest are known.
-func (c *resumeCache) saveMeta(chunkCount, batchSize int, sourceSHA256 string) error {
+func mustJSON(meta resumeMeta) []byte {
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+func bitmapBytes(batchCount int) int { return (batchCount + 7) / 8 }
+
+func (c *resumeCache) completedLocked(batch int) bool {
+	return batch >= 0 && batch/8 < len(c.bitmap) && c.bitmap[batch/8]&(1<<uint(batch%8)) != 0
+}
+
+func (c *resumeCache) expectedBatchLength(batch, from, count int) (int, error) {
+	if batch < 0 || batch >= c.meta.BatchCount || from < 0 || count <= 0 {
+		return 0, errors.New("invalid batch")
+	}
+	offset := int64(from) * int64(codecTXTChunkSize)
+	if offset < 0 || offset >= c.meta.EncodedSize {
+		return 0, errors.New("batch offset out of range")
+	}
+	length := int64(count) * int64(codecTXTChunkSize)
+	if remaining := c.meta.EncodedSize - offset; remaining < length {
+		length = remaining
+	}
+	if length <= 0 || length > int64(^uint(0)>>1) {
+		return 0, errors.New("batch length out of range")
+	}
+	return int(length), nil
+}
+
+// codecTXTChunkSize avoids importing internal/codec in this persistence-only
+// file just to use a protocol constant.  It is kept equal to codec.TXTChunkSize.
+const codecTXTChunkSize = 254
+
+func (c *resumeCache) saveBatch(batch, from, count int, data string) error {
 	if !c.enabled {
 		return nil
 	}
-	if sourceSHA256 == "" {
-		return nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.spool == nil {
+		return errors.New("resume spool is not open")
 	}
-	if err := os.MkdirAll(c.dir, 0o700); err != nil {
-		return fmt.Errorf("create resume cache: %w", err)
-	}
-	raw, err := json.Marshal(resumeMeta{ChunkCount: chunkCount, BatchSize: batchSize, SourceSHA256: sourceSHA256})
+	want, err := c.expectedBatchLength(batch, from, count)
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(filepath.Join(c.dir, "meta.json"), raw)
+	if len(data) != want {
+		return fmt.Errorf("batch %d length %d, want %d", batch, len(data), want)
+	}
+	offset := int64(from) * int64(codecTXTChunkSize)
+	if err := writeAtAll(c.spool, []byte(data), offset); err != nil {
+		return err
+	}
+	c.bitmap[batch/8] |= 1 << uint(batch%8)
+	if err := writeAtAllFile(c.bitmapPath, c.bitmap[batch/8:batch/8+1], int64(batch/8)); err != nil {
+		return err
+	}
+	return nil
 }
 
-// saveBatch atomically persists the base64 payload for one completed batch.
-// Safe to call concurrently from multiple goroutines for different k values.
-func (c *resumeCache) saveBatch(k int, data string) error {
+func (c *resumeCache) sync() error {
+	if !c.enabled || c.spool == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.spool.Sync()
+}
+
+func (c *resumeCache) path() string { return c.spoolPath }
+
+func (c *resumeCache) close() error {
+	err := c.closeSpool()
+	lockErr := c.releaseLock()
+	if err != nil {
+		return err
+	}
+	return lockErr
+}
+
+func (c *resumeCache) closeSpool() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.spool == nil {
+		return nil
+	}
+	err := c.spool.Close()
+	c.spool = nil
+	return err
+}
+
+func (c *resumeCache) acquireLock() error {
+	if !c.enabled || c.lock != nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(c.dir), 0o700); err != nil {
+		return err
+	}
+	lock, err := acquireResumeFileLock(c.lockPath, false)
+	if err != nil {
+		return fmt.Errorf("lock resume cache: %w", err)
+	}
+	c.lock = lock
+	return nil
+}
+
+func (c *resumeCache) releaseLock() error {
+	if c.lock == nil {
+		return nil
+	}
+	err := c.lock.release()
+	c.lock = nil
+	return err
+}
+
+func (c *resumeCache) clear() error {
+	_ = c.closeSpool()
 	if !c.enabled {
 		return nil
 	}
-	if err := os.MkdirAll(c.dir, 0o700); err != nil {
-		return err
-	}
-	name := fmt.Sprintf("batch-%06d", k)
-	return writeFileAtomic(filepath.Join(c.dir, name), []byte(data))
+	return c.clearFiles()
 }
 
-// clear removes the cache directory entirely. Called after a successful
-// end-to-end download so completed transfers leave no residue.
-func (c *resumeCache) clear() error {
-	if !c.enabled {
+func (c *resumeCache) clearFiles() error {
+	if c.dir == "" {
 		return nil
 	}
 	return os.RemoveAll(c.dir)
 }
 
-// writeFileAtomic writes data via a temp file in the same directory and then
-// renames it into place. Eliminates the half-written-file class of bugs if the
-// process is killed mid-write.
 func writeFileAtomic(path string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -172,4 +387,32 @@ func writeFileAtomic(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+func writeAtAll(f *os.File, data []byte, offset int64) error {
+	for len(data) > 0 {
+		n, err := f.WriteAt(data, offset)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+		offset += int64(n)
+	}
+	return nil
+}
+
+func writeAtAllFile(path string, data []byte, offset int64) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	err = writeAtAll(f, data, offset)
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
 }

@@ -412,6 +412,7 @@ func assembleAxchgQueryLen(domain string, tcp bool, raw int) int {
 		cidLen     = 16
 		seqMaxLen  = 8 // hex chars, capped at uint32 in practice
 		nonceLen   = 8
+		ackLen     = 10 // a- + 8 hex chars
 		smacLen    = 7
 		cmdLen     = 5 // "axchg"
 		labelLimit = 63
@@ -420,13 +421,13 @@ func assembleAxchgQueryLen(domain string, tcp bool, raw int) int {
 	// base32 (no padding) expansion: ceil(8/5).
 	encChars := (sealedBytes*8 + 4) / 5
 	dataLabels := (encChars + labelLimit - 1) / labelLimit
-	total := cidLen + seqMaxLen + encChars + nonceLen + smacLen + cmdLen + len(domain)
+	total := cidLen + seqMaxLen + encChars + ackLen + nonceLen + smacLen + cmdLen + len(domain)
 	if tcp {
 		total += len(gproxy.AxchgTCPMarker)
 	}
 	// Dots: between every adjacent label. Labels = 2 (cid,seq) + dataLabels
-	// + (1 if tcp) + 3 (nonce, smac, axchg) + 1 (domain).
-	labels := 2 + dataLabels + 3 + 1
+	// + (1 if tcp) + 4 (ack, nonce, smac, axchg) + 1 (domain).
+	labels := 2 + dataLabels + 4 + 1
 	if tcp {
 		labels++
 	}

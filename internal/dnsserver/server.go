@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -25,18 +26,24 @@ import (
 
 const (
 	DefaultMaxUploadBytes   = 32 << 20
-	DefaultMaxDownloadBytes = 32 << 20
+	DefaultMaxDownloadBytes = 256 << 20
+	DefaultCacheMaxBytes    = 1 << 30
+	DefaultCacheTTL         = 24 * time.Hour
 	// clientChunkSize is the base64 chunk length used when serving downloadable
 	// client artifacts over DNS. 254 fills a single DNS TXT character-string
 	// (max 255 bytes) with one byte of safety margin. Independent from the
 	// client's upload chunking.
-	clientChunkSize         = 254
-	maxClientTransferState  = 1024
-	maxTransferChunks       = 1_000_000
-	maxDownloadCacheEntries = 16
-	maxDownloadBatch        = 32
-	transferTTL             = 10 * time.Minute
-	authFailedResponse      = "Authentication failed."
+	clientChunkSize        = 254
+	maxClientTransferState = 1024
+	// A 256 MiB incompressible download expands to roughly 358 MiB after
+	// gzip/GDT2/base64, or about 1.41 million 254-byte TXT chunks.  Keep the
+	// guard above that real worst case; transfer state is now disk-backed, so
+	// this no longer implies a multi-million-element in-memory payload.
+	maxTransferChunks  = 2_000_000
+	maxDownloadBatch   = 32
+	transferTTL        = 10 * time.Minute
+	clientTransferTTL  = 10 * time.Minute
+	authFailedResponse = "Authentication failed."
 )
 
 var dnsToBase64 = strings.NewReplacer("_", "+", "-", "/")
@@ -54,6 +61,9 @@ type Config struct {
 	ProxyMaxConn        int
 	ProxyBufBytes       int
 	ProxyWatchdogWindow time.Duration
+	CacheDir            string
+	CacheMaxBytes       int64
+	CacheTTL            time.Duration
 	Logger              *log.Logger
 }
 
@@ -80,19 +90,30 @@ type Server struct {
 	allowList        bool
 	maxUploadBytes   int64
 	maxDownloadBytes int64
+	cacheDir         string
+	cacheMaxBytes    int64
+	cacheTTL         time.Duration
 	allowProxy       bool
 	socksNoAuth      bool
 	logger           *log.Logger
 
-	mu        sync.Mutex
-	downloads map[string]downloadState
-	uploads   map[string]uploadState
+	mu               sync.Mutex
+	downloads        map[string]downloadState
+	uploads          map[string]uploadState
+	uploadTombstones map[string]uploadTombstone
 
-	downloadCache      map[string]downloadCacheEntry
-	downloadCacheOrder []string // FIFO insertion order for bounded eviction
-	clientArtifacts    map[string]clientArtifact
-	clientTransfers    map[string]clientTransfer
-	reverse            *reverseState
+	downloadCache         map[string]downloadCacheEntry
+	downloadCacheOrder    []string // LRU, oldest first
+	downloadCacheBytes    int64
+	downloadCacheReserved int64
+	downloadCacheBuilds   map[string]*downloadCacheBuild
+	clientArtifacts       map[string]clientArtifact
+	clientTransfers       map[string]clientTransfer
+	reverse               *reverseState
+
+	janitorStop  chan struct{}
+	janitorDone  chan struct{}
+	shutdownOnce sync.Once
 }
 
 type clientArtifact struct {
@@ -102,34 +123,59 @@ type clientArtifact struct {
 }
 
 type clientTransfer struct {
-	seen       map[int]struct{}
+	seen       []byte
+	seenCount  int
 	lastBucket int
+	lastSeen   time.Time
 }
 
 type downloadState struct {
 	filename     string
-	chunks       []string
+	cacheKey     string
+	chunkCount   int
+	encodedSize  int64
 	sourceSHA256 string
 	expires      time.Time
 }
 
 type downloadCacheEntry struct {
-	chunks []string
-	mtime  time.Time
-	size   int64
-	sha256 string
+	spoolPath    string
+	metaPath     string
+	mtime        time.Time
+	size         int64
+	sha256       string
+	encodedSize  int64
+	chunkCount   int
+	lastAccess   time.Time
+	expires      time.Time
+	lastMetaSave time.Time
+	active       int
+}
+
+type downloadCacheBuild struct {
+	done chan struct{}
+	key  string
+	err  error
 }
 
 type uploadState struct {
-	file      *os.File
-	filename  string
-	path      string
-	encoded   *strings.Builder
-	total     int
-	chunkSize int
-	encoding  string
-	nextIndex int
-	expires   time.Time
+	spool       *os.File
+	filename    string
+	path        string
+	spoolPath   string
+	fingerprint string
+	total       int
+	chunkSize   int
+	encoding    string
+	nextIndex   int
+	expires     time.Time
+}
+
+type uploadTombstone struct {
+	fingerprint string
+	finalIndex  int
+	result      string
+	expires     time.Time
 }
 
 func New(cfg Config) (*Server, error) {
@@ -161,28 +207,59 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxDownloadBytes <= 0 {
 		cfg.MaxDownloadBytes = DefaultMaxDownloadBytes
 	}
+	cacheDir := strings.TrimSpace(cfg.CacheDir)
+	if cacheDir == "" {
+		cacheDir = filepath.Join(absDataDir, ".gdns2tcp-cache")
+	}
+	cacheDir, err = filepath.Abs(cacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve cache dir: %w", err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create cache dir: %w", err)
+	}
+	if cfg.CacheMaxBytes <= 0 {
+		cfg.CacheMaxBytes = DefaultCacheMaxBytes
+	}
+	if cfg.CacheTTL <= 0 {
+		cfg.CacheTTL = DefaultCacheTTL
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.Default()
 	}
 
 	server := &Server{
-		domain:           domain,
-		domains:          domains,
-		authDomain:       protocol.AuthDomain(domain),
-		secret:           cfg.Secret,
-		dataDir:          absDataDir,
-		allowList:        cfg.AllowList,
-		maxUploadBytes:   cfg.MaxUploadBytes,
-		maxDownloadBytes: cfg.MaxDownloadBytes,
-		allowProxy:       cfg.AllowProxy,
-		socksNoAuth:      cfg.SocksNoAuth,
-		logger:           logger,
-		downloads:        make(map[string]downloadState),
-		uploads:          make(map[string]uploadState),
-		downloadCache:    make(map[string]downloadCacheEntry),
-		clientArtifacts:  make(map[string]clientArtifact),
-		clientTransfers:  make(map[string]clientTransfer),
+		domain:              domain,
+		domains:             domains,
+		authDomain:          protocol.AuthDomain(domain),
+		secret:              cfg.Secret,
+		dataDir:             absDataDir,
+		allowList:           cfg.AllowList,
+		maxUploadBytes:      cfg.MaxUploadBytes,
+		maxDownloadBytes:    cfg.MaxDownloadBytes,
+		cacheDir:            cacheDir,
+		cacheMaxBytes:       cfg.CacheMaxBytes,
+		cacheTTL:            cfg.CacheTTL,
+		allowProxy:          cfg.AllowProxy,
+		socksNoAuth:         cfg.SocksNoAuth,
+		logger:              logger,
+		downloads:           make(map[string]downloadState),
+		uploads:             make(map[string]uploadState),
+		uploadTombstones:    make(map[string]uploadTombstone),
+		downloadCache:       make(map[string]downloadCacheEntry),
+		downloadCacheBuilds: make(map[string]*downloadCacheBuild),
+		clientArtifacts:     make(map[string]clientArtifact),
+		clientTransfers:     make(map[string]clientTransfer),
+		janitorStop:         make(chan struct{}),
+		janitorDone:         make(chan struct{}),
+	}
+	if err := server.cleanupOrphanCacheFiles(); err != nil {
+		return nil, err
+	}
+	server.cleanupOrphanUploadFiles(time.Now().UTC())
+	if err := server.loadDownloadCache(); err != nil {
+		return nil, err
 	}
 	if cfg.AllowProxy {
 		server.reverse = newReverseState(cfg.ProxyBufBytes, cfg.ProxyMaxConn, cfg.ProxyWatchdogWindow, logger)
@@ -192,13 +269,36 @@ func New(cfg Config) (*Server, error) {
 			return nil, err
 		}
 	}
+	server.startJanitor()
 	return server, nil
 }
 
 // Shutdown closes the SOCKS5 listener (if any) and tears down every live
 // proxy tunnel. Idempotent. Returns immediately if proxy is disabled.
 func (s *Server) Shutdown() {
-	s.proxyShutdown()
+	s.shutdownOnce.Do(func() {
+		close(s.janitorStop)
+		<-s.janitorDone
+		s.proxyShutdown()
+	})
+}
+
+func (s *Server) startJanitor() {
+	go func() {
+		defer close(s.janitorDone)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.mu.Lock()
+				s.cleanupExpiredLocked(time.Now().UTC())
+				s.mu.Unlock()
+			case <-s.janitorStop:
+				return
+			}
+		}
+	}()
 }
 
 func (s *Server) Domain() string {
@@ -295,6 +395,8 @@ func (s *Server) handleTXTOnDomain(name, matchedDomain, client string) []string 
 		return s.downloadBatch(args, now)
 	case "apoll":
 		return s.proxyAgentPoll(args, now, client)
+	case "aopen":
+		return s.proxyAgentOpen(args, now)
 	case "aread":
 		return s.proxyAgentRead(args, now)
 	case "awrite":
@@ -357,6 +459,12 @@ func (s *Server) catalog(args []string, now time.Time) []string {
 	}
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
+		// Internal cache/spool files are implementation details, never
+		// downloadable artifacts.  Restrict the catalog to regular visible
+		// files so an in-progress upload cannot appear as a valid download.
+		if strings.HasPrefix(entry.Name(), ".") || !entry.Type().IsRegular() {
+			continue
+		}
 		names = append(names, entry.Name())
 	}
 	pages := codec.ChunkString(strings.Join(names, ","), codec.TXTChunkSize)
@@ -400,7 +508,13 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 
 	s.mu.Lock()
 	s.cleanupExpiredLocked(now)
-	if _, exists := s.downloads[sid]; exists {
+	if existing, exists := s.downloads[sid]; exists {
+		if existing.filename == filename {
+			existing.expires = now.Add(transferTTL)
+			s.downloads[sid] = existing
+			s.mu.Unlock()
+			return []string{strconv.Itoa(existing.chunkCount)}
+		}
 		s.mu.Unlock()
 		return []string{"Transfer already exists."}
 	}
@@ -418,75 +532,38 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 		s.logger.Printf("download %q exceeded max size", filename)
 		return []string{"Download is too large for this server policy."}
 	}
-	raw, err := os.ReadFile(path)
+	key, entry, err := s.prepareDownloadCache(path, info, now)
 	if err != nil {
-		s.logger.Printf("read download file %q: %v", filename, err)
-		return []string{"Error open file."}
+		s.logger.Printf("prepare download %q: %v", filename, err)
+		if strings.Contains(err.Error(), "limit") {
+			return []string{"Download is too large for this server policy."}
+		}
+		return []string{"Server download preparation error."}
 	}
-	if int64(len(raw)) > s.maxDownloadBytes {
-		s.logger.Printf("download %q exceeded max size after read", filename)
-		return []string{"Download is too large for this server policy."}
-	}
-	sum := sha256.Sum256(raw)
-	digest := hex.EncodeToString(sum[:])
 
 	s.mu.Lock()
-	if entry, ok := s.downloadCache[path]; ok && entry.size == int64(len(raw)) && entry.sha256 == digest {
-		if _, exists := s.downloads[sid]; exists {
-			s.mu.Unlock()
-			return []string{"Transfer already exists."}
-		}
-		state := downloadState{
-			filename:     filename,
-			chunks:       entry.chunks,
-			sourceSHA256: entry.sha256,
-			expires:      now.Add(transferTTL),
-		}
-		s.downloads[sid] = state
-		s.mu.Unlock()
-		s.logger.Printf("served cached download %q as %s in %d chunks", filename, sid, len(state.chunks))
-		return []string{strconv.Itoa(len(state.chunks))}
-	}
-	s.mu.Unlock()
-
-	compressed, err := codec.Compress(raw)
-	if err != nil {
-		s.logger.Printf("compress download file %q: %v", filename, err)
-		return []string{"Server compression error."}
-	}
-	protected, err := secure.ProtectToBase64(s.secret, compressed)
-	if err != nil {
-		s.logger.Printf("encrypt download file %q: %v", filename, err)
-		return []string{"Server encryption error."}
-	}
-
-	chunks := codec.ChunkString(protected, codec.TXTChunkSize)
-	state := downloadState{
-		filename:     filename,
-		chunks:       chunks,
-		sourceSHA256: digest,
-		expires:      now.Add(transferTTL),
-	}
-	s.mu.Lock()
-	if _, alreadyCached := s.downloadCache[path]; !alreadyCached {
-		if len(s.downloadCacheOrder) >= maxDownloadCacheEntries {
-			evict := s.downloadCacheOrder[0]
-			s.downloadCacheOrder = s.downloadCacheOrder[1:]
-			delete(s.downloadCache, evict)
-		}
-		s.downloadCacheOrder = append(s.downloadCacheOrder, path)
-	}
-	s.downloadCache[path] = downloadCacheEntry{chunks: chunks, mtime: info.ModTime(), size: int64(len(raw)), sha256: digest}
 	s.cleanupExpiredLocked(now)
-	if _, exists := s.downloads[sid]; exists {
+	if existing, exists := s.downloads[sid]; exists {
+		s.releaseCacheLocked(key)
+		if existing.filename == filename {
+			existing.expires = now.Add(transferTTL)
+			s.downloads[sid] = existing
+			s.mu.Unlock()
+			return []string{strconv.Itoa(existing.chunkCount)}
+		}
 		s.mu.Unlock()
 		return []string{"Transfer already exists."}
+	}
+	state := downloadState{
+		filename: filename, cacheKey: key, chunkCount: entry.chunkCount,
+		encodedSize: entry.encodedSize, sourceSHA256: entry.sha256,
+		expires: now.Add(transferTTL),
 	}
 	s.downloads[sid] = state
 	s.mu.Unlock()
 
-	s.logger.Printf("prepared download %q as %s in %d chunks", filename, sid, len(state.chunks))
-	return []string{strconv.Itoa(len(state.chunks))}
+	s.logger.Printf("prepared streamed download %q as %s in %d chunks", filename, sid, state.chunkCount)
+	return []string{strconv.Itoa(state.chunkCount)}
 }
 
 func (s *Server) downloadMeta(args []string, now time.Time) []string {
@@ -513,7 +590,7 @@ func (s *Server) downloadMeta(args []string, now time.Time) []string {
 	s.downloads[sid] = state
 	s.mu.Unlock()
 
-	return []string{fmt.Sprintf("%d|%s", len(state.chunks), state.sourceSHA256)}
+	return []string{fmt.Sprintf("%d|%s|%d", state.chunkCount, state.sourceSHA256, state.encodedSize)}
 }
 
 func (s *Server) downloadChunk(args []string, now time.Time) []string {
@@ -537,14 +614,18 @@ func (s *Server) downloadChunk(args []string, now time.Time) []string {
 		s.mu.Unlock()
 		return []string{"Transfer not found."}
 	}
-	if index < 0 || index >= len(state.chunks) {
+	if index < 0 || index >= state.chunkCount {
 		s.mu.Unlock()
 		return []string{"Wrong chunk number."}
 	}
-	chunk := state.chunks[index]
 	state.expires = now.Add(transferTTL)
 	s.downloads[sid] = state
 	s.mu.Unlock()
+	chunk, err := s.readCacheChunk(state.cacheKey, index, now)
+	if err != nil {
+		s.logger.Printf("read download chunk %s/%d: %v", sid, index, err)
+		return []string{"Download cache unavailable."}
+	}
 	return []string{chunk}
 }
 
@@ -577,22 +658,22 @@ func (s *Server) downloadBatch(args []string, now time.Time) []string {
 		s.mu.Unlock()
 		return []string{"Transfer not found."}
 	}
-	if from >= len(state.chunks) {
+	if from >= state.chunkCount {
 		s.mu.Unlock()
 		return []string{"Wrong chunk number."}
 	}
 	end := from + count
-	if end > len(state.chunks) {
-		end = len(state.chunks)
+	if end > state.chunkCount {
+		end = state.chunkCount
 	}
-	// Copy into a fresh []string — a subslice would pin the entire
-	// state.chunks backing array (potentially hundreds of MB for large
-	// uploads) alive for as long as any caller retains the returned
-	// slice, defeating the transferTTL eviction below.
-	batch := append([]string(nil), state.chunks[from:end]...)
 	state.expires = now.Add(transferTTL)
 	s.downloads[sid] = state
 	s.mu.Unlock()
+	batch, err := s.readCacheChunks(state.cacheKey, from, end, now)
+	if err != nil {
+		s.logger.Printf("read download batch %s/%d: %v", sid, from, err)
+		return []string{"Download cache unavailable."}
+	}
 	return batch
 }
 
@@ -628,41 +709,44 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 	if err != nil {
 		return []string{"Invalid filename."}
 	}
+	fingerprint := fmt.Sprintf("%s|%d|%d|%s", filename, total, chunkSize, encoding)
 
 	s.mu.Lock()
 	s.cleanupExpiredLocked(now)
-	if _, exists := s.uploads[sid]; exists {
+	if existing, exists := s.uploads[sid]; exists {
+		if existing.fingerprint == fingerprint {
+			existing.expires = now.Add(transferTTL)
+			s.uploads[sid] = existing
+			s.mu.Unlock()
+			return []string{"Ready to file uploading"}
+		}
 		s.mu.Unlock()
 		return []string{"Transfer already exists."}
 	}
 	s.mu.Unlock()
-
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
+	if _, err := os.Lstat(path); err == nil {
 		return []string{"Error. File already exist."}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.logger.Printf("stat upload file %q: %v", filename, err)
+		return []string{"Cannot create file."}
 	}
+	spool, err := os.CreateTemp(s.dataDir, ".gdns2tcp-upload-*.wire")
 	if err != nil {
-		s.logger.Printf("create upload file %q: %v", filename, err)
+		s.logger.Printf("create upload spool %q: %v", filename, err)
 		return []string{"Cannot create file."}
 	}
 
 	state := uploadState{
-		file:      file,
-		filename:  filename,
-		path:      path,
-		encoded:   &strings.Builder{},
-		total:     total,
-		chunkSize: chunkSize,
-		encoding:  encoding,
-		nextIndex: 0,
-		expires:   now.Add(transferTTL),
+		spool: spool, filename: filename, path: path, spoolPath: spool.Name(),
+		fingerprint: fingerprint, total: total, chunkSize: chunkSize, encoding: encoding,
+		nextIndex: 0, expires: now.Add(transferTTL),
 	}
 	s.mu.Lock()
 	s.cleanupExpiredLocked(now)
 	if _, exists := s.uploads[sid]; exists {
 		s.mu.Unlock()
-		_ = file.Close()
-		_ = os.Remove(path)
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
 		return []string{"Transfer already exists."}
 	}
 	s.uploads[sid] = state
@@ -695,6 +779,11 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 	s.cleanupExpiredLocked(now)
 	state, exists := s.uploads[sid]
 	if !exists {
+		if tombstone, ok := s.uploadTombstones[sid]; ok && index == tombstone.finalIndex {
+			result := tombstone.result
+			s.mu.Unlock()
+			return []string{result}
+		}
 		s.mu.Unlock()
 		return []string{"Upload is not initialized."}
 	}
@@ -707,14 +796,21 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 		s.mu.Unlock()
 		return []string{"Incorrect chunk length format."}
 	}
-	if state.encoded == nil {
-		state.encoded = &strings.Builder{}
+	if err := writeAll(state.spool, []byte(wireChunk)); err != nil {
+		delete(s.uploads, sid)
+		s.mu.Unlock()
+		_ = state.spool.Close()
+		_ = os.Remove(state.spoolPath)
+		return []string{"Cannot write file."}
 	}
-	state.encoded.WriteString(wireChunk)
 	if index == state.total-1 {
 		delete(s.uploads, sid)
 		s.mu.Unlock()
-		return []string{s.finishUpload(sid, state)}
+		result := s.finishUpload(sid, state)
+		s.mu.Lock()
+		s.uploadTombstones[sid] = uploadTombstone{fingerprint: state.fingerprint, finalIndex: index, result: result, expires: now.Add(transferTTL)}
+		s.mu.Unlock()
+		return []string{result}
 	}
 	state.nextIndex++
 	state.expires = now.Add(transferTTL)
@@ -727,51 +823,86 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 func (s *Server) finishUpload(sid string, state uploadState) string {
 	failed := false
 	defer func() {
-		if state.file != nil {
-			_ = state.file.Close()
+		if state.spool != nil {
+			_ = state.spool.Close()
 		}
-		if failed {
-			if err := os.Remove(state.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				s.logger.Printf("remove failed upload file %q: %v", state.filename, err)
-			}
-		}
+		_ = os.Remove(state.spoolPath)
 	}()
 
-	if state.encoded == nil {
-		s.logger.Printf("upload %q missing accumulator", state.filename)
-		failed = true
+	if state.spool == nil {
 		return "Upload decode error."
 	}
-	protected, err := codec.DecodeDNSPayload(state.encoded.String(), state.encoding)
+	if err := state.spool.Close(); err != nil {
+		return "Cannot write file."
+	}
+	protected, err := os.CreateTemp(s.dataDir, ".gdns2tcp-upload-protected-*")
 	if err != nil {
+		return "Cannot create file."
+	}
+	protectedPath := protected.Name()
+	_ = protected.Close()
+	defer os.Remove(protectedPath)
+	if _, err := codec.DecodeDNSFile(state.spoolPath, protectedPath, state.encoding); err != nil {
 		s.logger.Printf("decode upload %q: %v", state.filename, err)
-		failed = true
 		return "Upload decode error."
 	}
-	compressed, err := secure.Open(s.secret, protected)
+	compressed, err := os.CreateTemp(s.dataDir, ".gdns2tcp-upload-compressed-*")
 	if err != nil {
+		return "Cannot create file."
+	}
+	compressedPath := compressed.Name()
+	_ = compressed.Close()
+	defer os.Remove(compressedPath)
+	if err := secure.OpenFile(s.secret, protectedPath, compressedPath); err != nil {
 		s.logger.Printf("decrypt upload %q: %v", state.filename, err)
-		failed = true
 		return "Upload decryption error."
 	}
-	raw, err := codec.DecompressLimit(compressed, s.maxUploadBytes)
+	output, err := os.CreateTemp(s.dataDir, ".gdns2tcp-upload-output-*")
+	if err != nil {
+		return "Cannot create file."
+	}
+	outputPath := output.Name()
+	_ = output.Close()
+	defer func() {
+		if failed {
+			_ = os.Remove(outputPath)
+		}
+	}()
+	written, err := codec.DecompressFileLimit(compressedPath, outputPath, s.maxUploadBytes)
 	if err != nil {
 		s.logger.Printf("decompress upload %q: %v", state.filename, err)
 		failed = true
 		return "Upload decompression error."
 	}
-	if int64(len(raw)) > s.maxUploadBytes {
-		s.logger.Printf("upload %q exceeded max uncompressed size", state.filename)
-		failed = true
-		return "Upload is too large for this server policy."
-	}
-	if _, err := state.file.Write(raw); err != nil {
-		s.logger.Printf("write upload %q: %v", state.filename, err)
+	if err := publishNoOverwrite(outputPath, state.path); err != nil {
+		s.logger.Printf("publish upload %q: %v", state.filename, err)
 		failed = true
 		return "Cannot write file."
 	}
-	s.logger.Printf("stored upload %q from %s (%d bytes)", state.filename, sid, len(raw))
+	failed = false
+	s.logger.Printf("stored upload %q from %s (%d bytes)", state.filename, sid, written)
 	return "-1"
+}
+
+func publishNoOverwrite(tmpPath, finalPath string) error {
+	if err := os.Link(tmpPath, finalPath); err != nil {
+		return err
+	}
+	return os.Remove(tmpPath)
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 func (s *Server) prepareClientArtifact(cfg ClientArtifactConfig) error {
@@ -884,6 +1015,7 @@ func (s *Server) clientBatch(alias string, args []string, client string) []strin
 }
 
 func (s *Server) logClientArtifactProgress(client, alias string, artifact clientArtifact, index int) {
+	now := time.Now().UTC()
 	key := client + "|" + alias
 	progress, ok := s.clientTransfers[key]
 	if !ok {
@@ -892,17 +1024,24 @@ func (s *Server) logClientArtifactProgress(client, alias string, artifact client
 			return
 		}
 		progress = clientTransfer{
-			seen:       make(map[int]struct{}),
+			seen:       make([]byte, (len(artifact.chunks)+7)/8),
 			lastBucket: -1,
 		}
 	}
-	if _, exists := progress.seen[index]; exists {
+	progress.lastSeen = now
+	byteIndex := index / 8
+	if byteIndex < 0 || byteIndex >= len(progress.seen) {
+		return
+	}
+	bit := byte(1 << uint(index%8))
+	if progress.seen[byteIndex]&bit != 0 {
 		s.clientTransfers[key] = progress
 		return
 	}
-	progress.seen[index] = struct{}{}
+	progress.seen[byteIndex] |= bit
+	progress.seenCount++
 	total := len(artifact.chunks)
-	seen := len(progress.seen)
+	seen := progress.seenCount
 	percent := seen * 100 / total
 	bucket := percent / 10 * 10
 	if seen == 1 || bucket > progress.lastBucket || seen == total {
@@ -918,15 +1057,20 @@ func (s *Server) logClientArtifactProgress(client, alias string, artifact client
 }
 
 func (s *Server) cleanupExpiredLocked(now time.Time) {
+	for key, progress := range s.clientTransfers {
+		if !progress.lastSeen.IsZero() && now.Sub(progress.lastSeen) > clientTransferTTL {
+			delete(s.clientTransfers, key)
+		}
+	}
 	for sid, state := range s.uploads {
 		if now.Before(state.expires) {
 			continue
 		}
-		if state.file != nil {
-			_ = state.file.Close()
+		if state.spool != nil {
+			_ = state.spool.Close()
 		}
-		if err := os.Remove(state.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			s.logger.Printf("remove expired upload file %q: %v", state.filename, err)
+		if err := os.Remove(state.spoolPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.logger.Printf("remove expired upload spool %q: %v", state.filename, err)
 		}
 		delete(s.uploads, sid)
 		s.logger.Printf("expired upload %q (%s)", state.filename, sid)
@@ -935,9 +1079,16 @@ func (s *Server) cleanupExpiredLocked(now time.Time) {
 		if now.Before(state.expires) {
 			continue
 		}
+		s.releaseCacheLocked(state.cacheKey)
 		delete(s.downloads, sid)
 		s.logger.Printf("expired download %q (%s)", state.filename, sid)
 	}
+	for sid, tombstone := range s.uploadTombstones {
+		if !now.Before(tombstone.expires) {
+			delete(s.uploadTombstones, sid)
+		}
+	}
+	s.evictDownloadCacheLocked(now)
 	s.proxyCleanupExpiredLocked(now)
 }
 

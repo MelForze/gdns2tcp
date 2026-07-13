@@ -451,10 +451,10 @@ func exchangeTCP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 	var prefix [2]byte
 	binary.BigEndian.PutUint16(prefix[:], uint16(len(q)))
-	if _, err := conn.Write(prefix[:]); err != nil {
+	if err := writeAll(conn, prefix[:]); err != nil {
 		return nil, err
 	}
-	if _, err := conn.Write(q); err != nil {
+	if err := writeAll(conn, q); err != nil {
 		return nil, err
 	}
 	if _, err := io.ReadFull(conn, prefix[:]); err != nil {
@@ -495,6 +495,7 @@ type tcpConnEntry struct {
 	conn       net.Conn
 	closed     bool
 	connectErr error
+	generation uint64
 }
 
 type tcpPool struct {
@@ -523,15 +524,22 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 	if e.conn != nil && !e.closed {
 		return nil
 	}
-	if e.closed {
-		// Drain any pending senders left from the previous readLoop.
-		e.pendingMu.Lock()
-		for id, ch := range e.pending {
-			close(ch)
-			delete(e.pending, id)
-		}
-		e.pendingMu.Unlock()
+	old := e.conn
+	e.conn = nil
+	e.closed = true
+	e.generation++
+	// Drain only requests owned by the broken generation before creating a
+	// new one.  Closing old first forces its readLoop to exit; its deferred
+	// cleanup is generation-gated and therefore cannot touch new pending IDs.
+	if old != nil {
+		_ = old.Close()
 	}
+	e.pendingMu.Lock()
+	for id, ch := range e.pending {
+		close(ch)
+		delete(e.pending, id)
+	}
+	e.pendingMu.Unlock()
 	conn, err := e.parent.dial(e.parent.addr, timeout)
 	if err != nil {
 		e.connectErr = err
@@ -548,7 +556,8 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 	e.conn = conn
 	e.closed = false
 	e.connectErr = nil
-	go e.readLoop(conn)
+	gen := e.generation
+	go e.readLoop(conn, gen)
 	return nil
 }
 
@@ -556,15 +565,19 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 // looks up the DNS ID's pending channel, and hands the payload over.
 // Termination: any read error closes the conn and trips all pending senders,
 // so they observe the failure instead of waiting forever.
-func (e *tcpConnEntry) readLoop(conn net.Conn) {
+func (e *tcpConnEntry) readLoop(conn net.Conn, generation uint64) {
 	defer func() {
 		e.mu.Lock()
-		if e.conn == conn {
+		owned := e.conn == conn && e.generation == generation
+		if owned {
 			e.closed = true
-			_ = e.conn.Close()
+			_ = conn.Close()
 			e.conn = nil
 		}
 		e.mu.Unlock()
+		if !owned {
+			return
+		}
 		e.pendingMu.Lock()
 		for id, ch := range e.pending {
 			close(ch)
@@ -625,24 +638,33 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 
 	var prefix [2]byte
 	binary.BigEndian.PutUint16(prefix[:], uint16(len(q)))
-	_ = e.conn.SetWriteDeadline(time.Now().Add(timeout))
-	if _, err := e.conn.Write(prefix[:]); err != nil {
-		e.closed = true
-		e.mu.Unlock()
-		e.pendingMu.Lock()
-		dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
-		e.pendingMu.Unlock()
-		return nil, err
+	conn := e.conn
+	gen := e.generation
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	werr := writeAll(conn, prefix[:])
+	if werr == nil {
+		werr = writeAll(conn, q)
 	}
-	if _, err := e.conn.Write(q); err != nil {
-		e.closed = true
+	_ = conn.SetWriteDeadline(time.Time{})
+	if werr != nil {
+		if e.conn == conn && e.generation == gen {
+			e.closed = true
+			e.conn = nil
+			_ = conn.Close()
+			e.pendingMu.Lock()
+			for pendingID, pendingCh := range e.pending {
+				close(pendingCh)
+				delete(e.pending, pendingID)
+			}
+			e.pendingMu.Unlock()
+		} else {
+			e.pendingMu.Lock()
+			dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
+			e.pendingMu.Unlock()
+		}
 		e.mu.Unlock()
-		e.pendingMu.Lock()
-		dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
-		e.pendingMu.Unlock()
-		return nil, err
+		return nil, werr
 	}
-	_ = e.conn.SetWriteDeadline(time.Time{})
 	e.mu.Unlock()
 
 	timer := time.NewTimer(timeout)
@@ -659,6 +681,20 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		e.pendingMu.Unlock()
 		return nil, errors.New("tcp exchange timeout")
 	}
+}
+
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 // exchange picks a conn round-robin and tries one re-pick on failure. Two
@@ -686,7 +722,9 @@ func (p *tcpPool) close() {
 		if e.conn != nil {
 			_ = e.conn.Close()
 		}
+		e.conn = nil
 		e.closed = true
+		e.generation++
 		e.mu.Unlock()
 		e.pendingMu.Lock()
 		for id, ch := range e.pending {

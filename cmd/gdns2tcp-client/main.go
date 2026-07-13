@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,13 +18,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gdns2tcp/internal/clihelp"
 	"gdns2tcp/internal/codec"
 	secure "gdns2tcp/internal/crypto"
 	"gdns2tcp/internal/protocol"
 )
 
 const defaultDNSPort = "53"
-const defaultMaxDownloadBytes int64 = 100 << 20
+const defaultMaxDownloadBytes int64 = 256 << 20
+
+const (
+	defaultResumeCacheBytes = int64(1 << 30)
+	defaultResumeCacheTTL   = 7 * 24 * time.Hour
+)
 
 const (
 	// defaultChunkSize is the default and maximum encoded upload chunk size
@@ -71,6 +79,7 @@ type config struct {
 	batch            int
 	noResume         bool
 	cacheDir         string
+	modeCount        int
 
 	listMode     bool
 	uploadFile   string
@@ -184,6 +193,9 @@ func validateConfig(cfg config) error {
 	if cfg.domain == "" {
 		return errors.New("domain is required")
 	}
+	if cfg.modeCount > 1 {
+		return errors.New("choose exactly one mode: --list, --upload <file>, --download <file>, or --test")
+	}
 	if cfg.mode == "" {
 		return errors.New("specify --list, --upload <file>, --download <file>, or --test")
 	}
@@ -210,6 +222,13 @@ func run() error {
 	cfg := parseFlags()
 	if err := validateConfig(cfg); err != nil {
 		return err
+	}
+	if cfg.tcp && cfg.dnsServer == "" {
+		server, err := systemResolverAddress()
+		if err != nil {
+			return fmt.Errorf("-tcp needs a discoverable system DNS server; pass -dns-server explicitly: %w", err)
+		}
+		cfg.dnsServer = server
 	}
 	if cfg.dnsServer != "" {
 		fmt.Printf("using DNS server %s:%s\n", cfg.dnsServer, cfg.dnsPort)
@@ -241,15 +260,37 @@ func run() error {
 	return nil
 }
 
+// systemResolverAddress extracts the first configured recursive resolver so
+// -tcp can actually use DNS-over-TCP rather than silently falling back to
+// net.DefaultResolver's UDP path.  Platforms without resolv.conf receive a
+// clear actionable error asking for -dns-server.
+func systemResolverAddress() (string, error) {
+	raw, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "nameserver" && net.ParseIP(fields[1]) != nil {
+			return fields[1], nil
+		}
+	}
+	return "", errors.New("no nameserver entry in /etc/resolv.conf")
+}
+
 func parseFlags() config {
 	cfg := config{}
+	installUsage()
 	flag.StringVar(&cfg.domain, "domain", "", "authoritative gdns2tcp domain. Accepts a single name or CSV list (a.com,b.com,c.com) — the first is used as the canonical HMAC domain, all are rotated round-robin as QNAME suffixes to spread load across resolver per-zone rate-limits.")
 	flag.StringVar(&cfg.domain, "d", "", "short alias for -domain")
 	flag.StringVar(&cfg.pass, "password", "", "shared encryption secret")
 	flag.StringVar(&cfg.pass, "p", "", "short alias for -password")
+	flag.StringVar(&cfg.pass, "pass", "", "deprecated alias for -password")
 	flag.BoolVar(&cfg.listMode, "list", false, "list files on the server")
 	flag.StringVar(&cfg.uploadFile, "upload", "", "local file to upload")
+	flag.StringVar(&cfg.uploadFile, "in", "", "deprecated alias for -upload")
 	flag.StringVar(&cfg.downloadFile, "download", "", "remote filename to download")
+	flag.StringVar(&cfg.downloadFile, "filename", "", "deprecated alias for -download")
 	flag.BoolVar(&cfg.testMode, "test", false, "test connection to the server")
 	flag.StringVar(&cfg.outFile, "out", "", "local output file for downloads")
 	flag.StringVar(&cfg.dnsServer, "dns-server", "", "DNS server address; empty uses the system resolver")
@@ -263,10 +304,24 @@ func parseFlags() config {
 	flag.IntVar(&cfg.parallelism, "parallelism", defaultDownloadParallelism, "concurrent DNS queries during download (1-64)")
 	flag.IntVar(&cfg.batch, "batch", defaultDownloadBatch, "chunks per DNS response when downloading (1-32; 1 disables batching)")
 	flag.BoolVar(&cfg.noResume, "no-resume", false, "disable resume from local cache and always fetch all chunks")
+	flag.StringVar(&cfg.cacheDir, "cache-dir", "", "download resume cache directory (default: OS user cache)")
 	flag.Parse()
 
 	cfg.domain, cfg.shardDomains, cfg.shardAuthDomains, cfg.shardLongest = protocol.ParseDomainCSV(cfg.domain)
 	cfg.shardRotor = new(atomic.Uint64)
+
+	if cfg.listMode {
+		cfg.modeCount++
+	}
+	if cfg.uploadFile != "" {
+		cfg.modeCount++
+	}
+	if cfg.downloadFile != "" {
+		cfg.modeCount++
+	}
+	if cfg.testMode {
+		cfg.modeCount++
+	}
 
 	switch {
 	case cfg.listMode:
@@ -300,7 +355,82 @@ func parseFlags() config {
 	if cfg.batch > maxDownloadBatch {
 		cfg.batch = maxDownloadBatch
 	}
+	if !cfg.noResume && cfg.cacheDir == "" {
+		cfg.cacheDir = defaultResumeRoot()
+	}
 	return cfg
+}
+
+func installUsage() {
+	program := filepath.Base(os.Args[0])
+	flag.CommandLine.Usage = func() {
+		clihelp.Print(flag.CommandLine.Output(), program,
+			"-domain <zone> <mode> [options]",
+			[]string{
+				fmt.Sprintf("%s -domain files.example.com -test -dns-server 203.0.113.10", program),
+				fmt.Sprintf("%s -domain files.example.com -password \"$GDNS_PASS\" -list", program),
+				fmt.Sprintf("%s -domain files.example.com -password \"$GDNS_PASS\" -upload ./payload.bin", program),
+				fmt.Sprintf("%s -domain files.example.com -password \"$GDNS_PASS\" -download payload.bin -out ./payload.bin", program),
+			},
+			[]clihelp.Group{
+				{
+					Title: "Connection and authentication",
+					Flags: []clihelp.Flag{
+						{Names: "-domain, -d <zone>", Description: "authoritative gdns2tcp zone; CSV enables shard fan-out, first zone is canonical"},
+						{Names: "-password, -p <secret>", Description: "shared secret; required for list, upload and download"},
+					},
+				},
+				{
+					Title: "Mode: choose exactly one",
+					Flags: []clihelp.Flag{
+						{Names: "-test", Description: "probe server DNS protocol support; no file transfer"},
+						{Names: "-list", Description: "list files available on the server"},
+						{Names: "-upload <path>", Description: "upload a local file to the server"},
+						{Names: "-download <name>", Description: "download a remote filename from the server"},
+					},
+				},
+				{
+					Title: "DNS transport",
+					Flags: []clihelp.Flag{
+						{Names: "-dns-server, -ds <ip>", Description: "DNS server address; empty uses the system resolver"},
+						{Names: "-dns-port, -dp <port>", Description: "DNS server port (default " + defaultDNSPort + ")"},
+						{Names: "-tcp", Description: "use TCP instead of UDP for DNS queries"},
+						{Names: "-retries <n>", Description: "DNS query attempts before failing (default 3)"},
+					},
+				},
+				{
+					Title: "Upload options",
+					Flags: []clihelp.Flag{
+						{Names: "-chunk-size <n>", Description: fmt.Sprintf("maximum encoded upload chunk size (default %d)", defaultChunkSize)},
+					},
+				},
+				{
+					Title: "Download options",
+					Flags: []clihelp.Flag{
+						{Names: "-out <path>", Description: "local output path; default is the remote filename"},
+						{Names: "-max-download-bytes <n>", Description: fmt.Sprintf("maximum decompressed download size (default %d)", defaultMaxDownloadBytes)},
+						{Names: "-parallelism <n>", Description: fmt.Sprintf("concurrent download DNS queries, 1-%d (default %d)", maxDownloadParallelism, defaultDownloadParallelism)},
+						{Names: "-batch <n>", Description: fmt.Sprintf("chunks per download DNS response, 1-%d; 1 disables batching (default %d)", maxDownloadBatch, defaultDownloadBatch)},
+						{Names: "-no-resume", Description: "ignore local resume cache and fetch all chunks again"},
+						{Names: "-cache-dir <dir>", Description: "resume spool cache; default is OS user cache (1 GiB / 7 days)"},
+					},
+				},
+				{
+					Title: "Deprecated aliases",
+					Flags: []clihelp.Flag{
+						{Names: "-pass <secret>", Description: "alias for -password"},
+						{Names: "-in <path>", Description: "alias for -upload"},
+						{Names: "-filename <name>", Description: "alias for -download"},
+					},
+				},
+			},
+			[]string{
+				"Go's flag parser accepts both -flag and --flag forms.",
+				"The client rejects conflicting modes instead of choosing one by precedence.",
+				"Use -tcp when UDP truncation, loss, or resolver policy breaks large downloads.",
+			},
+		)
+	}
 }
 
 func (r *txtResolver) query(name string) (string, error) {
@@ -422,26 +552,6 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 		return err
 	}
 
-	raw, err := os.ReadFile(inputPath)
-	if err != nil {
-		return fmt.Errorf("read input file: %w", err)
-	}
-	compressed, err := codec.Compress(raw)
-	if err != nil {
-		return err
-	}
-	protected, err := secure.Protect(cfg.pass, compressed)
-	if err != nil {
-		return err
-	}
-	encoded, err := codec.EncodeDNSPayload(protected, encoding)
-	if err != nil {
-		return err
-	}
-	if encoding == "base32" {
-		encoded = strings.ToLower(encoded)
-	}
-
 	sid, err := protocol.NewSID()
 	if err != nil {
 		return err
@@ -454,8 +564,37 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 	if err != nil {
 		return err
 	}
-	chunks := codec.ChunkString(encoded, effectiveChunkSize)
-	initArgs := append([]string{sid, strconv.Itoa(len(chunks)), strconv.Itoa(effectiveChunkSize), encoding}, filenameLabels...)
+	spoolDir, err := os.MkdirTemp("", "gdns2tcp-upload-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(spoolDir)
+	gzipPath := filepath.Join(spoolDir, "payload.gz")
+	protectedPath := filepath.Join(spoolDir, "payload.gdt")
+	encodedPath := filepath.Join(spoolDir, "payload.txt")
+	if err := codec.CompressFile(inputPath, gzipPath); err != nil {
+		return fmt.Errorf("compress input file: %w", err)
+	}
+	if err := secure.ProtectFile(cfg.pass, gzipPath, protectedPath); err != nil {
+		return err
+	}
+	encodedSize, err := codec.EncodeDNSFile(protectedPath, encodedPath, encoding)
+	if err != nil {
+		return err
+	}
+	if encodedSize <= 0 || encodedSize > int64(^uint(0)>>1) {
+		return errors.New("encoded upload size is out of range")
+	}
+	chunkCount := int((encodedSize + int64(effectiveChunkSize) - 1) / int64(effectiveChunkSize))
+	if chunkCount <= 0 {
+		return errors.New("upload has no encoded chunks")
+	}
+	encodedFile, err := os.Open(encodedPath)
+	if err != nil {
+		return err
+	}
+	defer encodedFile.Close()
+	initArgs := append([]string{sid, strconv.Itoa(chunkCount), strconv.Itoa(effectiveChunkSize), encoding}, filenameLabels...)
 	initName := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "uinit", initArgs)
 	if len(initName) > 253 {
 		return fmt.Errorf("DNS upload init name is %d characters (limit 253); use a shorter filename or domain", len(initName))
@@ -468,13 +607,17 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 		return fmt.Errorf("upload initialization failed: %s", status)
 	}
 
-	pb := newProgressBar("uploading", len(chunks), effectiveChunkSize)
+	pb := newProgressBar("uploading", chunkCount, effectiveChunkSize)
 	index := 0
 	for {
-		if index >= len(chunks) {
+		if index >= chunkCount {
 			return fmt.Errorf("server requested chunk %d outside prepared range", index)
 		}
-		wireChunk := dnsSafeChunk(chunks[index], encoding)
+		chunk, err := readSpoolChunk(encodedFile, int64(index)*int64(effectiveChunkSize), effectiveChunkSize)
+		if err != nil {
+			return fmt.Errorf("read upload spool chunk %d: %w", index, err)
+		}
+		wireChunk := dnsSafeChunk(string(chunk), encoding)
 		labels := codec.ChunkString(wireChunk, 63)
 		requestArgs := append([]string{sid, strconv.Itoa(index)}, labels...)
 		requestName := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "u", requestArgs)
@@ -498,7 +641,7 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 		index = nextIndex
 		pb.render(index)
 	}
-	pb.finish(len(chunks))
+	pb.finish(chunkCount)
 	return nil
 }
 
@@ -545,35 +688,47 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 	if parallelism < 1 {
 		parallelism = defaultDownloadParallelism
 	}
+	sourceSHA256, encodedSize, ok := fetchDownloadSourceSHA256(resolver, cfg, sid, chunkCount)
+	if !ok {
+		return errors.New("download metadata is unavailable or malformed")
+	}
+	if err := validateDownloadShape(chunkCount, batchSize, encodedSize, cfg.maxDownloadBytes); err != nil {
+		return err
+	}
 	nBatches := (chunkCount + batchSize - 1) / batchSize
-	batchResults := make([]string, nBatches)
-	batchErrors := make([]error, nBatches)
-	var completedChunks int64
 
 	cacheRoot := cfg.cacheDir
-	if cacheRoot == "" {
-		cacheRoot = defaultResumeRoot()
+	temporaryCacheRoot := ""
+	if cfg.noResume || cacheRoot == "" {
+		var err error
+		temporaryCacheRoot, err = os.MkdirTemp("", "gdns2tcp-download-*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(temporaryCacheRoot)
+		cacheRoot = temporaryCacheRoot
 	}
-	sourceSHA256 := ""
-	resumeEnabled := !cfg.noResume
-	if resumeEnabled {
-		var ok bool
-		sourceSHA256, ok = fetchDownloadSourceSHA256(resolver, cfg, sid, chunkCount)
-		if !ok {
-			resumeEnabled = false
+	cache := newResumeCache(cacheRoot, cfg.domain, cfg.filename, true)
+	if err := cache.acquireLock(); err != nil {
+		return err
+	}
+	defer cache.close()
+	if temporaryCacheRoot == "" {
+		reserveBytes := encodedSize + int64(bitmapBytes(nBatches)) + 4096
+		if reserveBytes < encodedSize {
+			return errors.New("resume cache reservation overflows int64")
+		}
+		if err := pruneResumeCacheFor(cacheRoot, defaultResumeCacheBytes, defaultResumeCacheTTL, reserveBytes, cache.dir); err != nil {
+			return fmt.Errorf("prune download resume cache: %w", err)
 		}
 	}
-	cache := newResumeCache(cacheRoot, cfg.domain, cfg.filename, resumeEnabled)
-	completed, _ := cache.loadCompleted(chunkCount, batchSize, sourceSHA256)
-	usedCachedBatches := len(completed) > 0
-	if err := cache.saveMeta(chunkCount, batchSize, sourceSHA256); err != nil {
-		return fmt.Errorf("write resume meta: %w", err)
+	completed, err := cache.open(chunkCount, batchSize, sourceSHA256, encodedSize)
+	if err != nil {
+		return fmt.Errorf("open download spool: %w", err)
 	}
-	for k, data := range completed {
-		if k < 0 || k >= nBatches {
-			continue
-		}
-		batchResults[k] = data
+	usedCachedBatches := len(completed) > 0 && temporaryCacheRoot == ""
+	var completedChunks int64
+	for k := range completed {
 		from := k * batchSize
 		count := batchSize
 		if from+count > chunkCount {
@@ -583,6 +738,7 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 	}
 
 	sem := make(chan struct{}, parallelism)
+	batchErrors := make([]error, nBatches)
 	var wg sync.WaitGroup
 	pb := newProgressBar("downloading", chunkCount, codec.TXTChunkSize)
 	if initial := int(atomic.LoadInt64(&completedChunks)); initial > 0 {
@@ -608,9 +764,12 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 			} else {
 				name = authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "db", []string{sid, strconv.Itoa(from), strconv.Itoa(count)})
 			}
-			batchResults[k], batchErrors[k] = resolver.query(name)
-			if batchErrors[k] == nil {
-				_ = cache.saveBatch(k, batchResults[k])
+			data, queryErr := resolver.query(name)
+			if queryErr == nil {
+				queryErr = cache.saveBatch(k, from, count, data)
+			}
+			batchErrors[k] = queryErr
+			if queryErr == nil {
 				n := atomic.AddInt64(&completedChunks, int64(count))
 				pb.render(int(n))
 			}
@@ -618,27 +777,26 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 	}
 	wg.Wait()
 	pb.finish(int(atomic.LoadInt64(&completedChunks)))
-
-	var encoded strings.Builder
-	encoded.Grow(chunkCount * codec.TXTChunkSize)
-	for k, err := range batchErrors {
-		if err != nil {
-			return fmt.Errorf("batch starting at chunk %d: %w", k*batchSize, err)
+	for k, batchErr := range batchErrors {
+		if batchErr != nil {
+			return fmt.Errorf("batch starting at chunk %d: %w", k*batchSize, batchErr)
 		}
-		encoded.WriteString(batchResults[k])
 	}
-
-	raw, err := decodeDownloadedPayload(encoded.String(), cfg.pass, cfg.maxDownloadBytes)
-	if err != nil {
-		if usedCachedBatches && !cfg.noResume {
+	if err := cache.sync(); err != nil {
+		return fmt.Errorf("sync download spool: %w", err)
+	}
+	spoolPath := cache.path()
+	if err := cache.closeSpool(); err != nil {
+		return err
+	}
+	if err := decodeDownloadedFile(spoolPath, cfg.pass, outputPath, cfg.maxDownloadBytes, sourceSHA256); err != nil {
+		if usedCachedBatches {
 			_ = cache.clear()
+			_ = cache.releaseLock()
 			retryCfg := cfg
 			retryCfg.noResume = true
 			return downloadFile(resolver, retryCfg)
 		}
-		return err
-	}
-	if err := writeOutput(outputPath, raw); err != nil {
 		return err
 	}
 	_ = cache.clear()
@@ -646,56 +804,156 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 	return nil
 }
 
-func fetchDownloadSourceSHA256(resolver *txtResolver, cfg config, sid string, chunkCount int) (string, bool) {
+func fetchDownloadSourceSHA256(resolver *txtResolver, cfg config, sid string, chunkCount int) (string, int64, bool) {
 	resp, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "dmeta", []string{sid}))
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
-	metaChunkCount, sourceSHA256, ok := parseDownloadMeta(resp)
+	metaChunkCount, sourceSHA256, encodedSize, ok := parseDownloadMeta(resp)
 	if !ok || metaChunkCount != chunkCount {
-		return "", false
+		return "", 0, false
 	}
-	return sourceSHA256, true
+	return sourceSHA256, encodedSize, true
 }
 
-func parseDownloadMeta(value string) (chunkCount int, sourceSHA256 string, ok bool) {
+func parseDownloadMeta(value string) (chunkCount int, sourceSHA256 string, encodedSize int64, ok bool) {
 	parts := strings.Split(value, "|")
-	if len(parts) != 2 {
-		return 0, "", false
+	if len(parts) != 2 && len(parts) != 3 {
+		return 0, "", 0, false
 	}
 	n, err := strconv.Atoi(parts[0])
 	if err != nil || n <= 0 {
-		return 0, "", false
+		return 0, "", 0, false
 	}
 	digest := strings.ToLower(parts[1])
 	if len(digest) != sha256HexLength {
-		return 0, "", false
+		return 0, "", 0, false
 	}
 	for _, r := range digest {
 		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
 			continue
 		}
-		return 0, "", false
+		return 0, "", 0, false
 	}
-	return n, digest, true
+	if len(parts) == 2 {
+		return n, digest, 0, true
+	}
+	encodedSize, err = strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || encodedSize <= 0 || encodedSize > int64(n)*codec.TXTChunkSize || encodedSize <= int64(n-1)*codec.TXTChunkSize {
+		return 0, "", 0, false
+	}
+	return n, digest, encodedSize, true
 }
 
 const sha256HexLength = 64
 
-func decodeDownloadedPayload(encoded, pass string, maxDownloadBytes int64) ([]byte, error) {
-	protected, err := codec.DecodeDNSPayload(encoded, "base64")
-	if err != nil {
-		return nil, fmt.Errorf("decode download payload: %w", err)
+func validateDownloadShape(chunkCount, batchSize int, encodedSize, maxDownloadBytes int64) error {
+	if chunkCount <= 0 || batchSize <= 0 || encodedSize <= 0 || maxDownloadBytes <= 0 {
+		return errors.New("invalid authenticated download metadata")
 	}
-	compressed, err := secure.Open(pass, protected)
-	if err != nil {
-		return nil, err
+	maxEncoded := maxDownloadBytes
+	if maxEncoded <= (int64(^uint64(0)>>1))/2 {
+		maxEncoded *= 2
+	} else {
+		maxEncoded = int64(^uint64(0) >> 1)
 	}
-	raw, err := codec.DecompressLimit(compressed, maxDownloadBytes)
-	if err != nil {
-		return nil, err
+	if encodedSize > maxEncoded {
+		return fmt.Errorf("encoded download exceeds configured byte limit")
 	}
-	return raw, nil
+	maxChunks := (encodedSize + codec.TXTChunkSize - 1) / codec.TXTChunkSize
+	if int64(chunkCount) != maxChunks {
+		return errors.New("download metadata chunk count does not match encoded size")
+	}
+	if chunkCount > int(^uint(0)>>1)-batchSize+1 {
+		return errors.New("download batch count overflows int")
+	}
+	return nil
+}
+
+// decodeDownloadedFile verifies and transforms the on-disk base64 spool into
+// an output temp file, validates the source digest, then atomically publishes
+// it without overwriting an existing destination.
+func decodeDownloadedFile(spoolPath, pass, outputPath string, maxDownloadBytes int64, sourceSHA256 string) error {
+	dir := filepath.Dir(outputPath)
+	protected, err := os.CreateTemp(dir, ".gdns2tcp-protected-*")
+	if err != nil {
+		return err
+	}
+	protectedPath := protected.Name()
+	if err := protected.Close(); err != nil {
+		_ = os.Remove(protectedPath)
+		return err
+	}
+	defer os.Remove(protectedPath)
+	if _, err := codec.DecodeDNSFile(spoolPath, protectedPath, "base64"); err != nil {
+		return fmt.Errorf("decode download payload: %w", err)
+	}
+	compressed, err := os.CreateTemp(dir, ".gdns2tcp-compressed-*")
+	if err != nil {
+		return err
+	}
+	compressedPath := compressed.Name()
+	if err := compressed.Close(); err != nil {
+		_ = os.Remove(compressedPath)
+		return err
+	}
+	defer os.Remove(compressedPath)
+	if err := secure.OpenFile(pass, protectedPath, compressedPath); err != nil {
+		return err
+	}
+	tmpOutput, err := os.CreateTemp(dir, ".gdns2tcp-output-*")
+	if err != nil {
+		return err
+	}
+	tmpOutputPath := tmpOutput.Name()
+	if err := tmpOutput.Close(); err != nil {
+		_ = os.Remove(tmpOutputPath)
+		return err
+	}
+	publish := false
+	defer func() {
+		if !publish {
+			_ = os.Remove(tmpOutputPath)
+		}
+	}()
+	if _, err := codec.DecompressFileLimit(compressedPath, tmpOutputPath, maxDownloadBytes); err != nil {
+		return err
+	}
+	digest, err := fileSHA256(tmpOutputPath)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(digest, sourceSHA256) {
+		return errors.New("download source digest mismatch")
+	}
+	if err := publishOutputNoOverwrite(tmpOutputPath, outputPath); err != nil {
+		return err
+	}
+	publish = true
+	return nil
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.CopyBuffer(h, f, make([]byte, 64*1024)); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+func publishOutputNoOverwrite(tmpPath, outputPath string) error {
+	if err := os.Link(tmpPath, outputPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("output file already exists: %s", outputPath)
+		}
+		return err
+	}
+	return os.Remove(tmpPath)
 }
 
 func resolveInputPath(path string) (string, error) {
@@ -768,6 +1026,21 @@ func dnsSafeChunk(chunk, encoding string) string {
 		return strings.ToLower(safe)
 	}
 	return safe
+}
+
+func readSpoolChunk(f *os.File, offset int64, max int) ([]byte, error) {
+	if max <= 0 || offset < 0 {
+		return nil, errors.New("invalid spool read")
+	}
+	buf := make([]byte, max)
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return buf[:n], nil
 }
 
 // authenticatedName builds a signed QNAME. canonicalDomain drives the

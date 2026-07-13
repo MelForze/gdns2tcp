@@ -122,12 +122,12 @@ func TestAuthenticatedNameWithTimestampVerifies(t *testing.T) {
 
 func TestParseDownloadMeta(t *testing.T) {
 	wantDigest := strings.Repeat("a", sha256HexLength)
-	count, digest, ok := parseDownloadMeta("12|" + strings.ToUpper(wantDigest))
+	count, digest, encodedSize, ok := parseDownloadMeta("12|" + strings.ToUpper(wantDigest) + "|3000")
 	if !ok {
 		t.Fatal("expected valid dmeta response")
 	}
-	if count != 12 || digest != wantDigest {
-		t.Fatalf("parseDownloadMeta = (%d, %q), want (12, %q)", count, digest, wantDigest)
+	if count != 12 || digest != wantDigest || encodedSize != 3000 {
+		t.Fatalf("parseDownloadMeta = (%d, %q, %d), want (12, %q, 3000)", count, digest, encodedSize, wantDigest)
 	}
 }
 
@@ -140,7 +140,7 @@ func TestParseDownloadMetaRejectsMalformed(t *testing.T) {
 		"12|" + strings.Repeat("g", sha256HexLength),
 		"12|" + strings.Repeat("a", sha256HexLength) + "|extra",
 	} {
-		if _, _, ok := parseDownloadMeta(value); ok {
+		if _, _, _, ok := parseDownloadMeta(value); ok {
 			t.Fatalf("parseDownloadMeta(%q) unexpectedly succeeded", value)
 		}
 	}
@@ -260,6 +260,15 @@ func TestValidateConfigDownloadFilenameRequired(t *testing.T) {
 func TestValidateConfigTestModeNoPassRequired(t *testing.T) {
 	if err := validateConfig(config{mode: "test", domain: "files.test"}); err != nil {
 		t.Fatalf("test mode with domain should pass validation: %v", err)
+	}
+}
+
+func TestValidateConfigRejectsConflictingModes(t *testing.T) {
+	err := validateConfig(config{
+		domain: "files.test", pass: "s", mode: "list", modeCount: 2,
+	})
+	if err == nil || !strings.Contains(err.Error(), "choose exactly one mode") {
+		t.Fatalf("error=%v, want conflicting-mode error", err)
 	}
 }
 
@@ -569,6 +578,23 @@ func TestParseFlagsBasic(t *testing.T) {
 	}
 	if cfg.maxDownloadBytes != defaultMaxDownloadBytes {
 		t.Fatalf("maxDownloadBytes=%d should be default", cfg.maxDownloadBytes)
+	}
+}
+
+func TestParseFlagsLegacyAliases(t *testing.T) {
+	resetFlagCommandLine(t, "-domain=example.com", "-pass=legacy", "-in=input.bin", "-cache-dir=/tmp/gdns2tcp-cache")
+	cfg := parseFlags()
+	if cfg.pass != "legacy" || cfg.mode != "upload" || cfg.inFile != "input.bin" {
+		t.Fatalf("legacy aliases parsed incorrectly: %+v", cfg)
+	}
+	if cfg.cacheDir != "/tmp/gdns2tcp-cache" {
+		t.Fatalf("cache dir = %q", cfg.cacheDir)
+	}
+
+	resetFlagCommandLine(t, "-domain=example.com", "-pass=legacy", "-filename=remote.bin")
+	cfg = parseFlags()
+	if cfg.mode != "download" || cfg.filename != "remote.bin" {
+		t.Fatalf("filename alias parsed incorrectly: %+v", cfg)
 	}
 }
 

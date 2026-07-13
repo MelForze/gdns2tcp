@@ -195,6 +195,32 @@ if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){
 
 Add `-tcp` (Go) or `-Tcp` (PowerShell) if UDP is blocked or truncates.
 
+### Transfer limits, cache and resume
+
+- The server accepts uploads up to **32 MiB** and serves source files up to
+  **256 MiB** by default. Override these limits with
+  `-max-upload-bytes` and `-max-download-bytes` only when both peers have
+  enough disk space for the temporary spool files.
+- Downloads are compressed, encrypted and encoded as streaming disk spools;
+  neither endpoint holds the complete transfer in RAM. A server-side encoded
+  cache is kept in `<data-dir>/.gdns2tcp-cache` for 24 hours, with a 1 GiB
+  hard LRU quota that also reserves space for in-progress cache builds. A new
+  build is rejected when inactive entries cannot free enough space. Use
+  `-cache-dir`, `-cache-max-bytes` and `-cache-ttl` to change it.
+- The Go client keeps incomplete downloads in the OS user cache (1 GiB,
+  seven-day cleanup) and resumes them from one spool file plus a bitmap.
+  It reserves quota before creating the spool and locks each transfer across
+  processes. `-cache-dir <dir>` selects another location; `-no-resume` keeps
+  all temporary state only for the current invocation.
+- Direct PowerShell TCP downloads reuse a bounded pool of 16 DNS connections
+  with connect/read/write timeouts; a broken stream is discarded without
+  affecting the other pool entries.
+- The legacy Go spellings `-pass`, `-in` and `-filename` remain accepted as
+  aliases for `-password`, `-upload` and `-download`. PowerShell accepts
+  `-in`, `-chunk-size` and `-max-download-bytes` alongside its canonical
+  parameter names. The Go file client requires exactly one mode flag and
+  rejects conflicting modes.
+
 ---
 
 ## Reverse SOCKS5 — browse the agent's network

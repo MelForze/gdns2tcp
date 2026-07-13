@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"gdns2tcp/internal/clihelp"
 	"gdns2tcp/internal/dnsserver"
 
 	"github.com/miekg/dns"
@@ -43,9 +45,13 @@ func run() error {
 		socksNoAuth      bool
 		proxyMaxConn     int
 		proxyBufBytes    int
+		cacheDir         string
+		cacheMaxBytes    int64
+		cacheTTL         time.Duration
 		pprofAddr        string
 	)
 
+	installUsage()
 	flag.StringVar(&domain, "domain", "", "authoritative DNS domain. Accepts a single name (files.example.com) or a comma-separated list for shard-domain fan-out (files.example.com,files1.example.com,files2.example.com); the first entry is used as the canonical HMAC domain.")
 	flag.StringVar(&domain, "d", "", "short alias for -domain")
 	flag.StringVar(&listenHost, "listen", "0.0.0.0", "UDP listen address (defaults to all interfaces)")
@@ -53,6 +59,7 @@ func run() error {
 	flag.StringVar(&port, "port", defaultPort, "UDP listen port")
 	flag.StringVar(&secret, "password", "", "shared encryption secret")
 	flag.StringVar(&secret, "p", "", "short alias for -password")
+	flag.StringVar(&secret, "pass", "", "deprecated alias for -password")
 	flag.StringVar(&dataDir, "data-dir", ".", "directory used for uploaded and downloaded files")
 	flag.StringVar(&clientsDir, "clients-dir", "clients", "directory containing client artifacts served through client-*/cl-* endpoints")
 	flag.Int64Var(&maxUploadBytes, "max-upload-bytes", dnsserver.DefaultMaxUploadBytes, "maximum protected upload payload accepted by the server")
@@ -64,6 +71,9 @@ func run() error {
 	flag.BoolVar(&socksNoAuth, "socks-no-auth", true, "skip SOCKS5 username/password auth. Default: on; pass -socks-no-auth=false to require user=gdns2tcp password=<-secret>.")
 	flag.IntVar(&proxyMaxConn, "proxy-max-conn", 64, "maximum concurrent tunnel connections")
 	flag.IntVar(&proxyBufBytes, "proxy-buf-bytes", 1<<20, "per-tunnel buffer cap (bytes) in each direction")
+	flag.StringVar(&cacheDir, "cache-dir", "", "durable download spool cache directory (default <data-dir>/.gdns2tcp-cache)")
+	flag.Int64Var(&cacheMaxBytes, "cache-max-bytes", dnsserver.DefaultCacheMaxBytes, "maximum durable download cache size in bytes")
+	flag.DurationVar(&cacheTTL, "cache-ttl", dnsserver.DefaultCacheTTL, "download cache retention duration")
 	flag.StringVar(&pprofAddr, "pprof-addr", "", "if set, expose net/http/pprof on this addr (e.g. 127.0.0.1:6060). Dev-only.")
 	flag.Parse()
 
@@ -91,6 +101,12 @@ func run() error {
 	if maxDownloadBytes <= 0 {
 		return errors.New("max-download-bytes must be positive")
 	}
+	if cacheMaxBytes <= 0 {
+		return errors.New("cache-max-bytes must be positive")
+	}
+	if cacheTTL <= 0 {
+		return errors.New("cache-ttl must be positive")
+	}
 
 	server, err := dnsserver.New(dnsserver.Config{
 		Domain:  domain,
@@ -116,6 +132,9 @@ func run() error {
 		SocksNoAuth:      socksNoAuth,
 		ProxyMaxConn:     proxyMaxConn,
 		ProxyBufBytes:    proxyBufBytes,
+		CacheDir:         cacheDir,
+		CacheMaxBytes:    cacheMaxBytes,
+		CacheTTL:         cacheTTL,
 		Logger:           log.Default(),
 	})
 	if err != nil {
@@ -138,8 +157,7 @@ func run() error {
 	}
 	log.Printf("data directory: %s", absDataDir)
 	log.Printf("clients directory: %s", absClientsDir)
-	udpSrv := &dns.Server{Addr: addr, Net: "udp", Handler: server}
-	tcpSrv := &dns.Server{Addr: addr, Net: "tcp", Handler: server}
+	udpSrv, tcpSrv := newDNSServers(addr, server)
 	errCh := make(chan error, 3)
 	go func() { errCh <- udpSrv.ListenAndServe() }()
 	go func() { errCh <- tcpSrv.ListenAndServe() }()
@@ -169,6 +187,92 @@ func run() error {
 	_ = udpSrv.Shutdown()
 	_ = tcpSrv.Shutdown()
 	return fmt.Errorf("dns server stopped: %w", firstErr)
+}
+
+func newDNSServers(addr string, handler dns.Handler) (*dns.Server, *dns.Server) {
+	udp := &dns.Server{Addr: addr, Net: "udp", Handler: handler}
+	// gdns2tcp keeps several pipelined DNS requests in flight per connection.
+	// miekg/dns otherwise closes a TCP connection after 128 queries, which can
+	// discard a response for an already-applied axchg and force an ambiguous
+	// nonce retry. Keep direct authoritative connections alive; socket failure
+	// and idle timeouts are still handled by the library and the client pools.
+	tcp := &dns.Server{Addr: addr, Net: "tcp", Handler: handler, MaxTCPQueries: -1}
+	return udp, tcp
+}
+
+func installUsage() {
+	program := filepath.Base(os.Args[0])
+	flag.CommandLine.Usage = func() {
+		clihelp.Print(flag.CommandLine.Output(), program,
+			"-domain <zone> -password <secret> [options]",
+			[]string{
+				fmt.Sprintf("%s -domain files.example.com -password \"$GDNS_PASS\" -clients-dir ./clients", program),
+				fmt.Sprintf("%s -domain files.example.com -password \"$GDNS_PASS\" -listen 0.0.0.0 -port 53", program),
+				fmt.Sprintf("%s -domain files.example.com -password \"$GDNS_PASS\" -allow-proxy -socks-listen 127.0.0.1:9050", program),
+			},
+			[]clihelp.Group{
+				{
+					Title: "Required",
+					Flags: []clihelp.Flag{
+						{Names: "-domain, -d <zone>", Description: "authoritative DNS zone; CSV enables shard fan-out, first zone is canonical"},
+						{Names: "-password, -p <secret>", Description: "shared encryption/authentication secret"},
+					},
+				},
+				{
+					Title: "DNS listener",
+					Flags: []clihelp.Flag{
+						{Names: "-listen, -l <ip>", Description: "DNS listen host (default 0.0.0.0)"},
+						{Names: "-port <port>", Description: "DNS UDP+TCP listen port (default " + defaultPort + ")"},
+					},
+				},
+				{
+					Title: "Files and transfer limits",
+					Flags: []clihelp.Flag{
+						{Names: "-data-dir <dir>", Description: "directory for operator files and uploads (default .)"},
+						{Names: "-clients-dir <dir>", Description: "directory with downloadable client artifacts (default clients)"},
+						{Names: "-disable-list", Description: "disable the DNS file listing command"},
+						{Names: "-max-upload-bytes <n>", Description: fmt.Sprintf("maximum protected upload payload (default %d)", dnsserver.DefaultMaxUploadBytes)},
+						{Names: "-max-download-bytes <n>", Description: fmt.Sprintf("maximum source file size served for downloads (default %d)", dnsserver.DefaultMaxDownloadBytes)},
+					},
+				},
+				{
+					Title: "Download disk cache",
+					Flags: []clihelp.Flag{
+						{Names: "-cache-dir <dir>", Description: "durable encoded spool cache (default <data-dir>/.gdns2tcp-cache)"},
+						{Names: "-cache-max-bytes <n>", Description: fmt.Sprintf("hard cache/build byte quota (default %d)", dnsserver.DefaultCacheMaxBytes)},
+						{Names: "-cache-ttl <duration>", Description: "inactive cache retention window (default 24h)"},
+					},
+				},
+				{
+					Title: "Reverse SOCKS proxy",
+					Flags: []clihelp.Flag{
+						{Names: "-allow-proxy", Description: "enable reverse SOCKS5 listener and agent DNS endpoints"},
+						{Names: "-socks-listen <host:port>", Description: "operator-facing SOCKS5 listen address (default 127.0.0.1:9050)"},
+						{Names: "-socks-iface <name>", Description: "bind SOCKS host to the first non-loopback IPv4 on this interface"},
+						{Names: "-socks-no-auth=<bool>", Description: "skip SOCKS username/password auth (default true); set false for user=gdns2tcp and password=secret"},
+						{Names: "-proxy-max-conn <n>", Description: "maximum concurrent tunnel connections (default 64)"},
+						{Names: "-proxy-buf-bytes <n>", Description: "per-tunnel buffer cap per direction in bytes (default 1048576)"},
+					},
+				},
+				{
+					Title: "Diagnostics",
+					Flags: []clihelp.Flag{
+						{Names: "-pprof-addr <host:port>", Description: "enable net/http/pprof on this address; development only"},
+					},
+				},
+				{
+					Title: "Deprecated aliases",
+					Flags: []clihelp.Flag{
+						{Names: "-pass <secret>", Description: "alias for -password"},
+					},
+				},
+			},
+			[]string{
+				"Go's flag parser accepts both -flag and --flag forms.",
+				"Keep -socks-listen on 127.0.0.1 unless you intentionally expose the proxy.",
+			},
+		)
+	}
 }
 
 // resolveInterfaceIPv4 returns the first usable IPv4 address bound to the

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 // resetFlagCommandLine replaces flag.CommandLine with a fresh FlagSet for the
@@ -59,6 +61,16 @@ func TestRunInvalidMaxDownloadBytes(t *testing.T) {
 	err := run()
 	if err == nil || !strings.Contains(err.Error(), "max-download-bytes must be positive") {
 		t.Fatalf("error=%v, want 'max-download-bytes must be positive'", err)
+	}
+}
+
+func TestDNSTCPServerDoesNotCloseAfterDefaultQueryLimit(t *testing.T) {
+	udp, tcp := newDNSServers("127.0.0.1:0", dns.HandlerFunc(func(dns.ResponseWriter, *dns.Msg) {}))
+	if udp.Net != "udp" || tcp.Net != "tcp" {
+		t.Fatalf("unexpected transports: udp=%q tcp=%q", udp.Net, tcp.Net)
+	}
+	if tcp.MaxTCPQueries != -1 {
+		t.Fatalf("MaxTCPQueries=%d, want -1 for long-lived pipelined tunnels", tcp.MaxTCPQueries)
 	}
 }
 

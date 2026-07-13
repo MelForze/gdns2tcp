@@ -47,6 +47,23 @@ const (
 	// server instance config overrides it via Config.ProxyWatchdogWindow so
 	// tests can shrink it without sharing state across goroutines.
 	reverseDefaultWatchdogWindow = 30 * time.Second
+
+	// reverseLeaseTTL is how long an OPEN handed to an agent stays reserved
+	// for that exact poll request.  DNS is lossy: deleting an item from the
+	// queue before the agent has acknowledged it made one dropped apoll reply
+	// strand a SOCKS connection until its idle timeout.
+	reverseLeaseTTL = 10 * time.Second
+
+	// reverseOpenTimeout bounds the time an operator waits for the agent to
+	// dial the requested target before SOCKS CONNECT receives a failure.
+	reverseOpenTimeout = 15 * time.Second
+
+	// proxyResponseTTL retains an axchg response long enough for the agent to
+	// retry exactly the same QNAME after a UDP/TCP timeout.  It is deliberately
+	// shorter than reverseLeaseTTL; the periodic janitor also bounds the map.
+	proxyResponseTTL      = 30 * time.Second
+	maxProxyResponseCache = 512
+	maxOutboundUnacked    = 128
 )
 
 // reverseConn carries one tunnel: the operator's local TCP socket on one end
@@ -83,13 +100,37 @@ type reverseConn struct {
 	opClosed    bool
 	expires     time.Time
 
-	// Anti-replay window for read-side commands (aread/aclose). The agent
-	// chooses a monotonic nonce per request; the server accepts each one at
-	// most once. We track the highest seen nonce (nonceFloor) and a 64-bit
-	// bitmap for nonces in the trailing window. Out-of-order arrivals up to
-	// 64 behind the floor are still accepted; older ones are dropped.
-	nonceFloor  uint64
-	nonceBitmap uint64
+	// Lease/open negotiation.  New agents include a unique poll ID in apoll
+	// and then send aopen once the target dial succeeds or fails.  Legacy
+	// apoll (without a poll ID) remains supported and resolves openReady at
+	// pickup time, preserving compatibility with already deployed agents.
+	leaseID      string
+	leaseExpires time.Time
+	leaseModern  bool
+	openReady    chan struct{}
+	openOnce     sync.Once
+	openStatus   byte
+	openPollID   string
+
+	// responseCache makes axchg idempotent by request nonce. Completed entries
+	// keep only headers and the DATA sequence; the payload itself lives once in
+	// outbound until read ACK. This avoids retaining hundreds of independent
+	// ~64 KiB TCP TXT payloads per tunnel.
+	responseCache map[uint64]*cachedProxyResponse
+	// outbound holds server->agent chunks until the agent acknowledges the
+	// highest contiguous sequence it has written to the local target.
+	outbound              map[uint64]outboundProxyResponse
+	outboundPlainBytes    int
+	outboundReservedBytes int
+	outboundInFlight      int
+	readAck               uint64
+
+	// Anti-replay window for read-side commands (aread/aclose).  A 64-bit
+	// bitmap was smaller but rejected valid replies with the UDP worker count
+	// (96) whenever scheduling reordered more than 64 requests.  Keep a
+	// bounded set instead; entries older than nonceReplayWindow are pruned.
+	nonceFloor uint64
+	nonceSeen  map[uint64]struct{}
 
 	// readWaiters fans the "new operator bytes" signal out to every
 	// long-poll axchg/aread that's currently parked. reversePumpOperator
@@ -97,6 +138,20 @@ type reverseConn struct {
 	// wakes up immediately (Шаг C). Slice is drained on each signal —
 	// waiters re-register on their next call if they need to wait again.
 	readWaiters []chan struct{}
+}
+
+type cachedProxyResponse struct {
+	done        chan struct{}
+	ready       bool
+	writeStatus string
+	readHead    string
+	readSeq     uint64
+	expires     time.Time
+}
+
+type outboundProxyResponse struct {
+	segments   []string
+	plainBytes int
 }
 
 // signalOneReaderLocked wakes a single parked aread/axchg — the one that
@@ -240,32 +295,149 @@ const longPollWindow = 150 * time.Millisecond
 
 // acceptNonce returns true if n hasn't been seen yet in this cid's sliding
 // window. Caller must hold rc.mu.
+const nonceReplayWindow = 65536
+
 func (rc *reverseConn) acceptNonce(n uint64) bool {
 	if n == 0 {
 		return false
 	}
+	if rc.nonceSeen == nil {
+		rc.nonceSeen = make(map[uint64]struct{}, nonceReplayWindow)
+	}
 	if n > rc.nonceFloor {
-		shift := n - rc.nonceFloor
-		if shift >= 64 {
-			rc.nonceBitmap = 0
-		} else {
-			rc.nonceBitmap <<= shift
-		}
 		rc.nonceFloor = n
-		rc.nonceBitmap |= 1
-		return true
 	}
-	// n <= floor: check whether it's still inside the trailing window.
-	diff := rc.nonceFloor - n
-	if diff >= 64 {
+	if _, exists := rc.nonceSeen[n]; exists {
 		return false
 	}
-	mask := uint64(1) << diff
-	if rc.nonceBitmap&mask != 0 {
-		return false
+	rc.nonceSeen[n] = struct{}{}
+	if len(rc.nonceSeen) > nonceReplayWindow {
+		floor := rc.nonceFloor
+		for seen := range rc.nonceSeen {
+			if seen < floor && floor-seen >= nonceReplayWindow {
+				delete(rc.nonceSeen, seen)
+			}
+		}
 	}
-	rc.nonceBitmap |= mask
 	return true
+}
+
+func cloneSegments(in []string) []string {
+	return append([]string(nil), in...)
+}
+
+// beginResponse either reserves a nonce for the caller that will compute its
+// response, or returns a previously cached/in-flight response.  rc.mu must be
+// held by the caller.  An in-flight duplicate waits outside the lock so DNS
+// retries cannot race a long-poll and turn into false replay failures.
+func (rc *reverseConn) beginResponse(nonce uint64, now time.Time) (cached []string, wait <-chan struct{}, owner bool) {
+	if rc.responseCache == nil {
+		rc.responseCache = make(map[uint64]*cachedProxyResponse)
+	}
+	if entry, ok := rc.responseCache[nonce]; ok {
+		if entry.ready && now.Before(entry.expires) {
+			return rc.materializeCachedResponseLocked(entry), nil, false
+		}
+		if !entry.ready {
+			return nil, entry.done, false
+		}
+		delete(rc.responseCache, nonce)
+	}
+	if len(rc.responseCache) >= maxProxyResponseCache {
+		// Keep the map bounded even under a broken resolver continually
+		// assigning fresh nonces.  Expired entries are preferred; otherwise
+		// any completed entry is safe to evict because the agent retries
+		// quickly and still has read ACK based recovery.
+		for key, entry := range rc.responseCache {
+			if entry.ready && now.After(entry.expires) {
+				delete(rc.responseCache, key)
+				break
+			}
+		}
+		if len(rc.responseCache) >= maxProxyResponseCache {
+			for key, entry := range rc.responseCache {
+				if entry.ready {
+					delete(rc.responseCache, key)
+					break
+				}
+			}
+		}
+	}
+	rc.responseCache[nonce] = &cachedProxyResponse{done: make(chan struct{})}
+	return nil, nil, true
+}
+
+func (rc *reverseConn) materializeCachedResponseLocked(entry *cachedProxyResponse) []string {
+	if entry == nil || !entry.ready {
+		return nil
+	}
+	out := []string{entry.writeStatus}
+	if entry.readSeq != 0 {
+		if retained, ok := rc.outbound[entry.readSeq]; ok {
+			return append(out, cloneSegments(retained.segments)...)
+		}
+		// A later delivery may already have advanced readAck and released the
+		// payload. Returning EMPTY is safe: the agent has written this sequence.
+		if entry.readSeq <= rc.readAck {
+			return append(out, "EMPTY")
+		}
+		return nil
+	}
+	if entry.readHead != "" {
+		out = append(out, entry.readHead)
+	}
+	return out
+}
+
+// finishResponse publishes a response reserved by beginResponse.  It is safe
+// to call exactly once for an owner.  rc.mu must not be held by the caller.
+func (rc *reverseConn) finishResponse(nonce uint64, response []string, now time.Time) {
+	rc.mu.Lock()
+	entry, ok := rc.responseCache[nonce]
+	if ok && !entry.ready {
+		if len(response) > 0 {
+			entry.writeStatus = response[0]
+		}
+		if len(response) > 1 {
+			entry.readHead = response[1]
+			if strings.HasPrefix(response[1], "DATA ") {
+				entry.readSeq, _ = strconv.ParseUint(strings.TrimPrefix(response[1], "DATA "), 16, 64)
+				entry.readHead = ""
+			}
+		}
+		entry.ready = true
+		entry.expires = now.Add(proxyResponseTTL)
+		close(entry.done)
+		entry.done = nil
+	}
+	rc.mu.Unlock()
+}
+
+// applyReadAck drops only chunks the agent has confirmed as written to its
+// upstream target.  Chunks remain available across a lost DNS response.
+// rc.mu must be held by the caller.
+func (rc *reverseConn) applyReadAck(ack uint64) {
+	if ack <= rc.readAck {
+		return
+	}
+	rc.readAck = ack
+	for seq, retained := range rc.outbound {
+		if seq <= ack {
+			rc.outboundPlainBytes -= retained.plainBytes
+			delete(rc.outbound, seq)
+		}
+	}
+	if rc.outboundPlainBytes < 0 {
+		rc.outboundPlainBytes = 0
+	}
+	rc.opCond.Broadcast()
+}
+
+func (rc *reverseConn) signalOpen(status byte) {
+	rc.openOnce.Do(func() {
+		rc.openStatus = status
+		close(rc.openReady)
+	})
 }
 
 // reverseState lives on Server when AllowProxy is true. Holds the rendezvous
@@ -572,7 +744,13 @@ func (s *Server) handleSOCKS5Operator(conn net.Conn) {
 		s.logger.Printf("socks5 enqueue %s→%s: %v", conn.RemoteAddr(), target, err)
 		return
 	}
-	if err := socks5WriteReply(conn, 0x00); err != nil {
+	status := s.waitReverseOpen(cid, rc)
+	if status != 0x00 {
+		_ = socks5WriteReply(conn, status)
+		s.reverseCloseConn(cid, rc, fmt.Sprintf("agent target dial status %#x", status))
+		return
+	}
+	if err := socks5WriteReply(conn, status); err != nil {
 		s.reverseCloseConn(cid, rc, "socks5 reply write: "+err.Error())
 		return
 	}
@@ -580,6 +758,22 @@ func (s *Server) handleSOCKS5Operator(conn net.Conn) {
 
 	// Pump local socket → opToAgent buffer. The aread handler drains it.
 	s.reversePumpOperator(cid, rc)
+}
+
+// waitReverseOpen waits until an agent has either completed its local target
+// dial (aopen), a legacy agent has picked up the CID, or the lease/dial window
+// expires.  SOCKS5 CONNECT must not advertise success before this point.
+func (s *Server) waitReverseOpen(cid string, rc *reverseConn) byte {
+	timer := time.NewTimer(reverseOpenTimeout)
+	defer timer.Stop()
+	select {
+	case <-rc.openReady:
+		return rc.openStatus
+	case <-timer.C:
+		return 0x04 // host unreachable / target did not answer in time
+	case <-s.reverse.shutdownCh:
+		return 0x01
+	}
 }
 
 // reverseEnqueueOpen allocates a cid + state and places it in the pending
@@ -609,6 +803,9 @@ func (s *Server) reverseEnqueueOpen(target string, op net.Conn) (string, *revers
 		sessionKey: protocol.DeriveSessionKey(s.secret, cid),
 		compressor: compressor,
 		expires:    time.Now().Add(reverseTTL),
+		openReady:  make(chan struct{}),
+		openStatus: 0x01, // general failure until an agent proves otherwise
+		outbound:   make(map[uint64]outboundProxyResponse),
 	}
 	rc.opCond = sync.NewCond(&rc.mu)
 	s.reverse.conns[cid] = rc
@@ -620,12 +817,22 @@ func (s *Server) reverseEnqueueOpen(target string, op net.Conn) (string, *revers
 // reversePumpOperator copies the operator's TCP bytes into opToAgent. Pauses
 // when the buffer is at cap; resumes after the agent's aread drains it.
 func (s *Server) reversePumpOperator(cid string, rc *reverseConn) {
-	buf := make([]byte, 4096)
+	readSize := 4096
+	if s.reverse.maxBufCap < readSize {
+		readSize = s.reverse.maxBufCap
+	}
+	if readSize < 1 {
+		readSize = 1
+	}
+	// Never read a chunk that can never fit into opToAgent.  Previously a
+	// valid small -proxy-buf-bytes value made the first Read block forever on
+	// opCond while the agent had no bytes it could drain.
+	buf := make([]byte, readSize)
 	for {
 		n, err := rc.operator.Read(buf)
 		if n > 0 {
 			rc.mu.Lock()
-			for !rc.opClosed && !rc.agentClosed && rc.opToAgent.Len()+n > s.reverse.maxBufCap {
+			for !rc.opClosed && !rc.agentClosed && rc.opToAgent.Len()+rc.outboundPlainBytes+rc.outboundReservedBytes+n > s.reverse.maxBufCap {
 				rc.opCond.Wait()
 			}
 			if rc.opClosed || rc.agentClosed {
@@ -655,6 +862,14 @@ func (s *Server) reverseCloseConn(cid string, rc *reverseConn, reason string) {
 	if rc == nil {
 		return
 	}
+	// Keep reverseState -> reverseConn as the single lock ordering.  Poll and
+	// aopen inspect pending state under reverseState.mu and then rc.mu; taking
+	// rc.mu first here used to permit a shutdown/lease deadlock.
+	if s.reverse != nil {
+		s.reverse.mu.Lock()
+		cid = s.reverse.removeConnLocked(cid, rc)
+		s.reverse.mu.Unlock()
+	}
 	closedNow := false
 	rc.mu.Lock()
 	if !rc.opClosed || !rc.agentClosed {
@@ -666,12 +881,6 @@ func (s *Server) reverseCloseConn(cid string, rc *reverseConn, reason string) {
 		closedNow = true
 	}
 	rc.mu.Unlock()
-
-	if s.reverse != nil {
-		s.reverse.mu.Lock()
-		cid = s.reverse.removeConnLocked(cid, rc)
-		s.reverse.mu.Unlock()
-	}
 	if closedNow {
 		s.logger.Printf("reverse close cid=%s (%s)", cid, reason)
 	}
@@ -720,9 +929,11 @@ func (r *reverseState) removeConnLocked(cid string, rc *reverseConn) string {
 
 // --- Agent DNS endpoints ---------------------------------------------------
 
-// apoll: agent asks "any new tunnels?". Returns "OPEN <cid> <target_b32>" or
-// "EMPTY". Idempotent — the same cid is handed to the first apoll that pulls
-// it; we don't requeue.
+// apoll: agent asks "any new tunnels?".  Modern agents include one unique
+// poll ID in the authenticated payload.  The server leases (rather than
+// removes) a CID and repeats the same OPEN for a retry of that poll ID.  A
+// lease without aopen expires and another agent can pick it up.  Empty-payload
+// apoll remains the legacy wire format for existing agents.
 //
 // The agent's source IP is recorded so the server can (1) log a single
 // "agent connected" line per new agent and (2) signal ServeSOCKS5 to bind
@@ -739,6 +950,16 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 	if s.reverse.noteAgent(client) {
 		s.logger.Printf("agent connected from %s (first apoll)", client)
 	}
+	if len(payload) > 1 {
+		return []string{"ERR malformed"}
+	}
+	pollID := ""
+	if len(payload) == 1 {
+		pollID = strings.ToLower(payload[0])
+		if !validPollID(pollID) {
+			return []string{"ERR bad poll"}
+		}
+	}
 
 	for {
 		s.reverse.mu.Lock()
@@ -746,6 +967,35 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 			s.reverse.mu.Unlock()
 			return []string{"EMPTY"}
 		}
+		if pollID != "" {
+			for _, rc := range s.reverse.pending {
+				cid := s.reverse.pendCids[rc]
+				if cid == "" || s.reverse.conns[cid] != rc {
+					continue
+				}
+				rc.mu.Lock()
+				if rc.leaseID == pollID {
+					rc.leaseExpires = now.Add(reverseLeaseTTL)
+					rc.mu.Unlock()
+					s.reverse.mu.Unlock()
+					return []string{"OPEN " + cid + " " + dnshelpers.B32LowerNoPad.EncodeToString([]byte(rc.target))}
+				}
+				if rc.leaseID == "" || !now.Before(rc.leaseExpires) {
+					rc.leaseID = pollID
+					rc.leaseExpires = now.Add(reverseLeaseTTL)
+					rc.leaseModern = true
+					rc.mu.Unlock()
+					s.reverse.mu.Unlock()
+					return []string{"OPEN " + cid + " " + dnshelpers.B32LowerNoPad.EncodeToString([]byte(rc.target))}
+				}
+				rc.mu.Unlock()
+			}
+			s.reverse.mu.Unlock()
+			return []string{"EMPTY"}
+		}
+
+		// Legacy behavior: remove the pending entry at pickup and allow the
+		// SOCKS handler to proceed.  New agents never use this branch.
 		rc := s.reverse.pending[0]
 		s.reverse.pending = s.reverse.pending[1:]
 		cid := s.reverse.pendCids[rc]
@@ -755,10 +1005,98 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 		if !live || cid == "" {
 			continue
 		}
-
+		rc.signalOpen(0x00)
 		targetB32 := dnshelpers.B32LowerNoPad.EncodeToString([]byte(rc.target))
 		return []string{"OPEN " + cid + " " + targetB32}
 	}
+}
+
+func validPollID(value string) bool {
+	if len(value) != 16 {
+		return false
+	}
+	for _, c := range value {
+		if (c >= 'a' && c <= 'f') || (c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// aopen is the modern lease acknowledgement.  It is authenticated with the
+// regular command HMAC because no tunnel traffic may flow until the target
+// dial result is known.
+//
+// Wire: cid . pollID . status . timestamp . token . aopen . domain
+// status is ok, refused, unreachable, or timeout.
+func (s *Server) proxyAgentOpen(args []string, now time.Time) []string {
+	if !s.allowProxy || s.reverse == nil {
+		return []string{proxyDisabledResponse}
+	}
+	payload, ts, mac, ok := splitAuthenticatedArgs(args)
+	if !ok || !protocol.VerifyAuth(s.secret, s.authDomain, "aopen", payload, ts, mac, now) {
+		return []string{proxyAuthFailResponse}
+	}
+	if len(payload) != 3 {
+		return []string{"ERR malformed"}
+	}
+	cid := strings.ToLower(payload[0])
+	pollID := strings.ToLower(payload[1])
+	if !gproxy.ValidCID(cid) || !validPollID(pollID) {
+		return []string{"ERR malformed"}
+	}
+	status := map[string]byte{
+		"ok":          0x00,
+		"refused":     0x05,
+		"unreachable": 0x04,
+		"timeout":     0x06,
+	}[strings.ToLower(payload[2])]
+	if status == 0 && strings.ToLower(payload[2]) != "ok" {
+		return []string{"ERR malformed"}
+	}
+
+	s.reverse.mu.Lock()
+	rc, exists := s.reverse.conns[cid]
+	if !exists {
+		s.reverse.mu.Unlock()
+		return []string{"OK"}
+	}
+	rc.mu.Lock()
+	if rc.openPollID == pollID && rc.openStatus == status {
+		rc.mu.Unlock()
+		s.reverse.mu.Unlock()
+		return []string{"OK"}
+	}
+	if !rc.leaseModern || rc.leaseID != pollID || !now.Before(rc.leaseExpires) {
+		rc.mu.Unlock()
+		s.reverse.mu.Unlock()
+		return []string{"ERR lease"}
+	}
+	rc.leaseID = ""
+	rc.leaseExpires = time.Time{}
+	rc.leaseModern = false
+	rc.openPollID = pollID
+	rc.openStatus = status
+	if status == 0x00 {
+		// The lease has become an active tunnel.  It must no longer be
+		// eligible for any other agent's poll.
+		for i, pending := range s.reverse.pending {
+			if pending == rc {
+				s.reverse.pending = append(s.reverse.pending[:i], s.reverse.pending[i+1:]...)
+				break
+			}
+		}
+		delete(s.reverse.pendCids, rc)
+	}
+	rc.mu.Unlock()
+	s.reverse.mu.Unlock()
+
+	rc.signalOpen(status)
+	if status != 0x00 {
+		s.reverseCloseConn(cid, rc, "agent target dial failed")
+	}
+	return []string{"OK"}
 }
 
 // aread: agent fetches operator-to-target bytes for cid. Returns
@@ -1047,11 +1385,19 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 	if err != nil {
 		return []string{"ERR bad nonce"}
 	}
-	// Optional TCP hint, like aread. Goes just before the nonce/smac trailer.
-	// The marker must not be a bare base32 word; otherwise a ciphertext label
-	// can be mistaken for transport metadata.
+	// Optional read ACK and TCP hint live immediately before the nonce/smac
+	// trailer.  They contain '-' and therefore cannot collide with base32
+	// ciphertext labels.
 	maxRead := gproxy.MaxReadBytes
 	chunksEnd := len(args) - 2
+	var readAck uint64
+	if chunksEnd > 0 && strings.HasPrefix(args[chunksEnd-1], "a-") {
+		readAck, err = strconv.ParseUint(strings.TrimPrefix(args[chunksEnd-1], "a-"), 16, 64)
+		if err != nil {
+			return []string{"ERR bad ack"}
+		}
+		chunksEnd--
+	}
 	if chunksEnd > 0 && args[chunksEnd-1] == gproxy.AxchgTCPMarker {
 		maxRead = gproxy.MaxReadBytesTCP
 		chunksEnd--
@@ -1069,22 +1415,62 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 	}
 
 	rc.mu.Lock()
-	if !rc.acceptNonce(readNonce) {
+	cached, wait, owner := rc.beginResponse(readNonce, now)
+	if cached != nil {
+		rc.mu.Unlock()
+		return cached
+	}
+	if wait != nil {
+		rc.mu.Unlock()
+		select {
+		case <-wait:
+			rc.mu.Lock()
+			entry := rc.responseCache[readNonce]
+			if out := rc.materializeCachedResponseLocked(entry); out != nil {
+				rc.mu.Unlock()
+				return out
+			}
+			rc.mu.Unlock()
+			return []string{"ERR retry"}
+		case <-time.After(longPollWindow + time.Second):
+			return []string{"ERR retry"}
+		}
+	}
+	if !owner {
 		rc.mu.Unlock()
 		return []string{proxyAuthFailResponse}
 	}
+	duplicateNonce := !rc.acceptNonce(readNonce)
+	rc.applyReadAck(readAck)
 	rc.mu.Unlock()
 
 	// --- Write phase (if any) ------------------------------------------------
 	writeStatus := "ACK " + strconv.FormatUint(writeSeq, 16)
 	if writeSeq > 0 {
 		if len(dataLabels) == 0 {
-			return []string{"ERR malformed"}
+			out := []string{"ERR malformed"}
+			rc.finishResponse(readNonce, out, now)
+			return out
 		}
 		writeStatus = s.applyAxchgWrite(rc, writeSeq, dataLabels, now)
 		if strings.HasPrefix(writeStatus, "ERR") {
-			return []string{writeStatus}
+			out := []string{writeStatus}
+			rc.finishResponse(readNonce, out, now)
+			return out
 		}
+	}
+
+	// A compact response-cache entry may have been evicted before a delayed
+	// TCP retry arrived. The nonce proves this request was handled already.
+	// Re-apply the write idempotently, but never drain a new read chunk: return
+	// the oldest retained outbound sequence (or EMPTY/CLOSED) instead.
+	if duplicateNonce {
+		readSegs := s.collectRetainedAxchgRead(rc, now)
+		out := make([]string, 0, 1+len(readSegs))
+		out = append(out, writeStatus)
+		out = append(out, readSegs...)
+		rc.finishResponse(readNonce, out, now)
+		return out
 	}
 
 	// --- Read phase ----------------------------------------------------------
@@ -1097,6 +1483,7 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 	out := make([]string, 0, 1+len(readSegs))
 	out = append(out, writeStatus)
 	out = append(out, readSegs...)
+	rc.finishResponse(readNonce, out, now)
 	return out
 }
 
@@ -1194,6 +1581,15 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	}
 
 	rc.mu.Lock()
+	if len(rc.outbound)+rc.outboundInFlight >= maxOutboundUnacked {
+		if data := rc.oldestOutboundLocked(); data != nil {
+			rc.expires = now.Add(reverseTTL)
+			rc.mu.Unlock()
+			return data
+		}
+		rc.mu.Unlock()
+		return []string{"EMPTY"}
+	}
 	if rc.opToAgent.Len() == 0 {
 		isClosed := rc.opClosed || rc.agentClosed
 		rc.expires = now.Add(reverseTTL)
@@ -1213,8 +1609,9 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	_, _ = rc.opToAgent.Read(*rawBuf)
 	rc.seqOpToA++
 	seq := rc.seqOpToA
+	rc.outboundInFlight++
+	rc.outboundReservedBytes += take
 	rc.expires = now.Add(reverseTTL)
-	rc.opCond.Broadcast()
 	rc.mu.Unlock()
 
 	plaintext := rc.compressor.Encode(*rawBuf)
@@ -1225,7 +1622,46 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	b64 := base64.StdEncoding.EncodeToString(ct)
 	out := []string{"DATA " + strconv.FormatUint(seq, 16)}
 	out = append(out, codec.ChunkString(b64, codec.TXTChunkSize)...)
+	rc.mu.Lock()
+	if rc.outbound == nil {
+		rc.outbound = make(map[uint64]outboundProxyResponse)
+	}
+	rc.outboundInFlight--
+	rc.outboundReservedBytes -= take
+	rc.outbound[seq] = outboundProxyResponse{segments: cloneSegments(out), plainBytes: take}
+	rc.outboundPlainBytes += take
+	rc.mu.Unlock()
 	return out
+}
+
+func (rc *reverseConn) oldestOutboundLocked() []string {
+	var (
+		seq  uint64
+		data []string
+	)
+	for candidate, retained := range rc.outbound {
+		if candidate <= rc.readAck {
+			continue
+		}
+		if data == nil || candidate < seq {
+			seq, data = candidate, retained.segments
+		}
+	}
+	return cloneSegments(data)
+}
+
+func (s *Server) collectRetainedAxchgRead(rc *reverseConn, now time.Time) []string {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if data := rc.oldestOutboundLocked(); data != nil {
+		rc.expires = now.Add(reverseTTL)
+		return data
+	}
+	rc.expires = now.Add(reverseTTL)
+	if rc.opClosed || rc.agentClosed {
+		return []string{"CLOSED"}
+	}
+	return []string{"EMPTY"}
 }
 
 // cidForReverseConn does a reverse lookup; used only on the rare error path
@@ -1266,6 +1702,18 @@ func (s *Server) proxyCleanupExpiredLocked(now time.Time) {
 	}
 	for _, item := range snapshot {
 		item.rc.mu.Lock()
+		if item.rc.leaseModern && !now.Before(item.rc.leaseExpires) {
+			// Keep the CID in pending: the next agent poll will acquire a
+			// new lease.  Only the abandoned lease itself expires.
+			item.rc.leaseID = ""
+			item.rc.leaseExpires = time.Time{}
+			item.rc.leaseModern = false
+		}
+		for nonce, entry := range item.rc.responseCache {
+			if entry.ready && !now.Before(entry.expires) {
+				delete(item.rc.responseCache, nonce)
+			}
+		}
 		expired := now.After(item.rc.expires)
 		both := item.rc.opClosed && item.rc.agentClosed
 		item.rc.mu.Unlock()
@@ -1277,6 +1725,22 @@ func (s *Server) proxyCleanupExpiredLocked(now time.Time) {
 			rc  *reverseConn
 		}{cid: item.cid, rc: item.rc})
 	}
+	// These maps are diagnostic-only.  Without cleanup a long-running
+	// server that sees many transient DNS source addresses grows forever.
+	s.reverse.agentReadyMu.Lock()
+	for addr, seen := range s.reverse.knownAgents {
+		if now.Sub(seen) > reverseTTL {
+			delete(s.reverse.knownAgents, addr)
+		}
+	}
+	s.reverse.agentReadyMu.Unlock()
+	s.reverse.authFailLogMu.Lock()
+	for addr, seen := range s.reverse.lastAuthFailLog {
+		if now.Sub(seen) > reverseTTL {
+			delete(s.reverse.lastAuthFailLog, addr)
+		}
+	}
+	s.reverse.authFailLogMu.Unlock()
 	for _, item := range expiredConns {
 		s.reverseCloseConn(item.cid, item.rc, "idle past "+reverseTTL.String())
 	}
@@ -1447,7 +1911,6 @@ func socks5WriteReply(conn net.Conn, status byte) error {
 	_, err := conn.Write([]byte{0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	return err
 }
-
 
 // tuneTCPConn applies the TCP_NODELAY + SO_KEEPALIVE pair to a connection
 // when it's a *net.TCPConn (the common case here — SOCKS5 operators dial

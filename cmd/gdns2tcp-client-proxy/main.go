@@ -15,12 +15,14 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"gdns2tcp/internal/clihelp"
 	"gdns2tcp/internal/codec"
 	"gdns2tcp/internal/dnshelpers"
 	"gdns2tcp/internal/protocol"
@@ -120,7 +122,7 @@ func run() error {
 			time.Sleep(cfg.pollMax)
 			continue
 		}
-		cid, target, err := agentPoll(cfg, resolver)
+		cid, target, pollID, err := agentPoll(cfg, resolver)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "apoll: %v\n", err)
 			time.Sleep(cfg.pollMax)
@@ -136,19 +138,21 @@ func run() error {
 		}
 		delay = cfg.pollMin
 		live.Add(1)
-		go func(cid, target string) {
+		go func(cid, target, pollID string) {
 			defer live.Add(-1)
-			handleTunnel(cfg, resolver, cid, target)
-		}(cid, target)
+			handleTunnel(cfg, resolver, cid, target, pollID)
+		}(cid, target, pollID)
 	}
 }
 
 func parseFlags() config {
 	cfg := config{}
+	installUsage()
 	flag.StringVar(&cfg.domain, "domain", "", "authoritative gdns2tcp domain. Accepts a single name or CSV list (a.com,b.com,c.com) — the first is used as the canonical HMAC domain, all are rotated round-robin as QNAME suffixes to spread load across resolver per-zone rate-limits.")
 	flag.StringVar(&cfg.domain, "d", "", "short alias for -domain")
 	flag.StringVar(&cfg.pass, "password", "", "shared encryption secret (must match server's -password)")
 	flag.StringVar(&cfg.pass, "p", "", "short alias for -password")
+	flag.StringVar(&cfg.pass, "pass", "", "deprecated alias for -password")
 	flag.StringVar(&cfg.dnsServer, "dns-server", "", "DNS server address; empty uses the system resolver")
 	flag.StringVar(&cfg.dnsServer, "ds", "", "short alias for -dns-server")
 	flag.StringVar(&cfg.dnsPort, "dns-port", defaultDNSPort, "DNS server port; defaults to 53")
@@ -191,32 +195,104 @@ func parseFlags() config {
 	return cfg
 }
 
-// autoResolverAddr picks a DNS server address for the agent when -ds
-// wasn't provided. Tries /etc/resolv.conf first (Unix-family), then
-// falls back to resolving cfg.domain via the OS default resolver and
-// using that IP (works on Windows / any platform where resolv.conf
-// isn't present or readable).
+func installUsage() {
+	program := filepath.Base(os.Args[0])
+	flag.CommandLine.Usage = func() {
+		clihelp.Print(flag.CommandLine.Output(), program,
+			"-domain <zone> -password <secret> [options]",
+			[]string{
+				fmt.Sprintf("%s -domain files.example.com -password \"$GDNS_PASS\"", program),
+				fmt.Sprintf("%s -domain files.example.com -password \"$GDNS_PASS\" -dns-server 203.0.113.10 -tcp", program),
+				fmt.Sprintf("%s -domain files.example.com -password \"$GDNS_PASS\" -max-conn 64 -target-dial-timeout 750ms", program),
+			},
+			[]clihelp.Group{
+				{
+					Title: "Required",
+					Flags: []clihelp.Flag{
+						{Names: "-domain, -d <zone>", Description: "authoritative gdns2tcp zone; CSV enables shard fan-out, first zone is canonical"},
+						{Names: "-password, -p <secret>", Description: "shared secret; must match the server"},
+					},
+				},
+				{
+					Title: "DNS transport",
+					Flags: []clihelp.Flag{
+						{Names: "-dns-server, -ds <ip>", Description: "DNS server address; empty auto-discovers a resolver"},
+						{Names: "-dns-port, -dp <port>", Description: "DNS server port (default " + defaultDNSPort + ")"},
+						{Names: "-tcp", Description: "use TCP instead of UDP for DNS queries"},
+						{Names: "-retries <n>", Description: "DNS query attempts before failing (default 3)"},
+					},
+				},
+				{
+					Title: "Tunnel capacity and target dialing",
+					Flags: []clihelp.Flag{
+						{Names: "-max-conn <n>", Description: "maximum concurrent local target connections, 1-512 (default 32)"},
+						{Names: "-target-dial-timeout <duration>", Description: "TCP dial timeout for target host:port requested through SOCKS (default 1s)"},
+					},
+				},
+				{
+					Title: "Polling cadence",
+					Flags: []clihelp.Flag{
+						{Names: "-poll-min <duration>", Description: "minimum apoll/aread interval while active (default 20ms)"},
+						{Names: "-poll-max <duration>", Description: "maximum apoll/aread interval after idle responses (default 200ms)"},
+					},
+				},
+				{
+					Title: "Deprecated aliases",
+					Flags: []clihelp.Flag{
+						{Names: "-pass <secret>", Description: "alias for -password"},
+					},
+				},
+			},
+			[]string{
+				"Run this on the target side; the operator connects to the server's SOCKS listener.",
+				"Go's flag parser accepts both -flag and --flag forms.",
+			},
+		)
+	}
+}
+
+// autoResolverAddr picks a DNS server address for the agent when -ds wasn't
+// provided.  On Unix it uses resolv.conf.  On platforms without it (notably
+// Windows), it resolves the zone's NS records through the system resolver and
+// dials the authoritative nameserver — the zone apex itself commonly has no
+// A/AAAA record, so looking it up as an IP was not a valid fallback.
 func autoResolverAddr(domain string) (string, error) {
 	if addr, err := resolvConfNameserver(); err == nil {
 		return addr, nil
 	}
-	// Fallback: ask the platform resolver where -domain points and
-	// use the first IPv4. Works on Windows too.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
-	if err != nil {
-		return "", fmt.Errorf("no /etc/resolv.conf and cannot resolve %s: %w; specify -dns-server explicitly", domain, err)
-	}
-	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			return v4.String(), nil
+	nss, err := net.DefaultResolver.LookupNS(ctx, domain)
+	if err == nil {
+		for _, ns := range nss {
+			ips, lookupErr := net.DefaultResolver.LookupIP(ctx, "ip", ns.Host)
+			if lookupErr != nil {
+				continue
+			}
+			for _, ip := range ips {
+				if v4 := ip.To4(); v4 != nil {
+					return v4.String(), nil
+				}
+			}
+			if len(ips) > 0 {
+				return ips[0].String(), nil
+			}
 		}
 	}
-	if len(ips) > 0 {
-		return ips[0].String(), nil
+	// Non-standard private deployments sometimes put an A record at the
+	// apex; retain that as a final compatibility fallback.
+	ips, ipErr := net.DefaultResolver.LookupIP(ctx, "ip", domain)
+	if ipErr == nil {
+		for _, ip := range ips {
+			if v4 := ip.To4(); v4 != nil {
+				return v4.String(), nil
+			}
+		}
+		if len(ips) > 0 {
+			return ips[0].String(), nil
+		}
 	}
-	return "", fmt.Errorf("no IPs returned for %s; specify -dns-server explicitly", domain)
+	return "", fmt.Errorf("cannot discover an authoritative nameserver for %s; specify -dns-server explicitly", domain)
 }
 
 func resolvConfNameserver() (string, error) {
@@ -247,6 +323,7 @@ type tunnelSession struct {
 	sessionKey [32]byte
 	compressor *gproxy.Compressor
 	nonce      atomic.Uint64
+	readAck    atomic.Uint64
 }
 
 func (ts *tunnelSession) nextNonce() uint64 {
@@ -255,13 +332,12 @@ func (ts *tunnelSession) nextNonce() uint64 {
 
 // handleTunnel dials the target locally and bridges bytes through the DNS
 // tunnel until either side closes.
-func handleTunnel(cfg config, resolver *txtResolver, cid, target string) {
+func handleTunnel(cfg config, resolver *txtResolver, cid, target, pollID string) {
 	dialer := net.Dialer{Timeout: cfg.targetTimeout, KeepAlive: 30 * time.Second}
 	upstream, err := dialer.Dial("tcp", target)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dial %s for cid=%s: %v\n", target, cid, err)
-		ts := &tunnelSession{sessionKey: protocol.DeriveSessionKey(cfg.pass, cid)}
-		_ = agentClose(cfg, resolver, ts, cid)
+		_ = agentOpen(cfg, resolver, cid, pollID, dialFailureStatus(err))
 		return
 	}
 	defer upstream.Close()
@@ -273,20 +349,22 @@ func handleTunnel(cfg config, resolver *txtResolver, cid, target string) {
 
 	aead, err := gproxy.SessionAEAD(cfg.pass, cid)
 	if err != nil {
-		ts := &tunnelSession{sessionKey: protocol.DeriveSessionKey(cfg.pass, cid)}
-		_ = agentClose(cfg, resolver, ts, cid)
+		_ = agentOpen(cfg, resolver, cid, pollID, "unreachable")
 		return
 	}
 	compressor, err := gproxy.GetCompressor()
 	if err != nil {
-		ts := &tunnelSession{sessionKey: protocol.DeriveSessionKey(cfg.pass, cid)}
-		_ = agentClose(cfg, resolver, ts, cid)
+		_ = agentOpen(cfg, resolver, cid, pollID, "unreachable")
 		return
 	}
 	ts := &tunnelSession{
 		aead:       aead,
 		sessionKey: protocol.DeriveSessionKey(cfg.pass, cid),
 		compressor: compressor,
+	}
+	if err := agentOpen(cfg, resolver, cid, pollID, "ok"); err != nil {
+		fmt.Fprintf(os.Stderr, "aopen cid=%s: %v\n", cid, err)
+		return
 	}
 	// Worst-case budget assumes seq+nonce fit in 32 bits (= 8 hex chars
 	// each). With 96 axchg workers and one seq per chunk, at 100K q/s
@@ -315,13 +393,25 @@ func handleTunnel(cfg config, resolver *txtResolver, cid, target string) {
 	_ = agentClose(cfg, resolver, ts, cid)
 }
 
+func dialFailureStatus(err error) string {
+	if isTimeout(err) {
+		return "timeout"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Timeout() {
+		return "timeout"
+	}
+	return "refused"
+}
+
 // axchgRetries is how many times a worker retries a single axchg round-trip
 // before tearing down the tunnel. 1–5% UDP loss is normal on residential
 // and cellular WAN; without retries, a bulk download trips
 // `connection closed` mid-stream the first time a packet drops. Each retry
-// uses a fresh nonce internally — the server doesn't conflate retries with
-// replays. Safe for write-bearing exchanges because the server fast-paths
-// duplicate seqs (seq ≤ seqAgentIn → ACK without re-applying).
+// resends the exact same nonce and QNAME, so the server's response cache can
+// return the retained outbound chunk byte-for-byte. Safe for write-bearing
+// exchanges because the server also fast-paths duplicate seqs
+// (seq ≤ seqAgentIn → ACK without re-applying).
 const axchgRetries = 3
 
 // errServerSeq is the typed sentinel for the server's "ERR seq" response
@@ -387,6 +477,7 @@ func tuningForCfg(cfg config) tunnelTuning {
 func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolver, ts *tunnelSession, cid string, upstream net.Conn, done <-chan struct{}, stop func()) {
 	writeJobs := make(chan awriteJob, tuning.workers)
 	readResults := make(chan exchangeResult, tuning.workers)
+	orderedReads := make(chan exchangeResult, tuning.reorderCap)
 	internalStop := make(chan struct{})
 	var stopOnce sync.Once
 	stopAll := func() {
@@ -397,6 +488,30 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 	// this, the EOF path (close(writeJobs); return) leaves the upstream
 	// deadline-poke goroutine parked on done/internalStop forever.
 	defer stop()
+	writerDone := make(chan struct{})
+	writerErr := make(chan error, 1)
+	go func() {
+		defer close(writerDone)
+		for result := range orderedReads {
+			if err := writeAll(upstream, result.readData); err != nil {
+				writerErr <- err
+				stopAll()
+				return
+			}
+			// Read ACK means "written to the target", not merely received from
+			// DNS. Advancing it here keeps server-side retransmission safe.
+			ts.readAck.Store(result.readSeq)
+		}
+	}()
+	writerClosed := false
+	finishWriter := func() {
+		if !writerClosed {
+			writerClosed = true
+			close(orderedReads)
+		}
+		<-writerDone
+	}
+	defer finishWriter()
 
 	var workerWG sync.WaitGroup
 	for i := 0; i < tuning.workers; i++ {
@@ -463,7 +578,7 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 					err               error
 					backpressureStart time.Time
 				)
-				for attempt := 0; attempt < axchgRetries; attempt++ {
+				for {
 					shardAuth := pickShard()
 					if haveJob {
 						res, err = agentExchange(cfg, resolver, ts, cid, job.seq, job.data, shardAuth)
@@ -477,11 +592,7 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 						if backpressureStart.IsZero() {
 							backpressureStart = time.Now()
 						}
-						if time.Since(backpressureStart) > tuning.backpressureCap {
-							// Server has been refusing this seq for too long;
-							// fall through to the normal error path which
-							// tears the tunnel down.
-						} else {
+						if time.Since(backpressureStart) <= tuning.backpressureCap {
 							// First few hits use a short sleep so a transient
 							// window-full (server's about to drain) recovers
 							// in ~1 ms instead of ~15 ms. Persistent
@@ -508,13 +619,13 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 								return
 							case <-timer.C:
 							}
-							attempt--
 							continue
 						}
 					}
-					if attempt < axchgRetries-1 {
-						time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
-					}
+					// agentExchange already retried the exact same QNAME for every
+					// transport failure.  Creating a new nonce now would abandon a
+					// possibly consumed server response, so fail closed instead.
+					break
 				}
 				if haveJob {
 					gproxy.PutBuf(job.bufPtr)
@@ -561,6 +672,7 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 		case <-internalStop:
 		}
 		_ = upstream.SetReadDeadline(time.Unix(1, 0))
+		_ = upstream.SetWriteDeadline(time.Unix(1, 0))
 	}()
 	go func() {
 		var seq uint64
@@ -644,7 +756,6 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 		if r.readClosed {
 			stopAll()
 			drainExchange(readResults)
-			_ = flushContiguous(pending, &nextSeq, upstream)
 			return
 		}
 		if r.readEmpty || len(r.readData) == 0 {
@@ -660,66 +771,49 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 			drainExchange(readResults)
 			return
 		}
-		if err := flushContiguous(pending, &nextSeq, upstream); err != nil {
+		if !enqueueContiguous(pending, &nextSeq, orderedReads, done, internalStop) {
 			stopAll()
 			drainExchange(readResults)
 			return
 		}
 	}
 	// readResults closed → all workers exited (clean teardown path).
-	// Flush any contiguous reads still buffered, then warn if a gap left
-	// data stranded: the operator will see EOF mid-stream rather than
-	// silently-truncated bytes followed by EOF.
-	_ = flushContiguous(pending, &nextSeq, upstream)
+	// Queue any final contiguous reads, then warn if a gap left data stranded:
+	// the operator will see EOF mid-stream rather than silent truncation.
+	_ = enqueueContiguous(pending, &nextSeq, orderedReads, done, internalStop)
+	finishWriter()
+	select {
+	case err := <-writerErr:
+		fmt.Fprintf(os.Stderr, "axchg cid=%s: target write: %v\n", cid, err)
+	default:
+	}
 	if len(pending) > 0 {
 		fmt.Fprintf(os.Stderr, "axchg cid=%s: stream truncated at seq %d, %d chunks lost\n", cid, nextSeq, len(pending))
 	}
 }
 
-// flushContiguous writes pending[*nextSeq], pending[*nextSeq+1], ... to
-// upstream until the first gap, advancing *nextSeq as it goes. Returns
-// the first upstream.Write error or nil. The map is mutated in place;
-// any entries beyond the gap remain for the caller to inspect.
-//
-// The contiguous chunks are gathered into a net.Buffers and issued as a
-// single writev(2) so a burst of 10-32 in-order chunks costs one syscall
-// instead of one per chunk. Falls back to Write when only one chunk is
-// ready (no need to allocate a net.Buffers for a single slice).
-func flushContiguous(pending map[uint64][]byte, nextSeq *uint64, upstream net.Conn) error {
-	// Fast path: nothing to flush.
-	first, ok := pending[*nextSeq]
-	if !ok {
-		return nil
-	}
-	// Peek ahead to see how many contiguous chunks are ready. Single-chunk
-	// case skips the net.Buffers allocation entirely.
-	if _, hasNext := pending[*nextSeq+1]; !hasNext {
-		delete(pending, *nextSeq)
-		if _, err := upstream.Write(first); err != nil {
-			return err
-		}
-		*nextSeq++
-		return nil
-	}
-	// Multi-chunk case — gather and writev.
-	batch := net.Buffers{first}
-	seq := *nextSeq + 1
+// enqueueContiguous moves in-order DNS results to the dedicated target writer.
+// Keeping socket writes off the result-dispatch goroutine prevents a full-
+// duplex cycle where a target blocks writing its response until it can read,
+// while the agent has stopped reading because all axchg workers are waiting to
+// publish more read results. ACK advancement remains in the writer goroutine.
+func enqueueContiguous(pending map[uint64][]byte, nextSeq *uint64, out chan<- exchangeResult, done, internalStop <-chan struct{}) bool {
 	for {
-		data, ok := pending[seq]
+		data, ok := pending[*nextSeq]
 		if !ok {
-			break
+			return true
 		}
-		batch = append(batch, data)
-		seq++
+		result := exchangeResult{readData: data, readSeq: *nextSeq}
+		select {
+		case out <- result:
+			delete(pending, *nextSeq)
+			*nextSeq++
+		case <-done:
+			return false
+		case <-internalStop:
+			return false
+		}
 	}
-	if _, err := batch.WriteTo(upstream); err != nil {
-		return err
-	}
-	for i := *nextSeq; i < seq; i++ {
-		delete(pending, i)
-	}
-	*nextSeq = seq
-	return nil
 }
 
 func drainExchange(ch <-chan exchangeResult) {
@@ -759,6 +853,10 @@ func maxAxchgWritePlaintextBytes(domain string, tcp bool, seqWidth, nonceWidth i
 		cidLabel   = 16
 		smacLabel  = 7 // 4-byte MAC encoded as 7 base32 chars (NoPadding)
 		cmdLabel   = 5 // "axchg"
+		// a- + up to eight hex digits for the highest-contiguous read ACK.
+		// Budget it even at startup so a long-lived tunnel never crosses the
+		// DNS 253-byte limit merely because its ACK counter grew.
+		ackLabelMax = 10
 		// dotsMargin reserves chars for the dots between labels.
 		// Actual count: 2 (cid,seq) + dataLabels + (1 if tcp) + 3
 		// (nonce, smac, axchg) + 1 (domain) − 1 = 5+dataLabels (UDP)
@@ -766,7 +864,7 @@ func maxAxchgWritePlaintextBytes(domain string, tcp bool, seqWidth, nonceWidth i
 		// ~4 data labels → 9 dots UDP, 10 TCP. Margin 12 keeps safety.
 		dotsMargin = 12
 	)
-	overhead := cidLabel + seqWidth + nonceWidth + smacLabel + cmdLabel + len(domain) + dotsMargin
+	overhead := cidLabel + seqWidth + nonceWidth + ackLabelMax + smacLabel + cmdLabel + len(domain) + dotsMargin
 	if tcp {
 		overhead += len(gproxy.AxchgTCPMarker) + 1
 	}
@@ -825,37 +923,41 @@ var b32 = dnshelpers.B32LowerNoPad
 
 // agentPoll asks the server "any pending opens?". Returns (cid, target,
 // nil) on a hit, ("", "", nil) on EMPTY, or an error.
-func agentPoll(cfg config, resolver *txtResolver) (cid, target string, err error) {
-	name := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "apoll", nil)
+func agentPoll(cfg config, resolver *txtResolver) (cid, target, pollID string, err error) {
+	pollID, err = protocol.NewSID()
+	if err != nil {
+		return "", "", "", err
+	}
+	name := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "apoll", []string{pollID})
 	resp, err := resolver.query(name)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	if resp == "EMPTY" {
-		return "", "", nil
+		return "", "", "", nil
 	}
 	if strings.HasPrefix(resp, "ERR ") {
-		return "", "", errors.New(resp)
+		return "", "", "", errors.New(resp)
 	}
 	if !strings.HasPrefix(resp, "OPEN ") {
-		return "", "", fmt.Errorf("unexpected apoll response: %q", resp)
+		return "", "", "", fmt.Errorf("unexpected apoll response: %q", resp)
 	}
 	parts := strings.SplitN(resp[len("OPEN "):], " ", 2)
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("malformed OPEN response: %q", resp)
+		return "", "", "", fmt.Errorf("malformed OPEN response: %q", resp)
 	}
 	cid = parts[0]
 	if !gproxy.ValidCID(cid) {
-		return "", "", fmt.Errorf("bad cid in OPEN: %q", cid)
+		return "", "", "", fmt.Errorf("bad cid in OPEN: %q", cid)
 	}
 	// Target is base32-encoded by the server; older servers send uppercase,
 	// newer ones lowercase. dnshelpers.B32DecodeAny handles both without
 	// paying a strings.ToUpper allocation on the common (lowercase) path.
 	rawTarget, err := dnshelpers.B32DecodeAny(parts[1])
 	if err != nil {
-		return "", "", fmt.Errorf("decode target: %w", err)
+		return "", "", "", fmt.Errorf("decode target: %w", err)
 	}
-	return cid, string(rawTarget), nil
+	return cid, string(rawTarget), pollID, nil
 }
 
 // exchangeResult captures what one axchg DNS round-trip yielded: the write
@@ -900,6 +1002,7 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 	if cfg.tcp {
 		args = append(args, gproxy.AxchgTCPMarker)
 	}
+	args = append(args, "a-"+strconv.FormatUint(ts.readAck.Load(), 16))
 	args = append(args, strconv.FormatUint(readNonce, 16))
 	args = append(args, protocol.SessionMAC(ts.sessionKey, "axchg", readNonce))
 	// shardAuthDomain is pre-normalized by parseDomainCSV and "axchg"
@@ -908,7 +1011,26 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 	// HMAC/session MAC live in args and are unaffected by suffix choice.
 	name := protocol.JoinNameFast(shardAuthDomain, "axchg", args)
 
-	segs, err := resolver.queryStringsNoRetry(name)
+	// A response timeout is ambiguous: the server may already have drained
+	// a stream chunk. Retry the exact same nonce and QNAME so its response
+	// cache returns byte-identical segments. Never mint a fresh nonce here.
+	retries := cfg.retries
+	if retries < 1 {
+		retries = 1
+	}
+	var (
+		segs []string
+		err  error
+	)
+	for attempt := 0; attempt < retries; attempt++ {
+		segs, err = resolver.queryStringsNoRetry(name)
+		if err == nil {
+			break
+		}
+		if attempt+1 < retries {
+			time.Sleep(time.Duration(attempt+1) * retryBackoff)
+		}
+	}
 	if err != nil {
 		return exchangeResult{}, err
 	}
@@ -981,6 +1103,23 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 	default:
 		return exchangeResult{}, fmt.Errorf("unexpected axchg head: %q", head)
 	}
+}
+
+// agentOpen confirms a modern apoll lease after the local target dial.  The
+// request is naturally idempotent: retries carry the same cid/poll ID/status.
+func agentOpen(cfg config, resolver *txtResolver, cid, pollID, status string) error {
+	if pollID == "" {
+		return nil
+	}
+	name := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "aopen", []string{cid, pollID, status})
+	resp, err := resolver.query(name)
+	if err != nil {
+		return err
+	}
+	if resp != "OK" {
+		return fmt.Errorf("unexpected aopen response: %q", resp)
+	}
+	return nil
 }
 
 // agentClose tells the server we're done with cid. The MAC binds the nonce

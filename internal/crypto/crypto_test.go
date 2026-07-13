@@ -2,8 +2,34 @@ package cryptoutil
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+func TestProtectFileOpenFileRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source.bin")
+	protected := filepath.Join(dir, "payload.gdt")
+	out := filepath.Join(dir, "out.bin")
+	want := bytes.Repeat([]byte("streaming-gdt2-"), 8192)
+	if err := os.WriteFile(src, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProtectFile("secret", src, protected); err != nil {
+		t.Fatalf("ProtectFile: %v", err)
+	}
+	if err := OpenFile("secret", protected, out); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("streaming round trip mismatch")
+	}
+}
 
 func TestProtectRoundTrip(t *testing.T) {
 	input := []byte("sensitive test payload")

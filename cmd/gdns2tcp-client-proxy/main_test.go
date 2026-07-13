@@ -134,14 +134,14 @@ func (a *testAgent) pollLoop() {
 			return
 		default:
 		}
-		cid, target, err := agentPoll(a.cfg, a.resolver)
+		cid, target, pollID, err := agentPoll(a.cfg, a.resolver)
 		if err != nil || cid == "" {
 			if !a.sleep(5 * time.Millisecond) {
 				return
 			}
 			continue
 		}
-		a.startTunnel(cid, target)
+		a.startTunnel(cid, target, pollID)
 	}
 }
 
@@ -156,7 +156,7 @@ func (a *testAgent) sleep(d time.Duration) bool {
 	}
 }
 
-func (a *testAgent) startTunnel(cid, target string) {
+func (a *testAgent) startTunnel(cid, target, pollID string) {
 	a.mu.Lock()
 	if a.stopped {
 		a.mu.Unlock()
@@ -166,7 +166,7 @@ func (a *testAgent) startTunnel(cid, target string) {
 	a.mu.Unlock()
 	go func() {
 		defer a.wg.Done()
-		handleTunnel(a.cfg, a.resolver, cid, target)
+		handleTunnel(a.cfg, a.resolver, cid, target, pollID)
 	}()
 }
 
@@ -287,7 +287,7 @@ func TestAgentPollEmpty(t *testing.T) {
 		dnsPort:   dnsPort,
 		retries:   1,
 	}
-	cid, target, err := agentPoll(cfg, newTxtResolver(cfg))
+	cid, target, _, err := agentPoll(cfg, newTxtResolver(cfg))
 	if err != nil {
 		t.Fatalf("agentPoll: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestEndToEndReverseSOCKS5OverTCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tcpDNSSrv := &dns.Server{Listener: tcpLn, Net: "tcp", Handler: srv}
+	tcpDNSSrv := &dns.Server{Listener: tcpLn, Net: "tcp", Handler: srv, MaxTCPQueries: -1}
 	go func() { _ = tcpDNSSrv.ActivateAndServe() }()
 	go func() {
 		for {
