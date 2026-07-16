@@ -1,4 +1,4 @@
-.PHONY: all build clients servers cover clean test .FORCE .clients-dir .servers-dir
+.PHONY: all build clients servers cover cover-check clean test .FORCE .clients-dir .servers-dir
 
 BUILD_DIR  := clients
 SERVER_DIR := servers
@@ -96,6 +96,12 @@ test:
 cover:
 	go test -coverprofile=cover.out -covermode=atomic ./...
 	go tool cover -func=cover.out
+
+cover-check:
+	go test -coverprofile=cover.out -covermode=atomic ./...
+	@pct=$$(go tool cover -func=cover.out | awk '/^total:/{gsub(/%/,"",$$3); printf "%.1f", $$3}'); \
+	echo "Total test coverage: $${pct}%"; \
+	awk -v p="$${pct}" 'BEGIN { if (p+0 < 85.0) { print "FAIL: coverage " p "% is below 85.0% threshold"; exit 1 } }'
 
 clean:
 	rm -f \

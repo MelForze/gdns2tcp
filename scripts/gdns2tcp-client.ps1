@@ -166,6 +166,16 @@ function Normalize-Domain {
     if ([string]::IsNullOrWhiteSpace($normalized)) {
         throw 'Domain is empty.'
     }
+    $wireLength = [System.Text.Encoding]::UTF8.GetByteCount($normalized)
+    if ($wireLength -gt 253) {
+        throw "Domain is $wireLength bytes; DNS limit is 253."
+    }
+    foreach ($label in $normalized.Split('.')) {
+        $labelLength = [System.Text.Encoding]::UTF8.GetByteCount($label)
+        if ($labelLength -lt 1 -or $labelLength -gt 63) {
+            throw "Invalid DNS domain label: '$label'."
+        }
+    }
     return $normalized
 }
 
@@ -534,6 +544,11 @@ public static class Gdns2TcpDownload {
     }
 
     private static byte[] BuildQuery(string name, ushort id) {
+        string normalizedName = name.TrimEnd('.');
+        int presentationBytes = Encoding.ASCII.GetByteCount(normalizedName);
+        if (presentationBytes == 0 || presentationBytes > 253) {
+            throw new ArgumentException("DNS QNAME must be between 1 and 253 bytes.", "name");
+        }
         var b = new List<byte>(256);
         b.Add((byte)(id >> 8)); b.Add((byte)id);
         b.Add(0x01); b.Add(0x00);
@@ -541,8 +556,11 @@ public static class Gdns2TcpDownload {
         b.Add(0x00); b.Add(0x00);                       // ANCOUNT=0
         b.Add(0x00); b.Add(0x00);                       // NSCOUNT=0
         b.Add(0x00); b.Add(0x01);                       // ARCOUNT=1 (EDNS0 OPT)
-        foreach (string label in name.TrimEnd('.').Split('.')) {
+        foreach (string label in normalizedName.Split('.')) {
             byte[] lb = Encoding.ASCII.GetBytes(label);
+            if (lb.Length == 0 || lb.Length > 63) {
+                throw new ArgumentException("DNS label must be between 1 and 63 bytes.", "name");
+            }
             b.Add((byte)lb.Length);
             b.AddRange(lb);
         }

@@ -19,17 +19,23 @@ import (
 // of thousands of files for a moderately sized download and also rebuilt the
 // full payload in RAM before decrypting it.
 type resumeCache struct {
-	dir      string
-	enabled  bool
-	lockPath string
-	lock     *resumeFileLock
+	root      string
+	dir       string
+	enabled   bool
+	lockPath  string
+	lock      *resumeFileLock
+	quotaLock *resumeFileLock
 
-	mu         sync.Mutex
-	spool      *os.File
-	spoolPath  string
-	bitmapPath string
-	bitmap     []byte
-	meta       resumeMeta
+	mu             sync.Mutex
+	spool          *os.File
+	bitmapFile     *os.File
+	spoolPath      string
+	bitmapPath     string
+	bitmap         []byte
+	meta           resumeMeta
+	dirtyBatches   int
+	lastCheckpoint time.Time
+	checkpointHook func(string) error
 }
 
 type resumeCacheDir struct {
@@ -53,7 +59,7 @@ func newResumeCache(root, domain, filename string, enabled bool) *resumeCache {
 	sum := sha256.Sum256([]byte(domain + "|" + filename))
 	id := hex.EncodeToString(sum[:])[:16]
 	dir := filepath.Join(root, id)
-	return &resumeCache{dir: dir, lockPath: dir + ".lock", enabled: true}
+	return &resumeCache{root: root, dir: dir, lockPath: dir + ".lock", enabled: true}
 }
 
 func defaultResumeRoot() string {
@@ -74,6 +80,21 @@ func pruneResumeCache(root string, maxBytes int64, ttl time.Duration) error {
 }
 
 func pruneResumeCacheFor(root string, maxBytes int64, ttl time.Duration, reserveBytes int64, preserve string) error {
+	if root == "" {
+		return nil
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	lock, err := acquireResumeFileLock(filepath.Join(root, ".quota.lock"), false)
+	if err != nil {
+		return fmt.Errorf("lock resume quota: %w", err)
+	}
+	defer lock.release()
+	return pruneResumeCacheForLocked(root, maxBytes, ttl, reserveBytes, preserve)
+}
+
+func pruneResumeCacheForLocked(root string, maxBytes int64, ttl time.Duration, reserveBytes int64, preserve string) error {
 	if root == "" || maxBytes <= 0 || ttl <= 0 {
 		return nil
 	}
@@ -181,6 +202,13 @@ func (c *resumeCache) open(chunkCount, batchSize int, sourceSHA256 string, encod
 	if err := c.acquireLock(); err != nil {
 		return nil, err
 	}
+	ownedQuota := c.quotaLock == nil
+	if err := c.acquireQuotaLock(); err != nil {
+		return nil, err
+	}
+	if ownedQuota {
+		defer c.releaseQuotaLock()
+	}
 	batchCount := (chunkCount + batchSize - 1) / batchSize
 	want := resumeMeta{ChunkCount: chunkCount, BatchSize: batchSize, BatchCount: batchCount, EncodedSize: encodedSize, SourceSHA256: sourceSHA256}
 	if err := os.MkdirAll(c.dir, 0o700); err != nil {
@@ -228,7 +256,16 @@ func (c *resumeCache) open(chunkCount, batchSize int, sourceSHA256 string, encod
 		}
 	}
 	c.spool = f
+	bitmapFile, err := os.OpenFile(c.bitmapPath, os.O_RDWR, 0o600)
+	if err != nil {
+		_ = f.Close()
+		c.spool = nil
+		return nil, err
+	}
+	c.bitmapFile = bitmapFile
 	c.meta = want
+	c.dirtyBatches = 0
+	c.lastCheckpoint = time.Now()
 	_ = os.Chtimes(c.dir, time.Now(), time.Now())
 	for batch := 0; batch < batchCount; batch++ {
 		if c.completedLocked(batch) {
@@ -295,28 +332,71 @@ func (c *resumeCache) saveBatch(batch, from, count int, data string) error {
 		return err
 	}
 	c.bitmap[batch/8] |= 1 << uint(batch%8)
-	if err := writeAtAllFile(c.bitmapPath, c.bitmap[batch/8:batch/8+1], int64(batch/8)); err != nil {
-		return err
+	c.dirtyBatches++
+	if c.dirtyBatches >= 256 || time.Since(c.lastCheckpoint) >= 2*time.Second {
+		return c.checkpointLocked()
 	}
 	return nil
 }
 
 func (c *resumeCache) sync() error {
-	if !c.enabled || c.spool == nil {
+	if !c.enabled {
 		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.spool.Sync()
+	return c.checkpointLocked()
+}
+
+func (c *resumeCache) checkpointLocked() error {
+	if c.spool == nil {
+		return nil
+	}
+	if c.checkpointHook != nil {
+		if err := c.checkpointHook("spool-sync"); err != nil {
+			return err
+		}
+	}
+	if err := c.spool.Sync(); err != nil {
+		return err
+	}
+	if c.bitmapFile == nil {
+		return errors.New("resume bitmap is not open")
+	}
+	if c.dirtyBatches > 0 {
+		if c.checkpointHook != nil {
+			if err := c.checkpointHook("bitmap-write"); err != nil {
+				return err
+			}
+		}
+		if err := writeAtAll(c.bitmapFile, c.bitmap, 0); err != nil {
+			return err
+		}
+	}
+	if c.checkpointHook != nil {
+		if err := c.checkpointHook("bitmap-sync"); err != nil {
+			return err
+		}
+	}
+	if err := c.bitmapFile.Sync(); err != nil {
+		return err
+	}
+	c.dirtyBatches = 0
+	c.lastCheckpoint = time.Now()
+	return nil
 }
 
 func (c *resumeCache) path() string { return c.spoolPath }
 
 func (c *resumeCache) close() error {
 	err := c.closeSpool()
+	quotaErr := c.releaseQuotaLock()
 	lockErr := c.releaseLock()
 	if err != nil {
 		return err
+	}
+	if quotaErr != nil {
+		return quotaErr
 	}
 	return lockErr
 }
@@ -325,10 +405,27 @@ func (c *resumeCache) closeSpool() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.spool == nil {
+		if c.bitmapFile != nil {
+			err := c.bitmapFile.Close()
+			c.bitmapFile = nil
+			return err
+		}
 		return nil
 	}
+	syncErr := c.checkpointLocked()
 	err := c.spool.Close()
 	c.spool = nil
+	bitmapErr := error(nil)
+	if c.bitmapFile != nil {
+		bitmapErr = c.bitmapFile.Close()
+		c.bitmapFile = nil
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	if err == nil {
+		err = bitmapErr
+	}
 	return err
 }
 
@@ -353,6 +450,30 @@ func (c *resumeCache) releaseLock() error {
 	}
 	err := c.lock.release()
 	c.lock = nil
+	return err
+}
+
+func (c *resumeCache) acquireQuotaLock() error {
+	if !c.enabled || c.quotaLock != nil {
+		return nil
+	}
+	if err := os.MkdirAll(c.root, 0o700); err != nil {
+		return err
+	}
+	lock, err := acquireResumeFileLock(filepath.Join(c.root, ".quota.lock"), false)
+	if err != nil {
+		return fmt.Errorf("lock resume quota: %w", err)
+	}
+	c.quotaLock = lock
+	return nil
+}
+
+func (c *resumeCache) releaseQuotaLock() error {
+	if c.quotaLock == nil {
+		return nil
+	}
+	err := c.quotaLock.release()
+	c.quotaLock = nil
 	return err
 }
 

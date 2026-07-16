@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	DefaultMaxUploadBytes   = 32 << 20
-	DefaultMaxDownloadBytes = 256 << 20
-	DefaultCacheMaxBytes    = 1 << 30
-	DefaultCacheTTL         = 24 * time.Hour
+	DefaultMaxUploadBytes         = 32 << 20
+	DefaultMaxDownloadBytes       = 256 << 20
+	DefaultMaxClientArtifactBytes = 128 << 20
+	DefaultCacheMaxBytes          = 1 << 30
+	DefaultCacheTTL               = 24 * time.Hour
 	// clientChunkSize is the base64 chunk length used when serving downloadable
 	// client artifacts over DNS. 254 fills a single DNS TXT character-string
 	// (max 255 bytes) with one byte of safety margin. Independent from the
@@ -49,22 +50,23 @@ const (
 var dnsToBase64 = strings.NewReplacer("_", "+", "-", "/")
 
 type Config struct {
-	Domain              string
-	Secret              string
-	DataDir             string
-	ClientArtifacts     []ClientArtifactConfig
-	AllowList           bool
-	MaxUploadBytes      int64
-	MaxDownloadBytes    int64
-	AllowProxy          bool
-	SocksNoAuth         bool
-	ProxyMaxConn        int
-	ProxyBufBytes       int
-	ProxyWatchdogWindow time.Duration
-	CacheDir            string
-	CacheMaxBytes       int64
-	CacheTTL            time.Duration
-	Logger              *log.Logger
+	Domain                 string
+	Secret                 string
+	DataDir                string
+	ClientArtifacts        []ClientArtifactConfig
+	MaxClientArtifactBytes int64
+	AllowList              bool
+	MaxUploadBytes         int64
+	MaxDownloadBytes       int64
+	AllowProxy             bool
+	SocksNoAuth            bool
+	ProxyMaxConn           int
+	ProxyBufBytes          int
+	ProxyWatchdogWindow    time.Duration
+	CacheDir               string
+	CacheMaxBytes          int64
+	CacheTTL               time.Duration
+	Logger                 *log.Logger
 }
 
 type ClientArtifactConfig struct {
@@ -83,24 +85,25 @@ type Server struct {
 	// hasDomainSuffix / parseCommand walk this list to decide whether
 	// an inbound QNAME belongs to us. For single-domain configs it has
 	// exactly one entry equal to domain.
-	domains          []string
-	authDomain       string
-	secret           string
-	dataDir          string
-	allowList        bool
-	maxUploadBytes   int64
-	maxDownloadBytes int64
-	cacheDir         string
-	cacheMaxBytes    int64
-	cacheTTL         time.Duration
-	allowProxy       bool
-	socksNoAuth      bool
-	logger           *log.Logger
+	domains                []string
+	authDomain             string
+	secret                 string
+	dataDir                string
+	allowList              bool
+	maxUploadBytes         int64
+	maxDownloadBytes       int64
+	maxClientArtifactBytes int64
+	cacheDir               string
+	cacheMaxBytes          int64
+	cacheTTL               time.Duration
+	allowProxy             bool
+	socksNoAuth            bool
+	logger                 *log.Logger
 
-	mu               sync.Mutex
-	downloads        map[string]downloadState
-	uploads          map[string]uploadState
-	uploadTombstones map[string]uploadTombstone
+	mu                sync.Mutex
+	downloads         map[string]downloadState
+	uploads           map[string]uploadState
+	uploadCompletions map[string]*uploadCompletion
 
 	downloadCache         map[string]downloadCacheEntry
 	downloadCacheOrder    []string // LRU, oldest first
@@ -111,15 +114,21 @@ type Server struct {
 	clientTransfers       map[string]clientTransfer
 	reverse               *reverseState
 
-	janitorStop  chan struct{}
-	janitorDone  chan struct{}
-	shutdownOnce sync.Once
+	janitorStop      chan struct{}
+	janitorDone      chan struct{}
+	shutdownOnce     sync.Once
+	finishUploadHook func()
 }
 
 type clientArtifact struct {
-	name   string
-	sha256 string
-	chunks []string
+	name        string
+	path        string
+	identity    os.FileInfo
+	size        int64
+	mtime       time.Time
+	sha256      string
+	encodedSize int64
+	chunkCount  int
 }
 
 type clientTransfer struct {
@@ -171,7 +180,8 @@ type uploadState struct {
 	expires     time.Time
 }
 
-type uploadTombstone struct {
+type uploadCompletion struct {
+	done        chan struct{}
 	fingerprint string
 	finalIndex  int
 	result      string
@@ -224,35 +234,39 @@ func New(cfg Config) (*Server, error) {
 	if cfg.CacheTTL <= 0 {
 		cfg.CacheTTL = DefaultCacheTTL
 	}
+	if cfg.MaxClientArtifactBytes <= 0 {
+		cfg.MaxClientArtifactBytes = DefaultMaxClientArtifactBytes
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.Default()
 	}
 
 	server := &Server{
-		domain:              domain,
-		domains:             domains,
-		authDomain:          protocol.AuthDomain(domain),
-		secret:              cfg.Secret,
-		dataDir:             absDataDir,
-		allowList:           cfg.AllowList,
-		maxUploadBytes:      cfg.MaxUploadBytes,
-		maxDownloadBytes:    cfg.MaxDownloadBytes,
-		cacheDir:            cacheDir,
-		cacheMaxBytes:       cfg.CacheMaxBytes,
-		cacheTTL:            cfg.CacheTTL,
-		allowProxy:          cfg.AllowProxy,
-		socksNoAuth:         cfg.SocksNoAuth,
-		logger:              logger,
-		downloads:           make(map[string]downloadState),
-		uploads:             make(map[string]uploadState),
-		uploadTombstones:    make(map[string]uploadTombstone),
-		downloadCache:       make(map[string]downloadCacheEntry),
-		downloadCacheBuilds: make(map[string]*downloadCacheBuild),
-		clientArtifacts:     make(map[string]clientArtifact),
-		clientTransfers:     make(map[string]clientTransfer),
-		janitorStop:         make(chan struct{}),
-		janitorDone:         make(chan struct{}),
+		domain:                 domain,
+		domains:                domains,
+		authDomain:             protocol.AuthDomain(domain),
+		secret:                 cfg.Secret,
+		dataDir:                absDataDir,
+		allowList:              cfg.AllowList,
+		maxUploadBytes:         cfg.MaxUploadBytes,
+		maxDownloadBytes:       cfg.MaxDownloadBytes,
+		maxClientArtifactBytes: cfg.MaxClientArtifactBytes,
+		cacheDir:               cacheDir,
+		cacheMaxBytes:          cfg.CacheMaxBytes,
+		cacheTTL:               cfg.CacheTTL,
+		allowProxy:             cfg.AllowProxy,
+		socksNoAuth:            cfg.SocksNoAuth,
+		logger:                 logger,
+		downloads:              make(map[string]downloadState),
+		uploads:                make(map[string]uploadState),
+		uploadCompletions:      make(map[string]*uploadCompletion),
+		downloadCache:          make(map[string]downloadCacheEntry),
+		downloadCacheBuilds:    make(map[string]*downloadCacheBuild),
+		clientArtifacts:        make(map[string]clientArtifact),
+		clientTransfers:        make(map[string]clientTransfer),
+		janitorStop:            make(chan struct{}),
+		janitorDone:            make(chan struct{}),
 	}
 	if err := server.cleanupOrphanCacheFiles(); err != nil {
 		return nil, err
@@ -408,6 +422,8 @@ func (s *Server) handleTXTOnDomain(name, matchedDomain, client string) []string 
 		return s.proxyAgentPoll(args, now, client)
 	case "aopen":
 		return s.proxyAgentOpen(args, now)
+	case "astatus":
+		return s.proxyAgentStatus(args, now)
 	case "aread":
 		return s.proxyAgentRead(args, now)
 	case "awrite":
@@ -441,6 +457,12 @@ func (s *Server) handleTXTOnDomain(name, matchedDomain, client string) []string 
 }
 
 func (s *Server) testConnection(args []string) []string {
+	// Proxy agents add a leading random label so an intermediate recursive
+	// resolver cannot satisfy a liveness probe from cache. The legacy
+	// single-argument form remains useful for manual dig diagnostics.
+	if len(args) == 2 && args[0] != "" {
+		args = args[1:]
+	}
 	if len(args) != 1 || args[0] == "" {
 		return []string{"Empty request. Please repeat."}
 	}
@@ -724,6 +746,16 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 
 	s.mu.Lock()
 	s.cleanupExpiredLocked(now)
+	if completion, exists := s.uploadCompletions[sid]; exists {
+		if completion.fingerprint != fingerprint {
+			s.mu.Unlock()
+			return []string{"Transfer already exists."}
+		}
+		done := completion.done
+		s.mu.Unlock()
+		<-done
+		return []string{"Error. File already exist."}
+	}
 	if existing, exists := s.uploads[sid]; exists {
 		if existing.fingerprint == fingerprint {
 			existing.expires = now.Add(transferTTL)
@@ -754,6 +786,13 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 	}
 	s.mu.Lock()
 	s.cleanupExpiredLocked(now)
+	if completion, exists := s.uploadCompletions[sid]; exists {
+		s.mu.Unlock()
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
+		<-completion.done
+		return []string{"Error. File already exist."}
+	}
 	if _, exists := s.uploads[sid]; exists {
 		s.mu.Unlock()
 		_ = spool.Close()
@@ -790,10 +829,11 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 	s.cleanupExpiredLocked(now)
 	state, exists := s.uploads[sid]
 	if !exists {
-		if tombstone, ok := s.uploadTombstones[sid]; ok && index == tombstone.finalIndex {
-			result := tombstone.result
+		if completion, ok := s.uploadCompletions[sid]; ok && index == completion.finalIndex {
+			done := completion.done
 			s.mu.Unlock()
-			return []string{result}
+			<-done
+			return []string{completion.result}
 		}
 		s.mu.Unlock()
 		return []string{"Upload is not initialized."}
@@ -815,11 +855,23 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 		return []string{"Cannot write file."}
 	}
 	if index == state.total-1 {
+		completion := &uploadCompletion{
+			done:        make(chan struct{}),
+			fingerprint: state.fingerprint,
+			finalIndex:  index,
+			expires:     now.Add(transferTTL),
+		}
 		delete(s.uploads, sid)
+		s.uploadCompletions[sid] = completion
 		s.mu.Unlock()
+		if s.finishUploadHook != nil {
+			s.finishUploadHook()
+		}
 		result := s.finishUpload(sid, state)
 		s.mu.Lock()
-		s.uploadTombstones[sid] = uploadTombstone{fingerprint: state.fingerprint, finalIndex: index, result: result, expires: now.Add(transferTTL)}
+		completion.result = result
+		completion.expires = time.Now().UTC().Add(transferTTL)
+		close(completion.done)
 		s.mu.Unlock()
 		return []string{result}
 	}
@@ -929,37 +981,126 @@ func (s *Server) prepareClientArtifact(cfg ClientArtifactConfig) error {
 		return nil
 	}
 
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		if cfg.Required {
-			return fmt.Errorf("read client artifact %q: %w", path, err)
+			return fmt.Errorf("open client artifact %q: %w", path, err)
 		}
 		s.logger.Printf("client artifact %s is not configured: %v", alias, err)
 		return nil
 	}
-	sum := sha256.Sum256(raw)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		if err == nil {
+			err = errors.New("artifact is not a regular file")
+		}
+		if cfg.Required {
+			return fmt.Errorf("stat client artifact %q: %w", path, err)
+		}
+		s.logger.Printf("client artifact %s is not configured: %v", alias, err)
+		return nil
+	}
+	if info.Size() > s.maxClientArtifactBytes {
+		err = fmt.Errorf("client artifact is %d bytes, limit is %d", info.Size(), s.maxClientArtifactBytes)
+		if cfg.Required {
+			return fmt.Errorf("prepare client artifact %q: %w", path, err)
+		}
+		s.logger.Printf("client artifact %s is not configured: %v", alias, err)
+		return nil
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		if cfg.Required {
+			return fmt.Errorf("hash client artifact %q: %w", path, err)
+		}
+		s.logger.Printf("client artifact %s is not configured: %v", alias, err)
+		return nil
+	}
+	encodedSize := ((info.Size() + 2) / 3) * 4
 	s.clientArtifacts[alias] = clientArtifact{
-		name:   filepath.Base(path),
-		sha256: hex.EncodeToString(sum[:]),
-		chunks: codec.ChunkString(base64.StdEncoding.EncodeToString(raw), clientChunkSize),
+		name:        filepath.Base(path),
+		path:        path,
+		identity:    info,
+		size:        info.Size(),
+		mtime:       info.ModTime(),
+		sha256:      hex.EncodeToString(hasher.Sum(nil)),
+		encodedSize: encodedSize,
+		chunkCount:  int((encodedSize + clientChunkSize - 1) / clientChunkSize),
 	}
 	s.logger.Printf("client artifact %s configured from %s", alias, path)
 	return nil
 }
 
+func (a clientArtifact) unchanged(info os.FileInfo) bool {
+	return info != nil && info.Mode().IsRegular() && os.SameFile(a.identity, info) &&
+		info.Size() == a.size && info.ModTime().Equal(a.mtime)
+}
+
+func (a clientArtifact) available() bool {
+	info, err := os.Stat(a.path)
+	return err == nil && a.unchanged(info)
+}
+
+// readEncodedRange Base64-encodes only the raw groups intersecting the
+// requested global encoded interval. The allocation is bounded by one DNS
+// batch instead of the complete artifact size.
+func (a clientArtifact) readEncodedRange(start int64, length int) (string, error) {
+	if start < 0 || length <= 0 || start >= a.encodedSize {
+		return "", errors.New("invalid artifact range")
+	}
+	end := start + int64(length)
+	if end < start || end > a.encodedSize {
+		end = a.encodedSize
+	}
+	rawStart := (start / 4) * 3
+	rawEnd := ((end + 3) / 4) * 3
+	if rawEnd > a.size {
+		rawEnd = a.size
+	}
+	f, err := os.Open(a.path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !a.unchanged(info) {
+		return "", errors.New("client artifact changed since startup")
+	}
+	raw := make([]byte, int(rawEnd-rawStart))
+	n, readErr := f.ReadAt(raw, rawStart)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return "", readErr
+	}
+	if n != len(raw) {
+		return "", io.ErrUnexpectedEOF
+	}
+	current, statErr := os.Stat(a.path)
+	if statErr != nil || !a.unchanged(current) {
+		return "", errors.New("client artifact changed during request")
+	}
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	offset := int(start % 4)
+	want := int(end - start)
+	if offset+want > len(encoded) {
+		return "", io.ErrUnexpectedEOF
+	}
+	return encoded[offset : offset+want], nil
+}
+
 func (s *Server) clientManifest(alias, client string) []string {
 	artifact, ok := s.clientArtifacts[alias]
-	if !ok || len(artifact.chunks) == 0 {
+	if !ok || artifact.chunkCount == 0 || !artifact.available() {
 		s.logger.Printf("client %s requested unavailable artifact %s", client, alias)
 		return []string{"Client artifact is not configured."}
 	}
-	s.logger.Printf("client %s requested artifact %s (%s, %d chunks, sha256 %s)", client, alias, artifact.name, len(artifact.chunks), artifact.sha256)
-	return []string{fmt.Sprintf("%s|%d|%s", artifact.name, len(artifact.chunks), artifact.sha256)}
+	s.logger.Printf("client %s requested artifact %s (%s, %d chunks, sha256 %s)", client, alias, artifact.name, artifact.chunkCount, artifact.sha256)
+	return []string{fmt.Sprintf("%s|%d|%s", artifact.name, artifact.chunkCount, artifact.sha256)}
 }
 
 func (s *Server) clientChunk(alias string, args []string, client string) []string {
 	artifact, ok := s.clientArtifacts[alias]
-	if !ok || len(artifact.chunks) == 0 {
+	if !ok || artifact.chunkCount == 0 {
 		s.logger.Printf("client %s requested unavailable artifact chunk %s", client, alias)
 		return []string{"Client artifact is not configured."}
 	}
@@ -967,13 +1108,18 @@ func (s *Server) clientChunk(alias string, args []string, client string) []strin
 		return []string{"Missing chunk number."}
 	}
 	index, err := strconv.Atoi(args[0])
-	if err != nil || index < 0 || index >= len(artifact.chunks) {
+	if err != nil || index < 0 || index >= artifact.chunkCount {
 		return []string{"Incorrect chunk number."}
 	}
 	s.mu.Lock()
 	s.logClientArtifactProgress(client, alias, artifact, index)
 	s.mu.Unlock()
-	return []string{artifact.chunks[index]}
+	chunk, err := artifact.readEncodedRange(int64(index*clientChunkSize), clientChunkSize)
+	if err != nil {
+		s.logger.Printf("client %s requested changed/unavailable artifact chunk %s: %v", client, alias, err)
+		return []string{"Client artifact is not configured."}
+	}
+	return []string{chunk}
 }
 
 // clientBatch is the batched counterpart of clientChunk: a single TXT response
@@ -990,7 +1136,7 @@ func (s *Server) clientChunk(alias string, args []string, client string) []strin
 // after thousands of batches have already been downloaded.
 func (s *Server) clientBatch(alias string, args []string, client string) []string {
 	artifact, ok := s.clientArtifacts[alias]
-	if !ok || len(artifact.chunks) == 0 {
+	if !ok || artifact.chunkCount == 0 {
 		s.logger.Printf("client %s requested unavailable artifact batch %s", client, alias)
 		return []string{"Client artifact is not configured."}
 	}
@@ -1005,19 +1151,24 @@ func (s *Server) clientBatch(alias string, args []string, client string) []strin
 	if count > maxDownloadBatch {
 		count = maxDownloadBatch
 	}
-	if from >= len(artifact.chunks) {
+	if from >= artifact.chunkCount {
 		return []string{"Incorrect chunk number."}
 	}
 	end := from + count
-	if end > len(artifact.chunks) {
-		end = len(artifact.chunks)
+	if end > artifact.chunkCount {
+		end = artifact.chunkCount
+	}
+	encoded, err := artifact.readEncodedRange(int64(from*clientChunkSize), (end-from)*clientChunkSize)
+	if err != nil {
+		s.logger.Printf("client %s requested changed/unavailable artifact batch %s: %v", client, alias, err)
+		return []string{"Client artifact is not configured."}
 	}
 	s.mu.Lock()
 	for i := from; i < end; i++ {
 		s.logClientArtifactProgress(client, alias, artifact, i)
 	}
 	s.mu.Unlock()
-	chunks := artifact.chunks[from:end]
+	chunks := codec.ChunkString(encoded, clientChunkSize)
 	sum := sha256.Sum256([]byte(strings.Join(chunks, "")))
 	out := make([]string, 0, len(chunks)+1)
 	out = append(out, "s:"+hex.EncodeToString(sum[:]))
@@ -1035,7 +1186,7 @@ func (s *Server) logClientArtifactProgress(client, alias string, artifact client
 			return
 		}
 		progress = clientTransfer{
-			seen:       make([]byte, (len(artifact.chunks)+7)/8),
+			seen:       make([]byte, (artifact.chunkCount+7)/8),
 			lastBucket: -1,
 		}
 	}
@@ -1051,7 +1202,7 @@ func (s *Server) logClientArtifactProgress(client, alias string, artifact client
 	}
 	progress.seen[byteIndex] |= bit
 	progress.seenCount++
-	total := len(artifact.chunks)
+	total := artifact.chunkCount
 	seen := progress.seenCount
 	percent := seen * 100 / total
 	bucket := percent / 10 * 10
@@ -1094,9 +1245,13 @@ func (s *Server) cleanupExpiredLocked(now time.Time) {
 		delete(s.downloads, sid)
 		s.logger.Printf("expired download %q (%s)", state.filename, sid)
 	}
-	for sid, tombstone := range s.uploadTombstones {
-		if !now.Before(tombstone.expires) {
-			delete(s.uploadTombstones, sid)
+	for sid, completion := range s.uploadCompletions {
+		select {
+		case <-completion.done:
+			if !now.Before(completion.expires) {
+				delete(s.uploadCompletions, sid)
+			}
+		default:
 		}
 	}
 	s.evictDownloadCacheLocked(now)
@@ -1146,13 +1301,8 @@ func (s *Server) resolveExistingPathWithinDataDir(path string) (string, error) {
 func normalizeDomain(domain string) (string, error) {
 	domain = strings.TrimSpace(strings.ToLower(domain))
 	domain = strings.TrimSuffix(domain, ".")
-	if domain == "" {
-		return "", errors.New("domain is required")
-	}
-	for _, label := range strings.Split(domain, ".") {
-		if label == "" || len(label) > 63 {
-			return "", fmt.Errorf("invalid domain label %q", label)
-		}
+	if err := protocol.ValidateDomain(domain); err != nil {
+		return "", err
 	}
 	return domain + ".", nil
 }

@@ -46,10 +46,10 @@ func AuthDomain(domain string) string {
 // stripped) joins shardDomains so the QNAME rotator can fan out
 // across all of them.
 //
-// Returns (canonical, shardDomains, shardAuthDomains, longest). An
-// empty raw input yields ("", [""], [""], "") — the caller sees the
+// Returns (canonical, shardDomains, shardAuthDomains, longest, error). An
+// empty raw input yields ("", [""], [""], "", nil) — the caller sees the
 // empty canonical and rejects with "domain is required".
-func ParseDomainCSV(raw string) (canonical string, shardDomains, shardAuthDomains []string, longest string) {
+func ParseDomainCSV(raw string) (canonical string, shardDomains, shardAuthDomains []string, longest string, err error) {
 	parts := strings.Split(raw, ",")
 	shardDomains = make([]string, 0, len(parts))
 	shardAuthDomains = make([]string, 0, len(parts))
@@ -59,10 +59,14 @@ func ParseDomainCSV(raw string) (canonical string, shardDomains, shardAuthDomain
 		if d == "" {
 			continue
 		}
-		if _, dup := seen[d]; dup {
+		if validateErr := ValidateDomain(d); validateErr != nil {
+			return "", nil, nil, "", validateErr
+		}
+		key := strings.ToLower(d)
+		if _, dup := seen[key]; dup {
 			continue
 		}
-		seen[d] = struct{}{}
+		seen[key] = struct{}{}
 		shardDomains = append(shardDomains, d)
 		shardAuthDomains = append(shardAuthDomains, AuthDomain(d))
 		if canonical == "" {
@@ -75,9 +79,29 @@ func ParseDomainCSV(raw string) (canonical string, shardDomains, shardAuthDomain
 	if canonical == "" {
 		// Preserve len==1 invariant callers rely on for the "skip
 		// atomic on single-domain configs" fast path.
-		return "", []string{""}, []string{""}, ""
+		return "", []string{""}, []string{""}, "", nil
 	}
-	return canonical, shardDomains, shardAuthDomains, longest
+	return canonical, shardDomains, shardAuthDomains, longest, nil
+}
+
+// ValidateDomain enforces the DNS wire constraints shared by every client and
+// server entry point. The presentation form omits the optional trailing dot;
+// 253 bytes is therefore the largest value that still fits the terminating
+// root label in the 255-byte DNS wire limit.
+func ValidateDomain(domain string) error {
+	domain = strings.TrimSuffix(strings.TrimSpace(domain), ".")
+	if domain == "" {
+		return errors.New("domain is required")
+	}
+	if len(domain) > 253 {
+		return fmt.Errorf("domain is %d bytes; DNS limit is 253", len(domain))
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" || len(label) > 63 {
+			return fmt.Errorf("invalid domain label %q", label)
+		}
+	}
+	return nil
 }
 
 func CurrentTimestamp(now time.Time) string {

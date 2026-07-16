@@ -2,13 +2,25 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"gdns2tcp/internal/dnshelpers"
 )
+
+func TestBuildTXTQueryPresentationLengthLimit(t *testing.T) {
+	valid := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+	if _, err := buildTXTQuery(valid, 1); err != nil {
+		t.Fatalf("253-byte name rejected: %v", err)
+	}
+	if _, err := buildTXTQuery(valid+"x", 1); err == nil {
+		t.Fatal("254-byte name accepted")
+	}
+}
 
 func TestReserveDNSIDLockedSkipsPendingID(t *testing.T) {
 	existing := make(chan []byte, 1)
@@ -110,6 +122,7 @@ func TestTCPPoolExchange(t *testing.T) {
 	addr, stop := fakeTCPDNS(t)
 	defer stop()
 	pool := newTCPPool(addr)
+	defer pool.close()
 	q, err := buildTXTQuery("x.example.com", 1)
 	if err != nil {
 		t.Fatal(err)
@@ -125,6 +138,101 @@ func TestTCPPoolExchange(t *testing.T) {
 	if binary.BigEndian.Uint16(resp[:2]) == 0 {
 		t.Fatal("id=0 leaked into resp")
 	}
+}
+
+func TestFileResolverCloseWaitsAndRejectsFurtherExchange(t *testing.T) {
+	addr, stop := fakeTCPDNS(t)
+	defer stop()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &txtResolver{server: host, port: port, retries: 1, useTCP: true, timeout: time.Second}
+	if _, err := resolver.query("x.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	resolver.close()
+	if _, err := resolver.query("x.example.com"); !errors.Is(err, errResolverClosed) {
+		t.Fatalf("query after close error=%v, want %v", err, errResolverClosed)
+	}
+	resolver.close()
+}
+
+func TestFileTCPEntryBlackHoleAndWriteFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	pool := newTCPPool(ln.Addr().String())
+	entry := pool.conns[0]
+	for i := 0; i < tcpPoolBlackHoleThreshold; i++ {
+		q, _ := buildTXTQuery("silent.example.com", uint16(i+1))
+		if _, err := entry.exchange(q, 20*time.Millisecond); err == nil || !strings.Contains(err.Error(), "timeout") {
+			t.Fatalf("black-hole exchange %d error=%v", i, err)
+		}
+	}
+	entry.mu.Lock()
+	closed := entry.closed && entry.conn == nil && entry.timeoutCount == 0
+	entry.mu.Unlock()
+	if !closed {
+		t.Fatal("black-hole threshold did not close the TCP connection")
+	}
+	pool.close()
+	_ = ln.Close()
+	<-serverDone
+
+	badPool := newTCPPool("unused")
+	badEntry := badPool.conns[0]
+	client, peer := net.Pipe()
+	_ = peer.Close()
+	badEntry.mu.Lock()
+	badEntry.conn = client
+	badEntry.closed = false
+	badEntry.mu.Unlock()
+	q, _ := buildTXTQuery("write-error.example.com", 1)
+	if _, err := badEntry.exchange(q, time.Second); err == nil {
+		t.Fatal("closed pipe write succeeded")
+	}
+	badPool.close()
+}
+
+func TestFileTCPEntryClosedAndMalformedFrameBranches(t *testing.T) {
+	pool := newTCPPool("unused")
+	pool.close()
+	entry := pool.conns[0]
+	entry.mu.Lock()
+	err := entry.ensureLocked(time.Millisecond)
+	entry.mu.Unlock()
+	if !errors.Is(err, errResolverClosed) {
+		t.Fatalf("ensure after close error=%v", err)
+	}
+	var nilPool *tcpPool
+	nilPool.close()
+
+	parent := newTCPPool("unused")
+	e := parent.conns[0]
+	client, peer := net.Pipe()
+	e.mu.Lock()
+	e.conn = client
+	e.closed = false
+	parent.wg.Add(1)
+	e.mu.Unlock()
+	go e.readLoop(client)
+	if _, err := peer.Write([]byte{0, 1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.Close()
+	parent.close()
 }
 
 func TestTCPPoolExchangeDialFail(t *testing.T) {

@@ -42,8 +42,9 @@ dig +short NS files.example.com
 dig +short TXT EnCoDiNg.test.files.example.com    # → "base64" (or "base32")
 ```
 
-For local/private testing without real DNS, add `-ds <server-ip>` to
-every client to bypass the system resolver.
+The proxy agent discovers this delegation through the system resolver and
+then sends tunnel traffic directly to the authoritative IP. For local/private
+testing without real DNS, add `-ds <server-ip>` to every client.
 
 #### Multi-domain sharding (optional)
 
@@ -372,18 +373,29 @@ if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){
 ### Run the agent
 
 ```sh
-./gdns2tcp-client-proxy-linux-amd64 -d files.example.com -p "change-me" -ds 11.11.11.11
+./gdns2tcp-client-proxy-linux-amd64 -d files.example.com -p "change-me"
 ```
 
 ```powershell
-.\gdns2tcp-client-proxy-windows-amd64.exe -d files.example.com -p "change-me" -ds 11.11.11.11
+.\gdns2tcp-client-proxy-windows-amd64.exe -d files.example.com -p "change-me"
 ```
 
 The agent doesn't listen — it polls the server and dials whatever
 target the operator's SOCKS5 CONNECT requests.
 
-The proxy agent probes the selected DNS path at startup. A direct
-authoritative `-ds` uses the full worker fan-out. A system or public recursive
-resolver automatically uses a conservative profile and extra retries to avoid
-rate-limit-driven tunnel resets. Direct `-ds <gdns2tcp-server-ip>` remains the
-recommended mode for long-lived LDAP, SSH and bulk-transfer sessions.
+When `-ds` is omitted, the proxy agent uses the system resolver only to
+discover the zone's parent delegation, then validates and connects directly
+to the authoritative gdns2tcp server. The selected IP must return an
+authoritative (`AA`) TXT probe for every configured shard. If delegation
+discovery fails (for example, for a private undelegated zone), the agent warns
+and falls back to the system recursive resolver with a conservative worker
+profile and extra retries. An explicit `-ds <gdns2tcp-server-ip>` skips
+discovery and remains useful for private networks and non-standard DNS ports.
+
+If the network permits DNS only through an internal recursive server, the
+fallback remains cache-safe: dynamic proxy operations carry unique poll IDs,
+stream nonces and sequence numbers in their QNAMEs, while gdns2tcp answers
+with TTL 0. A retry intentionally repeats the same QNAME to obtain the same
+idempotent response after packet loss. Startup probes include an additional
+random label so a cached `encoding.test` response cannot masquerade as a live
+authoritative path.

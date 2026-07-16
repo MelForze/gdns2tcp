@@ -36,8 +36,4 @@ jobs:
       run: go test -race ./...
 
     - name: Coverage
-      run: |
-        go test -coverprofile=cover.out -covermode=atomic ./...
-        pct=$(go tool cover -func=cover.out | awk '/^total:/{gsub(/%/,"",$3); printf "%.1f", $3}')
-        echo "Total test coverage: ${pct}%"
-        awk -v p="${pct}" 'BEGIN { if (p+0 < 80.0) { print "FAIL: coverage " p "% is below 80% threshold"; exit 1 } }'
+      run: make cover-check

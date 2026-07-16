@@ -63,6 +63,7 @@ type config struct {
 	shardAuthDomains []string
 	shardLongest     string
 	shardRotor       *atomic.Uint64
+	domainErr        error
 
 	mode             string
 	pass             string
@@ -94,8 +95,36 @@ type txtResolver struct {
 	useTCP  bool
 	timeout time.Duration
 
-	tcpPoolOnce sync.Once
-	tcpPool     *tcpPool
+	poolMu  sync.Mutex
+	closed  bool
+	tcpPool *tcpPool
+}
+
+var errResolverClosed = errors.New("DNS resolver closed")
+
+func (r *txtResolver) close() {
+	if r == nil {
+		return
+	}
+	r.poolMu.Lock()
+	if r.closed {
+		r.poolMu.Unlock()
+		return
+	}
+	r.closed = true
+	pool := r.tcpPool
+	r.tcpPool = nil
+	r.poolMu.Unlock()
+	if pool != nil {
+		pool.close()
+	}
+}
+
+func (r *txtResolver) isClosed() bool {
+	r.poolMu.Lock()
+	closed := r.closed
+	r.poolMu.Unlock()
+	return closed
 }
 
 type progressBar struct {
@@ -190,6 +219,9 @@ func main() {
 // present. It is called once by run() before any network activity, so the
 // user receives a clear error message without waiting for DNS.
 func validateConfig(cfg config) error {
+	if cfg.domainErr != nil {
+		return cfg.domainErr
+	}
 	if cfg.domain == "" {
 		return errors.New("domain is required")
 	}
@@ -220,6 +252,10 @@ func validateConfig(cfg config) error {
 
 func run() error {
 	cfg := parseFlags()
+	return runClient(cfg)
+}
+
+func runClient(cfg config) error {
 	if err := validateConfig(cfg); err != nil {
 		return err
 	}
@@ -240,13 +276,32 @@ func run() error {
 		useTCP:  cfg.tcp,
 		timeout: 5 * time.Second,
 	}
+	defer func() { resolver.close() }()
+	encoding, probeErr := testConnectionSharded(resolver, cfg)
+	if !cfg.tcp && errors.Is(probeErr, errDNSResponseTruncated) {
+		server := cfg.dnsServer
+		if strings.TrimSpace(server) == "" {
+			var err error
+			server, err = systemResolverAddress()
+			if err != nil {
+				return fmt.Errorf("UDP DNS was truncated and TCP resolver discovery failed: %w", err)
+			}
+		}
+		resolver.close()
+		cfg.tcp = true
+		cfg.dnsServer = server
+		resolver = &txtResolver{server: server, port: cfg.dnsPort, retries: cfg.retries, useTCP: true, timeout: 5 * time.Second}
+		encoding, probeErr = testConnectionSharded(resolver, cfg)
+		if probeErr == nil {
+			fmt.Printf("DNS probe was truncated over UDP; promoted transfer transport to TCP\n")
+		}
+	}
+	if probeErr != nil {
+		return probeErr
+	}
 
 	switch strings.ToLower(cfg.mode) {
 	case "test":
-		encoding, err := testConnection(resolver, cfg.domain)
-		if err != nil {
-			return err
-		}
 		fmt.Printf("server selected %s upload encoding\n", encoding)
 	case "list":
 		return listFiles(resolver, cfg)
@@ -307,7 +362,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.cacheDir, "cache-dir", "", "download resume cache directory (default: OS user cache)")
 	flag.Parse()
 
-	cfg.domain, cfg.shardDomains, cfg.shardAuthDomains, cfg.shardLongest = protocol.ParseDomainCSV(cfg.domain)
+	cfg.domain, cfg.shardDomains, cfg.shardAuthDomains, cfg.shardLongest, cfg.domainErr = protocol.ParseDomainCSV(cfg.domain)
 	cfg.shardRotor = new(atomic.Uint64)
 
 	if cfg.listMode {
@@ -434,7 +489,11 @@ func installUsage() {
 }
 
 func (r *txtResolver) query(name string) (string, error) {
-	if strings.TrimSpace(name) == "" {
+	return r.queryNames([]string{name})
+}
+
+func (r *txtResolver) queryNames(names []string) (string, error) {
+	if len(names) == 0 || strings.TrimSpace(names[0]) == "" {
 		return "", errors.New("empty DNS query name")
 	}
 	retries := r.retries
@@ -444,6 +503,7 @@ func (r *txtResolver) query(name string) (string, error) {
 
 	var lastErr error
 	for attempt := 1; attempt <= retries; attempt++ {
+		name := names[(attempt-1)%len(names)]
 		value, err := r.queryOnce(name)
 		if err == nil {
 			return value, nil
@@ -457,6 +517,9 @@ func (r *txtResolver) query(name string) (string, error) {
 }
 
 func (r *txtResolver) queryOnce(name string) (string, error) {
+	if r.isClosed() {
+		return "", errResolverClosed
+	}
 	timeout := r.timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -488,8 +551,17 @@ func (r *txtResolver) queryOnce(name string) (string, error) {
 		// Persistent pool avoids ephemeral-port exhaustion on
 		// multi-thousand-query downloads (parallelism=32 + ~11K
 		// chunks bursts out ~16K connections within seconds).
-		r.tcpPoolOnce.Do(func() { r.tcpPool = newTCPPool(addr) })
-		resp, err = r.tcpPool.exchange(q, timeout)
+		r.poolMu.Lock()
+		if r.closed {
+			r.poolMu.Unlock()
+			return "", errResolverClosed
+		}
+		if r.tcpPool == nil {
+			r.tcpPool = newTCPPool(addr)
+		}
+		pool := r.tcpPool
+		r.poolMu.Unlock()
+		resp, err = pool.exchange(q, timeout)
 	} else {
 		resp, err = exchangeUDP(addr, q, timeout)
 	}
@@ -517,8 +589,24 @@ func testConnection(resolver *txtResolver, domain string) (string, error) {
 	return encoding, nil
 }
 
+func testConnectionSharded(resolver *txtResolver, cfg config) (string, error) {
+	domains := cfg.retryShardDomains()
+	names := make([]string, len(domains))
+	for i, domain := range domains {
+		names[i] = "EnCoDiNg.test." + domain
+	}
+	encoding, err := resolver.queryNames(names)
+	if err != nil {
+		return "", err
+	}
+	if encoding != "base64" && encoding != "base32" {
+		return "", fmt.Errorf("server returned unsupported encoding %q", encoding)
+	}
+	return encoding, nil
+}
+
 func listFiles(resolver *txtResolver, cfg config) error {
-	first, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "c", nil))
+	first, err := resolver.queryNames(authenticatedNames(cfg, "c", nil))
 	if err != nil {
 		return err
 	}
@@ -533,7 +621,7 @@ func listFiles(resolver *txtResolver, cfg config) error {
 		return err
 	}
 	for page := 0; page < pages; page++ {
-		value, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "c", []string{strconv.Itoa(page)}))
+		value, err := resolver.queryNames(authenticatedNames(cfg, "c", []string{strconv.Itoa(page)}))
 		if err != nil {
 			return err
 		}
@@ -547,7 +635,7 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 	if err != nil {
 		return err
 	}
-	encoding, err := testConnection(resolver, cfg.domain)
+	encoding, err := testConnectionSharded(resolver, cfg)
 	if err != nil {
 		return err
 	}
@@ -595,11 +683,11 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 	}
 	defer encodedFile.Close()
 	initArgs := append([]string{sid, strconv.Itoa(chunkCount), strconv.Itoa(effectiveChunkSize), encoding}, filenameLabels...)
-	initName := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "uinit", initArgs)
-	if len(initName) > 253 {
-		return fmt.Errorf("DNS upload init name is %d characters (limit 253); use a shorter filename or domain", len(initName))
+	initNames := authenticatedNames(cfg, "uinit", initArgs)
+	if len(initNames[0]) > 253 {
+		return fmt.Errorf("DNS upload init name is %d characters (limit 253); use a shorter filename or domain", len(initNames[0]))
 	}
-	status, err := resolver.query(initName)
+	status, err := resolver.queryNames(initNames)
 	if err != nil {
 		return err
 	}
@@ -620,11 +708,11 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 		wireChunk := dnsSafeChunk(string(chunk), encoding)
 		labels := codec.ChunkString(wireChunk, 63)
 		requestArgs := append([]string{sid, strconv.Itoa(index)}, labels...)
-		requestName := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "u", requestArgs)
-		if len(requestName) > 253 {
-			return fmt.Errorf("DNS query name for chunk %d is %d characters (limit 253); reduce -chunk-size or use a shorter domain", index, len(requestName))
+		requestNames := authenticatedNames(cfg, "u", requestArgs)
+		if len(requestNames[0]) > 253 {
+			return fmt.Errorf("DNS query name for chunk %d is %d characters (limit 253); reduce -chunk-size or use a shorter domain", index, len(requestNames[0]))
 		}
-		response, err := resolver.query(requestName)
+		response, err := resolver.queryNames(requestNames)
 		if err != nil {
 			return err
 		}
@@ -667,11 +755,11 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 		return err
 	}
 	initArgs := append([]string{sid}, filenameLabels...)
-	initName := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "dinit", initArgs)
-	if len(initName) > 253 {
-		return fmt.Errorf("DNS download init name is %d characters (limit 253); use a shorter filename or domain", len(initName))
+	initNames := authenticatedNames(cfg, "dinit", initArgs)
+	if len(initNames[0]) > 253 {
+		return fmt.Errorf("DNS download init name is %d characters (limit 253); use a shorter filename or domain", len(initNames[0]))
 	}
-	chunkCountText, err := resolver.query(initName)
+	chunkCountText, err := resolver.queryNames(initNames)
 	if err != nil {
 		return err
 	}
@@ -713,18 +801,25 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 		return err
 	}
 	defer cache.close()
+	if err := cache.acquireQuotaLock(); err != nil {
+		return err
+	}
 	if temporaryCacheRoot == "" {
 		reserveBytes := encodedSize + int64(bitmapBytes(nBatches)) + 4096
 		if reserveBytes < encodedSize {
 			return errors.New("resume cache reservation overflows int64")
 		}
-		if err := pruneResumeCacheFor(cacheRoot, defaultResumeCacheBytes, defaultResumeCacheTTL, reserveBytes, cache.dir); err != nil {
+		if err := pruneResumeCacheForLocked(cacheRoot, defaultResumeCacheBytes, defaultResumeCacheTTL, reserveBytes, cache.dir); err != nil {
 			return fmt.Errorf("prune download resume cache: %w", err)
 		}
 	}
 	completed, err := cache.open(chunkCount, batchSize, sourceSHA256, encodedSize)
+	quotaErr := cache.releaseQuotaLock()
 	if err != nil {
 		return fmt.Errorf("open download spool: %w", err)
+	}
+	if quotaErr != nil {
+		return fmt.Errorf("release download resume quota lock: %w", quotaErr)
 	}
 	usedCachedBatches := len(completed) > 0 && temporaryCacheRoot == ""
 	var completedChunks int64
@@ -758,13 +853,13 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 		wg.Add(1)
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			var name string
+			var names []string
 			if batchSize == 1 {
-				name = authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "d", []string{sid, strconv.Itoa(from)})
+				names = authenticatedNames(cfg, "d", []string{sid, strconv.Itoa(from)})
 			} else {
-				name = authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "db", []string{sid, strconv.Itoa(from), strconv.Itoa(count)})
+				names = authenticatedNames(cfg, "db", []string{sid, strconv.Itoa(from), strconv.Itoa(count)})
 			}
-			data, queryErr := resolver.query(name)
+			data, queryErr := resolver.queryNames(names)
 			if queryErr == nil {
 				queryErr = cache.saveBatch(k, from, count, data)
 			}
@@ -805,7 +900,7 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 }
 
 func fetchDownloadSourceSHA256(resolver *txtResolver, cfg config, sid string, chunkCount int) (string, int64, bool) {
-	resp, err := resolver.query(authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "dmeta", []string{sid}))
+	resp, err := resolver.queryNames(authenticatedNames(cfg, "dmeta", []string{sid}))
 	if err != nil {
 		return "", 0, false
 	}
@@ -1060,6 +1155,20 @@ func authenticatedNameWithTimestamp(secret, canonicalDomain, shardAuthDomain, co
 	return protocol.JoinNameFast(shardAuthDomain, command, labels)
 }
 
+func authenticatedNames(cfg config, command string, args []string) []string {
+	timestamp := protocol.CurrentTimestamp(time.Now())
+	token := protocol.AuthToken(cfg.pass, cfg.domain, command, timestamp, args)
+	labels := make([]string, 0, len(args)+2)
+	labels = append(labels, args...)
+	labels = append(labels, timestamp, token)
+	domains := cfg.retryShardAuthDomains()
+	names := make([]string, len(domains))
+	for i, domain := range domains {
+		names[i] = protocol.JoinNameFast(domain, command, labels)
+	}
+	return names
+}
+
 // longestBudgetDomain returns the longest configured shard domain, or
 // canonical as a fallback for configs constructed without parseFlags
 // (test fixtures). Used by the QNAME-length budget calc so no shard
@@ -1081,6 +1190,38 @@ func (c config) pickShardAuthDomain() string {
 	if len(c.shardAuthDomains) == 1 || c.shardRotor == nil {
 		return c.shardAuthDomains[0]
 	}
-	idx := c.shardRotor.Add(1) % uint64(len(c.shardAuthDomains))
+	idx := (c.shardRotor.Add(1) - 1) % uint64(len(c.shardAuthDomains))
 	return c.shardAuthDomains[idx]
+}
+
+func (c config) retryShardAuthDomains() []string {
+	domains := c.shardAuthDomains
+	if len(domains) == 0 {
+		return []string{protocol.AuthDomain(c.domain)}
+	}
+	if len(domains) == 1 || c.shardRotor == nil {
+		return domains[:1]
+	}
+	start := int((c.shardRotor.Add(1) - 1) % uint64(len(domains)))
+	ordered := make([]string, len(domains))
+	for i := range ordered {
+		ordered[i] = domains[(start+i)%len(domains)]
+	}
+	return ordered
+}
+
+func (c config) retryShardDomains() []string {
+	domains := c.shardDomains
+	if len(domains) == 0 {
+		return []string{c.domain}
+	}
+	if len(domains) == 1 || c.shardRotor == nil {
+		return domains[:1]
+	}
+	start := int((c.shardRotor.Add(1) - 1) % uint64(len(domains)))
+	ordered := make([]string, len(domains))
+	for i := range ordered {
+		ordered[i] = domains[(start+i)%len(domains)]
+	}
+	return ordered
 }

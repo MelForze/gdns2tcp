@@ -18,6 +18,7 @@
 
 .DS_Store
 clients/
+.lab/
 cover.out
 coverage.out
 data/

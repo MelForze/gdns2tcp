@@ -30,25 +30,26 @@ func main() {
 
 func run() error {
 	var (
-		domain           string
-		listenHost       string
-		port             string
-		secret           string
-		dataDir          string
-		clientsDir       string
-		maxUploadBytes   int64
-		maxDownloadBytes int64
-		disableList      bool
-		allowProxy       bool
-		socksListen      string
-		socksIface       string
-		socksNoAuth      bool
-		proxyMaxConn     int
-		proxyBufBytes    int
-		cacheDir         string
-		cacheMaxBytes    int64
-		cacheTTL         time.Duration
-		pprofAddr        string
+		domain                 string
+		listenHost             string
+		port                   string
+		secret                 string
+		dataDir                string
+		clientsDir             string
+		maxUploadBytes         int64
+		maxDownloadBytes       int64
+		maxClientArtifactBytes int64
+		disableList            bool
+		allowProxy             bool
+		socksListen            string
+		socksIface             string
+		socksNoAuth            bool
+		proxyMaxConn           int
+		proxyBufBytes          int
+		cacheDir               string
+		cacheMaxBytes          int64
+		cacheTTL               time.Duration
+		pprofAddr              string
 	)
 
 	installUsage()
@@ -64,6 +65,7 @@ func run() error {
 	flag.StringVar(&clientsDir, "clients-dir", "clients", "directory containing client artifacts served through client-*/cl-* endpoints")
 	flag.Int64Var(&maxUploadBytes, "max-upload-bytes", dnsserver.DefaultMaxUploadBytes, "maximum protected upload payload accepted by the server")
 	flag.Int64Var(&maxDownloadBytes, "max-download-bytes", dnsserver.DefaultMaxDownloadBytes, "maximum source file size accepted for DNS downloads")
+	flag.Int64Var(&maxClientArtifactBytes, "max-client-artifact-bytes", dnsserver.DefaultMaxClientArtifactBytes, "maximum size of one downloadable client artifact")
 	flag.BoolVar(&disableList, "disable-list", false, "disable the DNS file listing command")
 	flag.BoolVar(&allowProxy, "allow-proxy", false, "enable the reverse SOCKS5 listener and agent DNS endpoints (apoll/aread/awrite/aclose/axchg). Off by default; pass -allow-proxy to turn on.")
 	flag.StringVar(&socksListen, "socks-listen", "127.0.0.1:9050", "TCP address for the operator-facing SOCKS5 listener")
@@ -101,6 +103,9 @@ func run() error {
 	if maxDownloadBytes <= 0 {
 		return errors.New("max-download-bytes must be positive")
 	}
+	if maxClientArtifactBytes <= 0 {
+		return errors.New("max-client-artifact-bytes must be positive")
+	}
 	if cacheMaxBytes <= 0 {
 		return errors.New("cache-max-bytes must be positive")
 	}
@@ -125,17 +130,18 @@ func run() error {
 			{Alias: "client-proxy-windows-amd64", Path: filepath.Join(clientsDir, "gdns2tcp-client-proxy-windows-amd64.exe")},
 			{Alias: "client-proxy-windows-arm64", Path: filepath.Join(clientsDir, "gdns2tcp-client-proxy-windows-arm64.exe")},
 		},
-		AllowList:        !disableList,
-		MaxUploadBytes:   maxUploadBytes,
-		MaxDownloadBytes: maxDownloadBytes,
-		AllowProxy:       allowProxy,
-		SocksNoAuth:      socksNoAuth,
-		ProxyMaxConn:     proxyMaxConn,
-		ProxyBufBytes:    proxyBufBytes,
-		CacheDir:         cacheDir,
-		CacheMaxBytes:    cacheMaxBytes,
-		CacheTTL:         cacheTTL,
-		Logger:           log.Default(),
+		AllowList:              !disableList,
+		MaxUploadBytes:         maxUploadBytes,
+		MaxDownloadBytes:       maxDownloadBytes,
+		MaxClientArtifactBytes: maxClientArtifactBytes,
+		AllowProxy:             allowProxy,
+		SocksNoAuth:            socksNoAuth,
+		ProxyMaxConn:           proxyMaxConn,
+		ProxyBufBytes:          proxyBufBytes,
+		CacheDir:               cacheDir,
+		CacheMaxBytes:          cacheMaxBytes,
+		CacheTTL:               cacheTTL,
+		Logger:                 log.Default(),
 	})
 	if err != nil {
 		return err
@@ -157,18 +163,16 @@ func run() error {
 	}
 	log.Printf("data directory: %s", absDataDir)
 	log.Printf("clients directory: %s", absClientsDir)
-	udpSrv, tcpSrv := newDNSServers(addr, server)
-	errCh := make(chan error, 3)
-	go func() { errCh <- udpSrv.ListenAndServe() }()
-	go func() { errCh <- tcpSrv.ListenAndServe() }()
 	if allowProxy {
 		if socksIface != "" {
 			ip, err := resolveInterfaceIPv4(socksIface)
 			if err != nil {
+				server.Shutdown()
 				return fmt.Errorf("resolve -socks-iface %s: %w", socksIface, err)
 			}
 			_, port, splitErr := net.SplitHostPort(socksListen)
 			if splitErr != nil {
+				server.Shutdown()
 				return fmt.Errorf("parse -socks-listen %s: %w", socksListen, splitErr)
 			}
 			socksListen = net.JoinHostPort(ip, port)
@@ -180,6 +184,12 @@ func run() error {
 				log.Printf("WARNING: -socks-no-auth + -socks-listen=%s is an open relay reachable by anyone who can route to that address", socksListen)
 			}
 		}
+	}
+	udpSrv, tcpSrv := newDNSServers(addr, server)
+	errCh := make(chan error, 3)
+	go func() { errCh <- udpSrv.ListenAndServe() }()
+	go func() { errCh <- tcpSrv.ListenAndServe() }()
+	if allowProxy {
 		go func() { errCh <- server.ServeSOCKS5(socksListen) }()
 	}
 	firstErr := <-errCh
@@ -233,6 +243,7 @@ func installUsage() {
 						{Names: "-disable-list", Description: "disable the DNS file listing command"},
 						{Names: "-max-upload-bytes <n>", Description: fmt.Sprintf("maximum protected upload payload (default %d)", dnsserver.DefaultMaxUploadBytes)},
 						{Names: "-max-download-bytes <n>", Description: fmt.Sprintf("maximum source file size served for downloads (default %d)", dnsserver.DefaultMaxDownloadBytes)},
+						{Names: "-max-client-artifact-bytes <n>", Description: fmt.Sprintf("maximum downloadable client artifact size (default %d)", dnsserver.DefaultMaxClientArtifactBytes)},
 					},
 				},
 				{

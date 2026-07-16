@@ -77,7 +77,10 @@ func runBulkOnce(t *testing.T, csvDomain string, payloadSize int) time.Duration 
 	dnsIP, dnsPort, socksAddr, secret := startEmbeddedServerDomain(t, csvDomain)
 	upstream := echoUpstream(t)
 
-	canonical, shardDomains, shardAuthDomains, longest := protocol.ParseDomainCSV(csvDomain)
+	canonical, shardDomains, shardAuthDomains, longest, err := protocol.ParseDomainCSV(csvDomain)
+	if err != nil {
+		t.Fatal(err)
+	}
 	agentCfg := config{
 		domain:           canonical,
 		shardDomains:     shardDomains,
@@ -141,10 +144,6 @@ func TestMultiDomainLocalPerformance(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration bench; run with -run TestMultiDomainLocalPerformance")
 	}
-	if raceEnabled {
-		t.Skip("under -race the 10× overhead swamps the signal")
-	}
-
 	const runs = 5
 	const payload = 1 * 1024 * 1024 // 1 MB — keeps each run fast
 

@@ -2,6 +2,9 @@ package codec
 
 import (
 	"bytes"
+	"encoding/base64"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,5 +169,123 @@ func TestDecodeDNSPayloadBase64NoPadding(t *testing.T) {
 	}
 	if string(got) != string(input) {
 		t.Fatalf("got=%q want=%q", got, input)
+	}
+}
+
+func TestStreamingFileHelpersAndLimits(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source.bin")
+	compressed := filepath.Join(dir, "source.gz")
+	decoded := filepath.Join(dir, "decoded.bin")
+	payload := bytes.Repeat([]byte("streaming-codec-"), 4096)
+	if err := os.WriteFile(src, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompressFile(src, compressed); err != nil {
+		t.Fatal(err)
+	}
+	n, err := DecompressFileLimit(compressed, decoded, int64(len(payload)))
+	if err != nil || n != int64(len(payload)) {
+		t.Fatalf("decompress n=%d err=%v", n, err)
+	}
+	got, err := os.ReadFile(decoded)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("decoded mismatch err=%v", err)
+	}
+	if _, err := DecompressFileLimit(compressed, decoded, int64(len(payload)-1)); err == nil {
+		t.Fatal("decompression over limit succeeded")
+	}
+	if _, err := os.Stat(decoded); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed output retained: %v", err)
+	}
+	if _, err := DecompressFileLimit(src, decoded, 100); err == nil {
+		t.Fatal("invalid gzip succeeded")
+	}
+}
+
+func TestStreamingCodecErrorCleanupAndDNSAlphabet(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source.bin")
+	dst := filepath.Join(dir, "output.bin")
+	if err := os.WriteFile(src, []byte{0xfb, 0xff, 0xef, 0x01}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EncodeDNSFile(src, dst, "rot13"); err == nil {
+		t.Fatal("unsupported file encoding succeeded")
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed encoded output retained: %v", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte{0xfb, 0xff, 0xef, 0x01})
+	encoded = strings.NewReplacer("+", "_", "/", "-").Replace(encoded)
+	if err := os.WriteFile(src, []byte(" \n"+encoded+"=\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeDNSFile(src, dst, "base64"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, []byte{0xfb, 0xff, 0xef, 0x01}) {
+		t.Fatalf("DNS alphabet decode=%x err=%v", got, err)
+	}
+	if _, err := DecodeDNSFile(src, dst, "rot13"); err == nil {
+		t.Fatal("unsupported decode succeeded")
+	}
+	if _, err := EncodeDNSFile(filepath.Join(dir, "missing"), dst, "base64"); err == nil {
+		t.Fatal("missing source encode succeeded")
+	}
+	if _, err := DecodeDNSFile(filepath.Join(dir, "missing"), dst, "base64"); err == nil {
+		t.Fatal("missing source decode succeeded")
+	}
+}
+
+func TestStreamingAdapters(t *testing.T) {
+	var lower bytes.Buffer
+	input := []byte("AbCZ09")
+	if _, err := (lowerWriter{w: &lower}).Write(input); err != nil || lower.String() != "abcz09" {
+		t.Fatalf("lower writer=%q err=%v", lower.String(), err)
+	}
+	upperBytes, err := io.ReadAll(upperReader{r: strings.NewReader("abCZ09")})
+	if err != nil || string(upperBytes) != "ABCZ09" {
+		t.Fatalf("upper reader=%q err=%v", upperBytes, err)
+	}
+	cleaned, err := io.ReadAll(base64DNSReader{r: strings.NewReader(" \n-_==\t")})
+	if err != nil || string(cleaned) != "/+" {
+		t.Fatalf("base64 DNS reader=%q err=%v", cleaned, err)
+	}
+	var dst bytes.Buffer
+	lw := &limitWriter{w: &dst, remain: 3}
+	if _, err := lw.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lw.Write([]byte("d")); err == nil {
+		t.Fatal("limit writer accepted overflow")
+	}
+}
+
+func TestStreamingCodecRejectsDirectoryDestinations(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source")
+	encoded := filepath.Join(dir, "encoded")
+	compressed := filepath.Join(dir, "compressed")
+	if err := os.WriteFile(src, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EncodeDNSFile(src, dir, "base64"); err == nil {
+		t.Fatal("encoding to a directory succeeded")
+	}
+	if _, err := EncodeDNSFile(src, encoded, "base64"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeDNSFile(encoded, dir, "base64"); err == nil {
+		t.Fatal("decoding to a directory succeeded")
+	}
+	if err := CompressFile(src, dir); err == nil {
+		t.Fatal("compression to a directory succeeded")
+	}
+	if err := CompressFile(src, compressed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecompressFileLimit(compressed, dir, 1024); err == nil {
+		t.Fatal("decompression to a directory succeeded")
 	}
 }

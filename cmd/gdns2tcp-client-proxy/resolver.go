@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -64,18 +66,24 @@ func (r *txtResolver) close() {
 }
 
 func (r *txtResolver) query(name string) (string, error) {
-	segs, err := r.queryStrings(name)
+	return r.queryNames([]string{name})
+}
+
+func (r *txtResolver) queryNames(names []string) (string, error) {
+	return r.queryNamesUntil(names, time.Time{})
+}
+
+func (r *txtResolver) queryNamesUntil(names []string, deadline time.Time) (string, error) {
+	segs, err := r.queryStringsNamesUntil(names, deadline)
 	if err != nil {
 		return "", err
 	}
 	return strings.Join(segs, ""), nil
 }
 
-// queryStringsNoRetry skips queryStrings' retry-on-failure loop. axchg needs
-// this because every request carries a fresh agent-side nonce that the
-// server tracks in a replay window; a textual retry of the same DNS name
-// would re-send the same nonce and be rejected as a replay. The dispatcher
-// in main.go simply issues another axchg with the next nonce instead.
+// queryStringsNoRetry skips the resolver's retry loop. axchg owns retries in
+// main.go so it can keep the exact nonce and arguments while changing only the
+// shard suffix; the server response cache makes that ambiguous retry safe.
 func (r *txtResolver) queryStringsNoRetry(name string) ([]string, error) {
 	if strings.TrimSpace(name) == "" {
 		return nil, errors.New("empty DNS query name")
@@ -84,7 +92,15 @@ func (r *txtResolver) queryStringsNoRetry(name string) ([]string, error) {
 }
 
 func (r *txtResolver) queryStrings(name string) ([]string, error) {
-	if strings.TrimSpace(name) == "" {
+	return r.queryStringsNames([]string{name})
+}
+
+func (r *txtResolver) queryStringsNames(names []string) ([]string, error) {
+	return r.queryStringsNamesUntil(names, time.Time{})
+}
+
+func (r *txtResolver) queryStringsNamesUntil(names []string, deadline time.Time) ([]string, error) {
+	if len(names) == 0 || strings.TrimSpace(names[0]) == "" {
 		return nil, errors.New("empty DNS query name")
 	}
 	retries := r.retries
@@ -93,20 +109,45 @@ func (r *txtResolver) queryStrings(name string) ([]string, error) {
 	}
 	var lastErr error
 	for attempt := 1; attempt <= retries; attempt++ {
-		segs, err := r.queryOnce(name)
+		timeout := r.timeout
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return nil, context.DeadlineExceeded
+			}
+			if timeout <= 0 || timeout > remaining {
+				timeout = remaining
+			}
+		}
+		name := names[(attempt-1)%len(names)]
+		segs, err := r.queryOnceTimeout(name, timeout)
 		if err == nil {
 			return segs, nil
 		}
 		lastErr = err
 		if attempt < retries {
-			time.Sleep(time.Duration(attempt) * retryBackoff)
+			delay := time.Duration(attempt) * retryBackoff
+			if !deadline.IsZero() {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					return nil, context.DeadlineExceeded
+				}
+				if delay > remaining {
+					delay = remaining
+				}
+			}
+			time.Sleep(delay)
 		}
 	}
 	return nil, lastErr
 }
 
 func (r *txtResolver) queryOnce(name string) ([]string, error) {
-	resp, id, err := r.exchangeName(name)
+	return r.queryOnceTimeout(name, r.timeout)
+}
+
+func (r *txtResolver) queryOnceTimeout(name string, timeout time.Duration) ([]string, error) {
+	resp, id, err := r.exchangeNameTimeout(name, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -123,10 +164,15 @@ func (r *txtResolver) probeAuthoritative(name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if _, err := parseTXTSegments(resp, id); err != nil {
+	segments, err := parseTXTSegments(resp, id)
+	if err != nil {
 		return false, err
 	}
-	return resp[2]&0x04 != 0, nil
+	authoritative := resp[2]&0x04 != 0
+	if authoritative && !validProbePayload(segments) {
+		return false, fmt.Errorf("unexpected authoritative probe response %q", strings.Join(segments, ""))
+	}
+	return authoritative, nil
 }
 
 // exchangeName performs one raw DNS exchange and returns both the response
@@ -134,7 +180,10 @@ func (r *txtResolver) probeAuthoritative(name string) (bool, error) {
 // in the caller so startup can inspect header metadata without duplicating
 // the hot-path transport selection.
 func (r *txtResolver) exchangeName(name string) ([]byte, uint16, error) {
-	timeout := r.timeout
+	return r.exchangeNameTimeout(name, r.timeout)
+}
+
+func (r *txtResolver) exchangeNameTimeout(name string, timeout time.Duration) ([]byte, uint16, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}

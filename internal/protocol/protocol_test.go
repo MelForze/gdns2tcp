@@ -66,6 +66,19 @@ func TestAuthRejectsWrongTokenAndArgs(t *testing.T) {
 	}
 }
 
+func TestVerifyAuthRejectsMissingAndMalformedTimestamps(t *testing.T) {
+	now := time.Now().UTC()
+	if VerifyAuth("", "example.test", "d", nil, "1", "token", now) {
+		t.Fatal("empty secret authenticated")
+	}
+	if VerifyAuth("secret", "example.test", "d", nil, "not-a-minute", "token", now) {
+		t.Fatal("malformed timestamp authenticated")
+	}
+	if _, err := DecodeFilenameLabels([]string{FilenamePrefix, "74"}); err == nil || !strings.Contains(err.Error(), "UTF-8") {
+		t.Fatalf("invalid UTF-8 filename error=%v", err)
+	}
+}
+
 func TestFilenameLabelsRoundTrip(t *testing.T) {
 	names := []string{
 		"TestCase!3:256.exe.txt",
@@ -96,8 +109,8 @@ func TestFilenameLabelsRoundTrip(t *testing.T) {
 func TestValidateFilenameRejectsPathsAndControlCharacters(t *testing.T) {
 	invalid := []string{
 		"", ".", "..", "../x", "x/y", `x\y`,
-		"bad\x00name",  // NUL (C0)
-		"bad\nname",    // LF (C0)
+		"bad\x00name",   // NUL (C0)
+		"bad\nname",     // LF (C0)
 		"bad\u0085name", // NEL (C1, U+0085)
 		"bad\u009fname", // APC (C1, U+009F)
 		"bad\u202ename", // RIGHT-TO-LEFT OVERRIDE (Cf)
@@ -195,6 +208,16 @@ func TestCurrentTimestamp(t *testing.T) {
 	ts3 := CurrentTimestamp(later)
 	if ts1 == ts3 {
 		t.Fatalf("timestamps 61 seconds apart should differ: both %q", ts1)
+	}
+}
+
+func TestAuthDriftMinutes(t *testing.T) {
+	now := time.Unix(6000, 0).UTC()
+	if drift, ok := AuthDriftMinutes("98", now); !ok || drift != 2 {
+		t.Fatalf("drift=%d ok=%v", drift, ok)
+	}
+	if _, ok := AuthDriftMinutes("bad", now); ok {
+		t.Fatal("malformed timestamp accepted")
 	}
 }
 

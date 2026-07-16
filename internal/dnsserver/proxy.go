@@ -107,6 +107,7 @@ type reverseConn struct {
 	leaseID      string
 	leaseExpires time.Time
 	leaseModern  bool
+	leaseVersion byte
 	openReady    chan struct{}
 	openOnce     sync.Once
 	openStatus   byte
@@ -950,15 +951,22 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 	if s.reverse.noteAgent(client) {
 		s.logger.Printf("agent connected from %s (first apoll)", client)
 	}
-	if len(payload) > 1 {
+	if len(payload) > 2 {
 		return []string{"ERR malformed"}
 	}
 	pollID := ""
-	if len(payload) == 1 {
+	protocolVersion := byte(1)
+	if len(payload) >= 1 {
 		pollID = strings.ToLower(payload[0])
 		if !validPollID(pollID) {
 			return []string{"ERR bad poll"}
 		}
+	}
+	if len(payload) == 2 {
+		if strings.ToLower(payload[1]) != "v2" {
+			return []string{"ERR malformed"}
+		}
+		protocolVersion = 2
 	}
 
 	for {
@@ -976,6 +984,9 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 				rc.mu.Lock()
 				if rc.leaseID == pollID {
 					rc.leaseExpires = now.Add(reverseLeaseTTL)
+					if protocolVersion > rc.leaseVersion {
+						rc.leaseVersion = protocolVersion
+					}
 					rc.mu.Unlock()
 					s.reverse.mu.Unlock()
 					return []string{"OPEN " + cid + " " + dnshelpers.B32LowerNoPad.EncodeToString([]byte(rc.target))}
@@ -984,6 +995,7 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 					rc.leaseID = pollID
 					rc.leaseExpires = now.Add(reverseLeaseTTL)
 					rc.leaseModern = true
+					rc.leaseVersion = protocolVersion
 					rc.mu.Unlock()
 					s.reverse.mu.Unlock()
 					return []string{"OPEN " + cid + " " + dnshelpers.B32LowerNoPad.EncodeToString([]byte(rc.target))}
@@ -1097,6 +1109,41 @@ func (s *Server) proxyAgentOpen(args []string, now time.Time) []string {
 		s.reverseCloseConn(cid, rc, "agent target dial failed")
 	}
 	return []string{"OK"}
+}
+
+// astatus resolves an ambiguous aopen timeout without mutating tunnel state.
+// New agents negotiate this command through apoll's v2 marker; v1 agents keep
+// the original aopen-only flow for rolling compatibility.
+func (s *Server) proxyAgentStatus(args []string, now time.Time) []string {
+	if !s.allowProxy || s.reverse == nil {
+		return []string{proxyDisabledResponse}
+	}
+	payload, ts, mac, ok := splitAuthenticatedArgs(args)
+	if !ok || !protocol.VerifyAuth(s.secret, s.authDomain, "astatus", payload, ts, mac, now) || len(payload) != 2 {
+		return []string{proxyAuthFailResponse}
+	}
+	cid := strings.ToLower(payload[0])
+	pollID := strings.ToLower(payload[1])
+	if !gproxy.ValidCID(cid) || !validPollID(pollID) {
+		return []string{"CLOSED"}
+	}
+	s.reverse.mu.Lock()
+	rc := s.reverse.conns[cid]
+	if rc == nil {
+		s.reverse.mu.Unlock()
+		return []string{"CLOSED"}
+	}
+	rc.mu.Lock()
+	state := "CLOSED"
+	switch {
+	case rc.openPollID == pollID && rc.openStatus == 0x00:
+		state = "OPEN"
+	case rc.leaseVersion >= 2 && rc.leaseID == pollID && now.Before(rc.leaseExpires):
+		state = "PENDING"
+	}
+	rc.mu.Unlock()
+	s.reverse.mu.Unlock()
+	return []string{state}
 }
 
 // aread: agent fetches operator-to-target bytes for cid. Returns

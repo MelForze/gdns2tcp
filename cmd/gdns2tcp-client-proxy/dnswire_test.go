@@ -54,6 +54,16 @@ func TestBuildTXTQueryLabelLimit(t *testing.T) {
 	}
 }
 
+func TestBuildTXTQueryPresentationLengthLimit(t *testing.T) {
+	valid := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+	if _, err := buildTXTQuery(valid, 1); err != nil {
+		t.Fatalf("253-byte name rejected: %v", err)
+	}
+	if _, err := buildTXTQuery(valid+"x", 1); err == nil {
+		t.Fatal("254-byte name accepted")
+	}
+}
+
 // TestExchangeUDPOneShot covers the fallback single-shot UDP path used
 // when the persistent udpPool isn't available (e.g. system resolver).
 func TestExchangeUDPOneShot(t *testing.T) {
@@ -514,6 +524,22 @@ func TestTCPPoolExchange(t *testing.T) {
 	}
 }
 
+func TestTCPPoolCloseWaitsAndPreventsRedial(t *testing.T) {
+	addr, stop := fakeTCPDNS(t)
+	defer stop()
+	pool := newTCPPool(addr)
+	q, _ := buildTXTQuery("test.example.com", 1)
+	if _, err := pool.exchange(q, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	pool.close()
+	q2, _ := buildTXTQuery("test.example.com", 2)
+	if _, err := pool.exchange(q2, time.Second); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("exchange after close error=%v", err)
+	}
+	pool.close()
+}
+
 func TestProbeAuthoritativeRejectsRecursiveStyleResponse(t *testing.T) {
 	addr, stop := fakeTCPDNS(t)
 	defer stop()
@@ -604,6 +630,64 @@ func TestTCPPoolReconnect(t *testing.T) {
 	if _, err := pool.exchange(q2, 2*time.Second); err != nil {
 		t.Fatalf("post-reconnect exchange: %v", err)
 	}
+}
+
+func TestOldTCPReadLoopCannotDrainNewGenerationPending(t *testing.T) {
+	pool := newTCPPool("scripted")
+	pool.conns = pool.conns[:1]
+	firstClient, firstServer := net.Pipe()
+	secondClient, secondServer := net.Pipe()
+	dials := make(chan net.Conn, 2)
+	dials <- firstClient
+	dials <- secondClient
+	pool.dial = func(string, time.Duration) (net.Conn, error) { return <-dials, nil }
+	firstRead := make(chan struct{})
+	go func() {
+		defer firstServer.Close()
+		var prefix [2]byte
+		if _, err := io.ReadFull(firstServer, prefix[:]); err != nil {
+			return
+		}
+		body := make([]byte, binary.BigEndian.Uint16(prefix[:]))
+		if _, err := io.ReadFull(firstServer, body); err == nil {
+			close(firstRead)
+		}
+		_, _ = io.Copy(io.Discard, firstServer)
+	}()
+	go func() {
+		defer secondServer.Close()
+		var prefix [2]byte
+		if _, err := io.ReadFull(secondServer, prefix[:]); err != nil {
+			return
+		}
+		body := make([]byte, binary.BigEndian.Uint16(prefix[:]))
+		if _, err := io.ReadFull(secondServer, body); err != nil {
+			return
+		}
+		binary.BigEndian.PutUint16(prefix[:], uint16(len(body)))
+		_ = writeAll(secondServer, prefix[:])
+		_ = writeAll(secondServer, body)
+	}()
+	firstResult := make(chan error, 1)
+	q1, _ := buildTXTQuery("old.example.com", 1)
+	go func() {
+		_, err := pool.exchange(q1, time.Second)
+		firstResult <- err
+	}()
+	<-firstRead
+	entry := pool.conns[0]
+	entry.mu.Lock()
+	entry.closed = true
+	entry.mu.Unlock()
+	q2, _ := buildTXTQuery("new.example.com", 2)
+	resp, err := pool.exchange(q2, time.Second)
+	if err != nil || len(resp) < 2 {
+		t.Fatalf("new generation exchange resp=%v err=%v", resp, err)
+	}
+	if err := <-firstResult; err == nil {
+		t.Fatal("old generation exchange unexpectedly succeeded")
+	}
+	pool.close()
 }
 
 func TestSkipDNSNameBranches(t *testing.T) {

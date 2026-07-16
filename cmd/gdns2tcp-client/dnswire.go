@@ -17,6 +17,8 @@ import (
 
 const dnsTypeTXT uint16 = 16
 
+var errDNSResponseTruncated = errors.New("DNS response truncated (TC=1)")
+
 // ednsUDPBufferSize is advertised to the server via EDNS0 OPT so it knows it
 // can return larger UDP responses (default DNS UDP cap is 512 bytes). 4096 is
 // the conventional EDNS0 buffer size and matches what the server can pack
@@ -49,6 +51,9 @@ func randomDNSID() uint16 {
 // with up to ednsUDPBufferSize bytes over UDP.
 func buildTXTQuery(name string, id uint16) ([]byte, error) {
 	name = strings.TrimSuffix(name, ".")
+	if len(name) > 253 {
+		return nil, fmt.Errorf("DNS name too long: %d bytes", len(name))
+	}
 	buf := make([]byte, 0, 64+len(name))
 	var hdr [12]byte
 	binary.BigEndian.PutUint16(hdr[0:2], id)
@@ -98,7 +103,7 @@ func parseTXTResponse(resp []byte, expectID uint16) (string, error) {
 		return "", fmt.Errorf("DNS response code %s", name)
 	}
 	if resp[2]&0x02 != 0 {
-		return "", errors.New("DNS response truncated (TC=1); reduce batch size or use -tcp")
+		return "", fmt.Errorf("%w; retrying over TCP is required", errDNSResponseTruncated)
 	}
 	qdcount := int(binary.BigEndian.Uint16(resp[4:6]))
 	ancount := int(binary.BigEndian.Uint16(resp[6:8]))
@@ -224,13 +229,17 @@ type tcpConnEntry struct {
 }
 
 type tcpPool struct {
-	addr  string
-	conns []*tcpConnEntry
-	next  atomic.Uint64
+	addr      string
+	conns     []*tcpConnEntry
+	next      atomic.Uint64
+	mu        sync.Mutex
+	closed    bool
+	wg        sync.WaitGroup
+	closeDone chan struct{}
 }
 
 func newTCPPool(addr string) *tcpPool {
-	p := &tcpPool{addr: addr}
+	p := &tcpPool{addr: addr, closeDone: make(chan struct{})}
 	p.conns = make([]*tcpConnEntry, tcpPoolConns)
 	for i := range p.conns {
 		p.conns[i] = &tcpConnEntry{parent: p, pending: make(map[uint16]chan []byte), nextID: randomDNSID(), closed: true}
@@ -264,7 +273,13 @@ func dialTCPConn(addr string, timeout time.Duration) (net.Conn, error) {
 // Mitigated by tcpPoolMaxRetries in pool.exchange — if a conn is busy
 // dialing, the worker picks another entry on the next attempt.
 func (e *tcpConnEntry) ensureLocked(timeout time.Duration) error {
+	e.parent.mu.Lock()
+	if e.parent.closed {
+		e.parent.mu.Unlock()
+		return errResolverClosed
+	}
 	if e.conn != nil && !e.closed {
+		e.parent.mu.Unlock()
 		return nil
 	}
 	for id, ch := range e.pending {
@@ -278,11 +293,14 @@ func (e *tcpConnEntry) ensureLocked(timeout time.Duration) error {
 	conn, err := dialTCPConn(e.parent.addr, timeout)
 	if err != nil {
 		e.closed = true
+		e.parent.mu.Unlock()
 		return err
 	}
 	e.conn = conn
 	e.closed = false
 	e.timeoutCount = 0
+	e.parent.wg.Add(1)
+	e.parent.mu.Unlock()
 	go e.readLoop(conn)
 	return nil
 }
@@ -294,6 +312,7 @@ func (e *tcpConnEntry) ensureLocked(timeout time.Duration) error {
 // race condition that surfaces as spurious "tcp pool conn closed during
 // exchange" errors on healthy queries.
 func (e *tcpConnEntry) readLoop(conn net.Conn) {
+	defer e.parent.wg.Done()
 	defer func() {
 		e.mu.Lock()
 		if e.conn == conn {
@@ -419,6 +438,9 @@ func writeAll(conn net.Conn, data []byte) error {
 		if err != nil {
 			return err
 		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
 		data = data[n:]
 	}
 	return nil
@@ -429,6 +451,12 @@ func writeAll(conn net.Conn, data []byte) error {
 // conn (or two simultaneously dead) doesn't fail an otherwise healthy
 // download burst.
 func (p *tcpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return nil, errResolverClosed
+	}
 	var lastErr error
 	for attempt := 0; attempt < tcpPoolMaxRetries; attempt++ {
 		idx := int((p.next.Add(1) - 1) % uint64(len(p.conns)))
@@ -439,4 +467,35 @@ func (p *tcpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
 		lastErr = err
 	}
 	return nil, lastErr
+}
+
+func (p *tcpPool) close() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.closed {
+		done := p.closeDone
+		p.mu.Unlock()
+		<-done
+		return
+	}
+	p.closed = true
+	p.mu.Unlock()
+	for _, e := range p.conns {
+		e.mu.Lock()
+		e.closed = true
+		conn := e.conn
+		e.conn = nil
+		for id, ch := range e.pending {
+			close(ch)
+			delete(e.pending, id)
+		}
+		e.mu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+	p.wg.Wait()
+	close(p.closeDone)
 }

@@ -2,6 +2,8 @@ package cryptoutil
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -148,5 +150,122 @@ func TestProtectOpenEmptyPlaintext(t *testing.T) {
 	}
 	if !bytes.Equal(got, []byte{}) {
 		t.Fatalf("got=%v want empty slice", got)
+	}
+}
+
+func TestPKCS7ValidationBranches(t *testing.T) {
+	padded := pkcs7Pad([]byte("abc"), 8)
+	if got, err := pkcs7Unpad(padded, 8); err != nil || string(got) != "abc" {
+		t.Fatalf("unpad=%q err=%v", got, err)
+	}
+	for _, invalid := range [][]byte{
+		nil,
+		{1, 2, 3},
+		{1, 2, 3, 4, 5, 6, 7, 0},
+		{1, 2, 3, 4, 5, 6, 7, 9},
+		{1, 2, 3, 4, 5, 6, 3, 2},
+	} {
+		if _, err := pkcs7Unpad(invalid, 8); err == nil {
+			t.Fatalf("invalid padding accepted: %v", invalid)
+		}
+	}
+}
+
+func TestOpenRejectsInvalidBase64AndMisalignedCiphertext(t *testing.T) {
+	if _, err := OpenBase64("secret", "%%%"); err == nil {
+		t.Fatal("invalid Base64 accepted")
+	}
+	protected, err := Protect("secret", []byte("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open("secret", protected[:len(protected)-1]); err == nil {
+		t.Fatal("misaligned ciphertext accepted")
+	}
+}
+
+type zeroWriter struct{}
+
+func (zeroWriter) Write([]byte) (int, error) { return 0, nil }
+
+type partialErrorWriter struct{ wrote bool }
+
+func (w *partialErrorWriter) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.wrote = true
+		return len(p) / 2, nil
+	}
+	return 0, io.ErrClosedPipe
+}
+
+func TestWriteAllShortAndPartialErrors(t *testing.T) {
+	if err := writeAll(zeroWriter{}, []byte("x")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("zero write error=%v", err)
+	}
+	if err := writeAll(&partialErrorWriter{}, []byte("abcd")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("partial write error=%v", err)
+	}
+}
+
+func TestStreamingCryptoRejectsMalformedInputsAndCleansOutput(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "plain.bin")
+	protected := filepath.Join(dir, "protected.gdt")
+	out := filepath.Join(dir, "out.bin")
+	if err := os.WriteFile(src, []byte("plain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProtectFile("", src, protected); err == nil {
+		t.Fatal("empty secret ProtectFile succeeded")
+	}
+	if err := ProtectFile("secret", filepath.Join(dir, "missing"), protected); err == nil {
+		t.Fatal("missing source ProtectFile succeeded")
+	}
+	if err := OpenFile("", protected, out); err == nil {
+		t.Fatal("empty secret OpenFile succeeded")
+	}
+	if err := os.WriteFile(protected, []byte("short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := OpenFile("secret", protected, out); err == nil {
+		t.Fatal("short protected file accepted")
+	}
+	if err := ProtectFile("secret", src, protected); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(protected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[0] ^= 0xff
+	if err := os.WriteFile(protected, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := OpenFile("secret", protected, out); err == nil {
+		t.Fatal("wrong magic accepted")
+	}
+	if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed decrypt retained output: %v", err)
+	}
+}
+
+func TestStreamingCryptoRejectsWrongSecretAndDirectoryOutputs(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "plain")
+	protected := filepath.Join(dir, "protected")
+	if err := os.WriteFile(src, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProtectFile("secret", src, dir); err == nil {
+		t.Fatal("ProtectFile accepted a directory destination")
+	}
+	if err := ProtectFile("secret", src, protected); err != nil {
+		t.Fatal(err)
+	}
+	if err := OpenFile("wrong", protected, filepath.Join(dir, "wrong")); err == nil {
+		t.Fatal("OpenFile accepted the wrong secret")
+	}
+	if err := OpenFile("secret", protected, dir); err == nil {
+		t.Fatal("OpenFile accepted a directory destination")
 	}
 }

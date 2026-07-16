@@ -11,7 +11,7 @@ import (
 // long-standing deployments would silently start behaving as if they
 // were multi-domain (rotating suffixes, wider budget worst-case, etc.).
 func TestParseDomainCSVSingleDomain(t *testing.T) {
-	canonical, shards, auth, longest := ParseDomainCSV("files.example.com")
+	canonical, shards, auth, longest := mustParseDomainCSV(t, "files.example.com")
 	if canonical != "files.example.com" {
 		t.Errorf("canonical=%q want files.example.com", canonical)
 	}
@@ -29,7 +29,7 @@ func TestParseDomainCSVSingleDomain(t *testing.T) {
 // TestParseDomainCSVMultiDomain verifies the canonical-first invariant
 // and that every shard survives dedup / whitespace-normalisation.
 func TestParseDomainCSVMultiDomain(t *testing.T) {
-	canonical, shards, auth, longest := ParseDomainCSV(" a.com ,B.COM,c.com. ,a.com")
+	canonical, shards, auth, longest := mustParseDomainCSV(t, " a.com ,B.COM,c.com. ,a.com")
 
 	if canonical != "a.com" {
 		t.Errorf("canonical=%q want a.com (first CSV entry)", canonical)
@@ -56,7 +56,7 @@ func TestParseDomainCSVMultiDomain(t *testing.T) {
 // build QNAMEs against a shorter shard and overflow 253 chars when
 // the rotator lands on the longer one.
 func TestParseDomainCSVLongestActuallyLongest(t *testing.T) {
-	_, _, _, longest := ParseDomainCSV("short.io,much-longer-shard.example.com,medium.com")
+	_, _, _, longest := mustParseDomainCSV(t, "short.io,much-longer-shard.example.com,medium.com")
 	if longest != "much-longer-shard.example.com" {
 		t.Errorf("longest=%q want much-longer-shard.example.com", longest)
 	}
@@ -68,7 +68,7 @@ func TestParseDomainCSVLongestActuallyLongest(t *testing.T) {
 // branches don't panic on nil deref.
 func TestParseDomainCSVEmptyInput(t *testing.T) {
 	for _, raw := range []string{"", " ", " , , ", ",,,"} {
-		canonical, shards, auth, longest := ParseDomainCSV(raw)
+		canonical, shards, auth, longest := mustParseDomainCSV(t, raw)
 		if canonical != "" {
 			t.Errorf("raw=%q canonical=%q want empty", raw, canonical)
 		}
@@ -90,7 +90,7 @@ func TestParseDomainCSVEmptyInput(t *testing.T) {
 // HMAC against canonical only, so shardAuthDomains[0] must be the
 // AuthDomain the client actually signs under.
 func TestParseDomainCSVAuthDomainConsistency(t *testing.T) {
-	canonical, _, auth, _ := ParseDomainCSV("Foo.Example.COM,bar.example.com")
+	canonical, _, auth, _ := mustParseDomainCSV(t, "Foo.Example.COM,bar.example.com")
 	if auth[0] != AuthDomain(canonical) {
 		t.Errorf("auth[0]=%q AuthDomain(canonical)=%q — mismatch would break server HMAC verify",
 			auth[0], AuthDomain(canonical))
@@ -108,6 +108,38 @@ func TestParseDomainCSVAuthDomainConsistency(t *testing.T) {
 			t.Errorf("auth entry %q not lowercased", a)
 		}
 	}
+}
+
+func TestParseDomainCSVRejectsWireOverflow(t *testing.T) {
+	valid := strings.Join([]string{strings.Repeat("a", 63), strings.Repeat("b", 63), strings.Repeat("c", 63), strings.Repeat("d", 61)}, ".")
+	if len(valid) != 253 {
+		t.Fatalf("test domain length=%d", len(valid))
+	}
+	if _, _, _, _, err := ParseDomainCSV(valid); err != nil {
+		t.Fatalf("maximum valid domain rejected: %v", err)
+	}
+	invalid := valid + "e"
+	if _, _, _, _, err := ParseDomainCSV(invalid); err == nil {
+		t.Fatal("254-byte domain was accepted")
+	}
+	if _, _, _, _, err := ParseDomainCSV("ok.example," + invalid); err == nil {
+		t.Fatal("invalid secondary shard was accepted")
+	}
+	if err := ValidateDomain(" "); err == nil {
+		t.Fatal("empty domain was accepted")
+	}
+	if err := ValidateDomain("bad..example"); err == nil {
+		t.Fatal("empty DNS label was accepted")
+	}
+}
+
+func mustParseDomainCSV(t *testing.T, raw string) (string, []string, []string, string) {
+	t.Helper()
+	canonical, shards, auth, longest, err := ParseDomainCSV(raw)
+	if err != nil {
+		t.Fatalf("ParseDomainCSV(%q): %v", raw, err)
+	}
+	return canonical, shards, auth, longest
 }
 
 func equalStrings(a, b []string) bool {

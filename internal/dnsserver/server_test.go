@@ -7,6 +7,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -288,6 +289,73 @@ func TestClientArtifactEndpoints(t *testing.T) {
 	}
 	if got := s.clientManifest("linux-amd64", "127.0.0.1"); got[0] != "Client artifact is not configured." {
 		t.Fatalf("unexpected missing artifact response: %v", got)
+	}
+}
+
+func TestClientArtifactStreamsExactBase64AndDetectsChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large-client.bin")
+	payload := make([]byte, 2<<20)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.ClientArtifacts = []ClientArtifactConfig{{Alias: "large", Path: path, Required: true}}
+	})
+	artifact := s.clientArtifacts["large"]
+	if artifact.chunkCount == 0 || artifact.encodedSize != int64(base64.StdEncoding.EncodedLen(len(payload))) {
+		t.Fatalf("artifact shape=%+v", artifact)
+	}
+	from := artifact.chunkCount / 2
+	got := s.clientBatch("large", []string{strconv.Itoa(from), "11"}, "127.0.0.1")
+	if len(got) != 12 {
+		t.Fatalf("batch strings=%d, want 12", len(got))
+	}
+	encoded := base64.StdEncoding.EncodeToString(payload)
+	start := from * clientChunkSize
+	end := start + 11*clientChunkSize
+	if end > len(encoded) {
+		end = len(encoded)
+	}
+	if strings.Join(got[1:], "") != encoded[start:end] {
+		t.Fatal("streamed artifact batch differs from legacy Base64 bytes")
+	}
+
+	changed := bytes.Repeat([]byte{0x5a}, len(payload))
+	if err := os.WriteFile(path, changed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.clientManifest("large", "127.0.0.1"); got[0] != "Client artifact is not configured." {
+		t.Fatalf("changed artifact manifest=%v", got)
+	}
+	if got := s.clientChunk("large", []string{"0"}, "127.0.0.1"); got[0] != "Client artifact is not configured." {
+		t.Fatalf("changed artifact chunk=%v", got)
+	}
+}
+
+func TestClientArtifactSizeLimitBeforeHashing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oversized-client.bin")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(4097); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	_, err = New(Config{
+		Domain: "example.test", Secret: "test-secret", DataDir: t.TempDir(),
+		MaxClientArtifactBytes: 4096,
+		ClientArtifacts:        []ClientArtifactConfig{{Alias: "large", Path: path, Required: true}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "limit is 4096") {
+		t.Fatalf("oversized required artifact error=%v", err)
 	}
 }
 
@@ -597,6 +665,9 @@ func TestServeDNS(t *testing.T) {
 		if !ok || len(txt.Txt) == 0 {
 			t.Fatal("expected TXT record in answer")
 		}
+		if txt.Hdr.Ttl != 0 {
+			t.Fatalf("dynamic TXT TTL=%d, want 0 to prevent recursive caching", txt.Hdr.Ttl)
+		}
 		got := txt.Txt[0]
 		if got != "base64" && got != "base32" {
 			t.Fatalf("expected base64 or base32, got %q", got)
@@ -632,6 +703,9 @@ func TestTestConnectionEncoding(t *testing.T) {
 	}
 	if got := s.handleTXT("encoding.test.example.test.", "127.0.0.1"); len(got) != 1 || got[0] != "base32" {
 		t.Fatalf("lowercase: %v", got)
+	}
+	if got := s.handleTXT("0123456789abcdef.encoding.test.example.test.", "127.0.0.1"); len(got) != 1 || got[0] != "base32" {
+		t.Fatalf("cache-busted probe: %v", got)
 	}
 	if got := s.handleTXT(".test.example.test.", "127.0.0.1"); len(got) != 1 || got[0] != "Empty request. Please repeat." {
 		t.Fatalf("empty arg: %v", got)
@@ -860,6 +934,9 @@ func TestCleanupExpiredDownload(t *testing.T) {
 }
 
 func TestNewErrors(t *testing.T) {
+	if _, err := New(Config{Domain: strings.Repeat("a", 64) + ".test", Secret: testSecret, DataDir: t.TempDir()}); err == nil {
+		t.Fatal("expected invalid domain error")
+	}
 	// Empty secret → error
 	_, err := New(Config{
 		Domain:  testDomain,
@@ -892,6 +969,86 @@ func TestNewErrors(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "not a directory") {
 		t.Fatalf("expected 'not a directory' error, got %v", err)
+	}
+
+	cacheParent := filepath.Join(t.TempDir(), "cache-parent-file")
+	if err := os.WriteFile(cacheParent, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(Config{
+		Domain: testDomain, Secret: testSecret, DataDir: t.TempDir(),
+		CacheDir: filepath.Join(cacheParent, "child"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "create cache dir") {
+		t.Fatalf("expected cache directory creation error, got %v", err)
+	}
+
+	func() {
+		oldWD, chdirErr := os.Getwd()
+		if chdirErr != nil {
+			t.Fatal(chdirErr)
+		}
+		if chdirErr = os.Chdir(t.TempDir()); chdirErr != nil {
+			t.Fatal(chdirErr)
+		}
+		defer func() { _ = os.Chdir(oldWD) }()
+		s, newErr := New(Config{Domain: testDomain, Secret: testSecret, DataDir: "", CacheDir: t.TempDir()})
+		if newErr != nil {
+			t.Fatalf("default data directory: %v", newErr)
+		}
+		s.Shutdown()
+	}()
+}
+
+func TestDownloadCacheReadAndEvictionErrorBranches(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now().UTC()
+	if _, err := s.readCacheChunk("missing", 0, now); err == nil {
+		t.Fatal("missing cache chunk succeeded")
+	}
+
+	s.downloadCache["missing-spool"] = downloadCacheEntry{
+		spoolPath: filepath.Join(t.TempDir(), "missing"), encodedSize: 1,
+		chunkCount: 1, lastAccess: now, expires: now.Add(time.Hour),
+	}
+	s.downloadCacheOrder = []string{"missing-spool"}
+	if _, err := s.readCacheChunks("missing-spool", 0, 1, now); err == nil {
+		t.Fatal("missing spool read succeeded")
+	}
+	if _, err := s.readCacheChunks("missing-spool", -1, 1, now); err == nil {
+		t.Fatal("invalid cache range succeeded")
+	}
+
+	short := filepath.Join(t.TempDir(), "short")
+	if err := os.WriteFile(short, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.downloadCache["short"] = downloadCacheEntry{
+		spoolPath: short, encodedSize: 10, chunkCount: 1,
+		lastAccess: now, lastMetaSave: now, expires: now.Add(time.Hour),
+	}
+	if _, err := s.readCacheChunk("short", 0, now); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("short cache read error=%v", err)
+	}
+	s.releaseCacheLocked("absent")
+
+	activePath := filepath.Join(t.TempDir(), "active")
+	inactivePath := filepath.Join(t.TempDir(), "inactive")
+	_ = os.WriteFile(activePath, []byte("a"), 0o600)
+	_ = os.WriteFile(inactivePath, []byte("b"), 0o600)
+	s.downloadCache = map[string]downloadCacheEntry{
+		"active":   {spoolPath: activePath, encodedSize: 10, active: 1, expires: now.Add(time.Hour)},
+		"inactive": {spoolPath: inactivePath, encodedSize: 10, expires: now.Add(time.Hour)},
+	}
+	s.downloadCacheOrder = []string{"stale-order-key", "active", "inactive"}
+	s.downloadCacheBytes = 20
+	s.cacheMaxBytes = 1
+	s.evictDownloadCacheLocked(now)
+	if _, ok := s.downloadCache["inactive"]; ok {
+		t.Fatal("inactive cache entry was not evicted")
+	}
+	if _, ok := s.downloadCache["active"]; !ok {
+		t.Fatal("active cache entry was evicted")
 	}
 }
 
@@ -1007,6 +1164,49 @@ func TestUploadFinalChunkTombstoneIsIdempotent(t *testing.T) {
 	stored, err := os.ReadFile(filepath.Join(s.dataDir, "tombstone.txt"))
 	if err != nil || !bytes.Equal(stored, data) {
 		t.Fatalf("published upload changed after duplicate final chunk: %q, %v", stored, err)
+	}
+	sameInit := append([]string{sid, strconv.Itoa(len(chunks)), "60", "base64"}, filenameLabels(t, "tombstone.txt")...)
+	if got := s.handleTXT(signedName("uinit", sameInit), "127.0.0.1"); got[0] != "Error. File already exist." {
+		t.Fatalf("completed same-fingerprint uinit=%v", got)
+	}
+	conflictInit := append([]string{sid, strconv.Itoa(len(chunks)), "60", "base64"}, filenameLabels(t, "other.txt")...)
+	if got := s.handleTXT(signedName("uinit", conflictInit), "127.0.0.1"); got[0] != "Transfer already exists." {
+		t.Fatalf("completed conflicting uinit=%v", got)
+	}
+}
+
+func TestUploadConcurrentFinalChunksShareCompletion(t *testing.T) {
+	s := newTestServer(t)
+	sid := "parallelfinal01"
+	data := []byte("parallel final chunk completion")
+	chunks := protectedUploadChunks(t, data, "base64", 60)
+	startUpload(t, s, sid, "parallel-final.txt", chunks, 60, "base64")
+	for index := 0; index < len(chunks)-1; index++ {
+		if got := sendUploadChunk(t, s, sid, index, chunks[index]); got != strconv.Itoa(index+1) {
+			t.Fatalf("chunk %d response=%q", index, got)
+		}
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var hookOnce sync.Once
+	s.finishUploadHook = func() {
+		hookOnce.Do(func() { close(entered) })
+		<-release
+	}
+	final := len(chunks) - 1
+	results := make(chan string, 2)
+	go func() { results <- sendUploadChunk(t, s, sid, final, chunks[final]) }()
+	<-entered
+	go func() { results <- sendUploadChunk(t, s, sid, final, chunks[final]) }()
+	close(release)
+	first, second := <-results, <-results
+	if first != "-1" || second != "-1" {
+		t.Fatalf("parallel final responses=(%q,%q), want identical success", first, second)
+	}
+	stored, err := os.ReadFile(filepath.Join(s.dataDir, "parallel-final.txt"))
+	if err != nil || !bytes.Equal(stored, data) {
+		t.Fatalf("published data=%q, err=%v", stored, err)
 	}
 }
 
@@ -1191,6 +1391,65 @@ func TestPrepareClientArtifactEmptyAlias(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "alias is required") {
 		t.Fatalf("expected 'alias is required' error, got %v", err)
+	}
+}
+
+func TestPrepareClientArtifactOptionalAndValidationBranches(t *testing.T) {
+	s := newTestServer(t, func(cfg *Config) { cfg.MaxClientArtifactBytes = 4 })
+	if err := s.prepareClientArtifact(ClientArtifactConfig{Alias: "bad.alias", Path: "ignored"}); err == nil {
+		t.Fatal("artifact alias containing a dot was accepted")
+	}
+	if err := s.prepareClientArtifact(ClientArtifactConfig{Alias: "unused", Path: ""}); err != nil {
+		t.Fatalf("empty optional artifact path: %v", err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing")
+	if err := s.prepareClientArtifact(ClientArtifactConfig{Alias: "optional", Path: missing}); err != nil {
+		t.Fatalf("missing optional artifact: %v", err)
+	}
+	if err := s.prepareClientArtifact(ClientArtifactConfig{Alias: "required", Path: missing, Required: true}); err == nil {
+		t.Fatal("missing required artifact was accepted")
+	}
+	dir := t.TempDir()
+	if err := s.prepareClientArtifact(ClientArtifactConfig{Alias: "directory", Path: dir}); err != nil {
+		t.Fatalf("optional directory artifact: %v", err)
+	}
+	if err := s.prepareClientArtifact(ClientArtifactConfig{Alias: "requireddir", Path: dir, Required: true}); err == nil {
+		t.Fatal("required directory artifact was accepted")
+	}
+	large := filepath.Join(t.TempDir(), "large.bin")
+	if err := os.WriteFile(large, []byte("12345"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.prepareClientArtifact(ClientArtifactConfig{Alias: "large", Path: large}); err != nil {
+		t.Fatalf("oversized optional artifact: %v", err)
+	}
+	if _, ok := s.clientArtifacts["large"]; ok {
+		t.Fatal("oversized optional artifact was published")
+	}
+}
+
+func TestSaveCacheMetaSuccessAndMissingDirectory(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now().UTC().Truncate(time.Nanosecond)
+	entry := downloadCacheEntry{
+		spoolPath: filepath.Join(s.cacheDir, "payload.bin"), mtime: now,
+		size: 10, sha256: strings.Repeat("a", 64), encodedSize: 16,
+		chunkCount: 1, lastAccess: now, expires: now.Add(time.Hour),
+	}
+	if err := s.saveCacheMeta(entry, "cache-key"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(s.cacheDir, "cache-key.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta diskCacheMeta
+	if err := json.Unmarshal(raw, &meta); err != nil || meta.Key != "cache-key" || meta.Spool != "payload.bin" {
+		t.Fatalf("saved metadata=%+v err=%v", meta, err)
+	}
+	s.cacheDir = filepath.Join(t.TempDir(), "removed")
+	if err := s.saveCacheMeta(entry, "unwritable"); err == nil {
+		t.Fatal("expected metadata temp-file creation error")
 	}
 }
 
@@ -1507,6 +1766,69 @@ func TestNewReconcilesOrphanTransferSpools(t *testing.T) {
 	}
 }
 
+func TestLoadDownloadCacheDropsMalformedMissingAndExpiredMetadata(t *testing.T) {
+	dataDir := t.TempDir()
+	cacheDir := filepath.Join(dataDir, "cache")
+	if err := os.Mkdir(cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	writeEntry := func(key string, spoolExists bool, expires time.Time) {
+		t.Helper()
+		spool := key + ".b64"
+		if spoolExists {
+			if err := os.WriteFile(filepath.Join(cacheDir, spool), []byte("encoded"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		meta := diskCacheMeta{Key: key, Spool: spool, MTimeUnixNs: now.UnixNano(), Size: 3, SHA256: "abc", EncodedSize: 7, ChunkCount: 1, LastAccess: now.UnixNano(), Expires: expires.UnixNano()}
+		raw, _ := json.Marshal(meta)
+		if err := os.WriteFile(filepath.Join(cacheDir, key+".json"), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeEntry("valid", true, now.Add(time.Hour))
+	writeEntry("missing", false, now.Add(time.Hour))
+	writeEntry("expired", true, now.Add(-time.Hour))
+	if err := os.WriteFile(filepath.Join(cacheDir, "malformed.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServer(t, func(cfg *Config) {
+		cfg.DataDir = dataDir
+		cfg.CacheDir = cacheDir
+	})
+	s.mu.Lock()
+	_, valid := s.downloadCache["valid"]
+	loadedBytes := s.downloadCacheBytes
+	s.mu.Unlock()
+	if !valid || loadedBytes != 7 {
+		t.Fatalf("valid=%v loaded bytes=%d", valid, loadedBytes)
+	}
+	for _, name := range []string{"missing.json", "expired.json", "expired.b64", "malformed.json"} {
+		if _, err := os.Stat(filepath.Join(cacheDir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("invalid cache file %s retained: %v", name, err)
+		}
+	}
+}
+
+func TestEvictDownloadCacheSkipsStaleOrderAndStopsWhenAllActive(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now().UTC()
+	s.mu.Lock()
+	s.cacheMaxBytes = 1
+	s.downloadCache = map[string]downloadCacheEntry{
+		"active": {encodedSize: 10, active: 1, expires: now.Add(time.Hour)},
+	}
+	s.downloadCacheBytes = 10
+	s.downloadCacheOrder = []string{"missing", "active"}
+	s.evictDownloadCacheLocked(now)
+	_, retained := s.downloadCache["active"]
+	s.mu.Unlock()
+	if !retained {
+		t.Fatal("active cache entry was evicted")
+	}
+}
+
 func TestDownloadBatchDebouncesCacheMetadataWrites(t *testing.T) {
 	s := newTestServer(t)
 	filename := "meta-debounce.bin"
@@ -1527,6 +1849,39 @@ func TestDownloadBatchDebouncesCacheMetadataWrites(t *testing.T) {
 	s.mu.Unlock()
 	if !afterSave.Equal(beforeSave) {
 		t.Fatalf("metadata was rewritten inside debounce interval: before=%v after=%v", beforeSave, afterSave)
+	}
+}
+
+func TestDownloadChunkAndBatchReportMissingCacheSpool(t *testing.T) {
+	s := newTestServer(t)
+	filename := "missing-spool.bin"
+	if err := os.WriteFile(filepath.Join(s.dataDir, filename), []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sid := "missingspool01"
+	startDownload(t, s, sid, filename)
+	s.mu.Lock()
+	state := s.downloads[sid]
+	entry := s.downloadCache[state.cacheKey]
+	s.mu.Unlock()
+	if err := os.Remove(entry.spoolPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.handleTXT(signedName("d", []string{sid, "0"}), "127.0.0.1"); got[0] != "Download cache unavailable." {
+		t.Fatalf("missing chunk spool response=%v", got)
+	}
+	if got := s.handleTXT(signedName("db", []string{sid, "0", "1"}), "127.0.0.1"); got[0] != "Download cache unavailable." {
+		t.Fatalf("missing batch spool response=%v", got)
+	}
+}
+
+func TestCatalogReadDirectoryError(t *testing.T) {
+	s := newTestServer(t)
+	if err := os.RemoveAll(s.dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.handleTXT(signedName("c", nil), "127.0.0.1"); got[0] != "Directory listing error." {
+		t.Fatalf("catalog missing dir response=%v", got)
 	}
 }
 
@@ -1639,7 +1994,7 @@ func newClientArtifactServer(t *testing.T) (*Server, int) {
 	s := newTestServer(t, func(cfg *Config) {
 		cfg.ClientArtifacts = []ClientArtifactConfig{{Alias: "win", Path: clientPath, Required: true}}
 	})
-	chunks := len(s.clientArtifacts["win"].chunks)
+	chunks := s.clientArtifacts["win"].chunkCount
 	if chunks < 20 {
 		t.Fatalf("artifact only produced %d chunks; bump payload size", chunks)
 	}
@@ -2550,6 +2905,196 @@ func TestReverseSocks5AuthRejectsBadPassword(t *testing.T) {
 	}
 }
 
+func TestHandleSOCKS5OperatorMalformedAndCapacityPaths(t *testing.T) {
+	runPipe := func(t *testing.T, s *Server, client func(net.Conn)) {
+		t.Helper()
+		serverConn, clientConn := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.HandleSOCKS5OperatorForTest(serverConn)
+		}()
+		client(clientConn)
+		_ = clientConn.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("SOCKS handler did not terminate")
+		}
+	}
+
+	t.Run("bad no-auth greeting", func(t *testing.T) {
+		s := newTestServer(t, func(cfg *Config) {
+			cfg.AllowProxy = true
+			cfg.SocksNoAuth = true
+		})
+		runPipe(t, s, func(conn net.Conn) { _, _ = conn.Write([]byte{0x04, 0x01, 0x00}) })
+	})
+
+	t.Run("invalid connect command", func(t *testing.T) {
+		s := newTestServer(t, func(cfg *Config) {
+			cfg.AllowProxy = true
+			cfg.SocksNoAuth = true
+		})
+		runPipe(t, s, func(conn net.Conn) {
+			_, _ = conn.Write([]byte{0x05, 0x01, 0x00})
+			method := make([]byte, 2)
+			_, _ = io.ReadFull(conn, method)
+			go func() { _, _ = conn.Write([]byte{0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0, 80}) }()
+			reply := make([]byte, 10)
+			_, _ = io.ReadFull(conn, reply)
+			if reply[1] != 0x01 {
+				t.Fatalf("invalid CONNECT reply=%v", reply)
+			}
+		})
+	})
+
+	t.Run("reverse capacity", func(t *testing.T) {
+		s := newTestServer(t, func(cfg *Config) {
+			cfg.AllowProxy = true
+			cfg.SocksNoAuth = true
+			cfg.ProxyMaxConn = 1
+		})
+		held, peer := net.Pipe()
+		defer held.Close()
+		defer peer.Close()
+		if _, _, err := s.reverseEnqueueOpen("127.0.0.1:80", held); err != nil {
+			t.Fatal(err)
+		}
+		runPipe(t, s, func(conn net.Conn) {
+			_, _ = conn.Write([]byte{0x05, 0x01, 0x00})
+			method := make([]byte, 2)
+			_, _ = io.ReadFull(conn, method)
+			go func() { _, _ = conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80}) }()
+			reply := make([]byte, 10)
+			_, _ = io.ReadFull(conn, reply)
+			if reply[1] != 0x05 {
+				t.Fatalf("capacity reply=%v", reply)
+			}
+		})
+	})
+}
+
+func TestCollectRetainedAxchgReadBranches(t *testing.T) {
+	s := proxyTestServer(t)
+	rc := &reverseConn{outbound: map[uint64]outboundProxyResponse{
+		2: {segments: []string{"DATA", "two"}},
+		1: {segments: []string{"DATA", "one"}},
+	}}
+	now := time.Now()
+	if got := s.collectRetainedAxchgRead(rc, now); strings.Join(got, "|") != "DATA|one" {
+		t.Fatalf("oldest retained response=%v", got)
+	}
+	rc.outbound = nil
+	if got := s.collectRetainedAxchgRead(rc, now); strings.Join(got, "|") != "EMPTY" {
+		t.Fatalf("empty retained response=%v", got)
+	}
+	rc.opClosed = true
+	if got := s.collectRetainedAxchgRead(rc, now); strings.Join(got, "|") != "CLOSED" {
+		t.Fatalf("closed retained response=%v", got)
+	}
+}
+
+func TestProxyAgentEndpointValidationMatrix(t *testing.T) {
+	s := proxyTestServer(t)
+	now := time.Now().UTC()
+	authArgs := func(command string, payload ...string) []string {
+		ts := protocol.CurrentTimestamp(now)
+		token := protocol.AuthToken(testSecret, testDomain, command, ts, payload)
+		return append(append([]string{}, payload...), ts, token)
+	}
+	assertResponse := func(name string, got []string, want string) {
+		t.Helper()
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("%s response=%v, want %q", name, got, want)
+		}
+	}
+
+	assertResponse("poll auth", s.proxyAgentPoll(nil, now, "127.0.0.1"), proxyAuthFailResponse)
+	assertResponse("poll payload", s.proxyAgentPoll(authArgs("apoll", "a", "b", "c"), now, "127.0.0.1"), "ERR malformed")
+	assertResponse("poll id", s.proxyAgentPoll(authArgs("apoll", "not-a-poll-id"), now, "127.0.0.1"), "ERR bad poll")
+	assertResponse("poll version", s.proxyAgentPoll(authArgs("apoll", "0123456789abcdef", "v3"), now, "127.0.0.1"), "ERR malformed")
+	if validPollID("0123456789abcdeg") || validPollID("short") {
+		t.Fatal("invalid poll ID accepted")
+	}
+
+	assertResponse("open auth", s.proxyAgentOpen(nil, now), proxyAuthFailResponse)
+	assertResponse("open arity", s.proxyAgentOpen(authArgs("aopen", "only"), now), "ERR malformed")
+	assertResponse("open identifiers", s.proxyAgentOpen(authArgs("aopen", "bad", "0123456789abcdef", "ok"), now), "ERR malformed")
+	assertResponse("open status", s.proxyAgentOpen(authArgs("aopen", "0123456789abcdef", "fedcba9876543210", "mystery"), now), "ERR malformed")
+	assertResponse("open unknown", s.proxyAgentOpen(authArgs("aopen", "0123456789abcdef", "fedcba9876543210", "ok"), now), "OK")
+
+	assertResponse("status auth", s.proxyAgentStatus(nil, now), proxyAuthFailResponse)
+	assertResponse("status identifiers", s.proxyAgentStatus(authArgs("astatus", "bad", "bad"), now), "CLOSED")
+	assertResponse("status unknown", s.proxyAgentStatus(authArgs("astatus", "0123456789abcdef", "fedcba9876543210"), now), "CLOSED")
+
+	op, peer := net.Pipe()
+	defer op.Close()
+	defer peer.Close()
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := rc.sessionKey
+	assertResponse("open wrong lease", s.proxyAgentOpen(authArgs("aopen", cid, "fedcba9876543210", "ok"), now), "ERR lease")
+
+	assertResponse("read arity", s.proxyAgentRead(nil, now), "ERR malformed")
+	assertResponse("read cid", s.proxyAgentRead([]string{"bad", "1", "x"}, now), "ERR bad cid")
+	assertResponse("read nonce", s.proxyAgentRead([]string{cid, "xyz", "x"}, now), "ERR bad nonce")
+	assertResponse("read marker", s.proxyAgentRead([]string{cid, "1", "bad-marker", "x"}, now), "ERR malformed")
+	assertResponse("read unknown", s.proxyAgentRead([]string{"0123456789abcdef", "1", "x"}, now), "CLOSED")
+	assertResponse("read mac", s.proxyAgentRead([]string{cid, "1", "wrong"}, now), proxyAuthFailResponse)
+
+	assertResponse("write arity", s.proxyAgentWrite(nil, now), "ERR malformed")
+	assertResponse("write cid", s.proxyAgentWrite([]string{"bad", "1", "x", "x"}, now), "ERR bad cid")
+	assertResponse("write seq", s.proxyAgentWrite([]string{cid, "xyz", "x", "x"}, now), "ERR bad seq")
+	assertResponse("write unknown", s.proxyAgentWrite([]string{"0123456789abcdef", "1", "x", "x"}, now), "ERR unknown cid")
+	assertResponse("write mac", s.proxyAgentWrite([]string{cid, "1", "x", "wrong"}, now), proxyAuthFailResponse)
+	rc.mu.Lock()
+	rc.agentClosed = true
+	rc.mu.Unlock()
+	assertResponse("write closed", s.proxyAgentWrite([]string{cid, "1", "x", protocol.SessionMAC(key, "awrite", 1)}, now), "ERR closed")
+	rc.mu.Lock()
+	rc.agentClosed = false
+	rc.mu.Unlock()
+	assertResponse("write encoding", s.proxyAgentWrite([]string{cid, "1", "!", protocol.SessionMAC(key, "awrite", 1)}, now), "ERR illegal base32 data at input byte 0")
+	assertResponse("write ciphertext", s.proxyAgentWrite([]string{cid, "1", "aa", protocol.SessionMAC(key, "awrite", 1)}, now), "ERR open")
+
+	assertResponse("close arity", s.proxyAgentClose(nil, now), "ERR malformed")
+	assertResponse("close cid", s.proxyAgentClose([]string{"bad", "1", "x"}, now), "ERR bad cid")
+	assertResponse("close nonce", s.proxyAgentClose([]string{cid, "xyz", "x"}, now), "ERR bad nonce")
+	assertResponse("close unknown", s.proxyAgentClose([]string{"0123456789abcdef", "1", "x"}, now), "OK")
+	assertResponse("close mac", s.proxyAgentClose([]string{cid, "1", "wrong"}, now), proxyAuthFailResponse)
+
+	assertResponse("exchange arity", s.proxyAgentExchange(nil, now), "ERR malformed")
+	assertResponse("exchange cid", s.proxyAgentExchange([]string{"bad", "0", "1", "x"}, now), "ERR bad cid")
+	assertResponse("exchange seq", s.proxyAgentExchange([]string{cid, "xyz", "1", "x"}, now), "ERR bad seq")
+	assertResponse("exchange nonce", s.proxyAgentExchange([]string{cid, "0", "xyz", "x"}, now), "ERR bad nonce")
+	assertResponse("exchange ack", s.proxyAgentExchange([]string{cid, "0", "a-xyz", "1", "x"}, now), "ERR bad ack")
+	assertResponse("exchange unknown", s.proxyAgentExchange([]string{"0123456789abcdef", "0", "1", "x"}, now), "CLOSED")
+	assertResponse("exchange mac", s.proxyAgentExchange([]string{cid, "0", "2", "wrong"}, now), proxyAuthFailResponse)
+	assertResponse("exchange missing write", s.proxyAgentExchange([]string{cid, "1", "3", protocol.SessionMAC(key, "axchg", 3)}, now), "ERR malformed")
+	assertResponse("exchange encoding", s.proxyAgentExchange([]string{cid, "1", "!", "4", protocol.SessionMAC(key, "axchg", 4)}, now), "ERR illegal base32 data at input byte 0")
+}
+
+func TestProxyAgentEndpointsReportDisabled(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now().UTC()
+	for name, response := range map[string][]string{
+		"apoll":   s.proxyAgentPoll(nil, now, "127.0.0.1"),
+		"aopen":   s.proxyAgentOpen(nil, now),
+		"astatus": s.proxyAgentStatus(nil, now),
+		"aread":   s.proxyAgentRead(nil, now),
+		"awrite":  s.proxyAgentWrite(nil, now),
+		"aclose":  s.proxyAgentClose(nil, now),
+		"axchg":   s.proxyAgentExchange(nil, now),
+	} {
+		if len(response) != 1 || response[0] != proxyDisabledResponse {
+			t.Fatalf("%s disabled response=%v", name, response)
+		}
+	}
+}
+
 func TestSocks5NoAuthSelect(t *testing.T) {
 	a, b := net.Pipe()
 	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
@@ -2704,6 +3249,34 @@ func TestReverseModernPollLeaseAndOpenAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestReverseV2StatusTransitions(t *testing.T) {
+	s := proxyTestServer(t)
+	op, peer := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = peer.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pollID := "0123456789abcdef"
+	poll := s.handleTXT(signedName("apoll", []string{pollID, "v2"}), "127.0.0.1")
+	if len(poll) != 1 || !strings.HasPrefix(poll[0], "OPEN "+cid+" ") {
+		t.Fatalf("v2 apoll=%v", poll)
+	}
+	if got := s.handleTXT(signedName("astatus", []string{cid, pollID}), "127.0.0.1"); len(got) != 1 || got[0] != "PENDING" {
+		t.Fatalf("pending astatus=%v", got)
+	}
+	if got := s.handleTXT(signedName("aopen", []string{cid, pollID, "ok"}), "127.0.0.1"); len(got) != 1 || got[0] != "OK" {
+		t.Fatalf("aopen=%v", got)
+	}
+	if got := s.handleTXT(signedName("astatus", []string{cid, pollID}), "127.0.0.1"); len(got) != 1 || got[0] != "OPEN" {
+		t.Fatalf("open astatus=%v", got)
+	}
+	s.reverseCloseConn(cid, rc, "test")
+	if got := s.handleTXT(signedName("astatus", []string{cid, pollID}), "127.0.0.1"); len(got) != 1 || got[0] != "CLOSED" {
+		t.Fatalf("closed astatus=%v", got)
+	}
+}
+
 func TestProxyAgentExchangeCachesLostResponseUntilReadACK(t *testing.T) {
 	s := proxyTestServer(t)
 	op, peer := net.Pipe()
@@ -2763,6 +3336,62 @@ func TestProxyAgentExchangeCachesLostResponseUntilReadACK(t *testing.T) {
 	defer rc.mu.Unlock()
 	if len(rc.outbound) != 0 || rc.readAck != 1 {
 		t.Fatalf("read ACK did not release retained outbound data: ack=%d outbound=%d", rc.readAck, len(rc.outbound))
+	}
+}
+
+func TestProxyResponseCacheInflightMaterializationAndEviction(t *testing.T) {
+	rc := &reverseConn{
+		responseCache: make(map[uint64]*cachedProxyResponse),
+		outbound: map[uint64]outboundProxyResponse{
+			7: {segments: []string{"DATA 7", "payload"}},
+		},
+	}
+	now := time.Now().UTC()
+	rc.mu.Lock()
+	cached, wait, owner := rc.beginResponse(1, now)
+	if cached != nil || wait != nil || !owner {
+		rc.mu.Unlock()
+		t.Fatalf("first reservation cached=%v wait=%v owner=%v", cached, wait, owner)
+	}
+	_, wait, owner = rc.beginResponse(1, now)
+	rc.mu.Unlock()
+	if wait == nil || owner {
+		t.Fatalf("duplicate inflight wait=%v owner=%v", wait, owner)
+	}
+	rc.finishResponse(1, []string{"ACK 0", "DATA 7", "payload"}, now)
+	<-wait
+	rc.mu.Lock()
+	cached, _, owner = rc.beginResponse(1, now)
+	rc.mu.Unlock()
+	if owner || strings.Join(cached, "|") != "ACK 0|DATA 7|payload" {
+		t.Fatalf("materialized retained response=%v owner=%v", cached, owner)
+	}
+
+	rc.mu.Lock()
+	delete(rc.outbound, 7)
+	rc.readAck = 7
+	cached = rc.materializeCachedResponseLocked(rc.responseCache[1])
+	if strings.Join(cached, "|") != "ACK 0|EMPTY" {
+		rc.mu.Unlock()
+		t.Fatalf("acked materialization=%v", cached)
+	}
+	rc.readAck = 0
+	if got := rc.materializeCachedResponseLocked(rc.responseCache[1]); got != nil {
+		rc.mu.Unlock()
+		t.Fatalf("missing unacked outbound materialized=%v", got)
+	}
+	if got := rc.materializeCachedResponseLocked(nil); got != nil {
+		rc.mu.Unlock()
+		t.Fatalf("nil cache entry materialized=%v", got)
+	}
+	rc.responseCache = make(map[uint64]*cachedProxyResponse)
+	for i := uint64(0); i < maxProxyResponseCache; i++ {
+		rc.responseCache[i] = &cachedProxyResponse{ready: true, expires: now.Add(-time.Second)}
+	}
+	_, _, owner = rc.beginResponse(maxProxyResponseCache+3, now)
+	rc.mu.Unlock()
+	if !owner || len(rc.responseCache) > maxProxyResponseCache {
+		t.Fatalf("cache owner=%v size=%d", owner, len(rc.responseCache))
 	}
 }
 
@@ -2853,6 +3482,81 @@ func TestProxyAgentExchangePureRead(t *testing.T) {
 	resp := s.proxyAgentExchange(args, time.Now().UTC())
 	if len(resp) < 2 || resp[0] != "ACK 0" || resp[1] != "EMPTY" { // 0 is "0" in both bases
 		t.Fatalf("expected [ACK 0, EMPTY], got %v", resp)
+	}
+}
+
+func TestProxyAgentExchangeValidationAndWriteErrorBranches(t *testing.T) {
+	disabled := newTestServer(t)
+	if got := disabled.proxyAgentExchange(nil, time.Now()); got[0] != proxyDisabledResponse {
+		t.Fatalf("disabled axchg=%v", got)
+	}
+	s := proxyTestServer(t)
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"x"}, "ERR malformed"},
+		{[]string{"bad", "0", "1", "x"}, "ERR bad cid"},
+		{[]string{"0123456789abcdef", "zz", "1", "x"}, "ERR bad seq"},
+		{[]string{"0123456789abcdef", "0", "zz", "x"}, "ERR bad nonce"},
+		{[]string{"0123456789abcdef", "0", "a-zz", "1", "x"}, "ERR bad ack"},
+		{[]string{"0123456789abcdef", "0", "1", "x"}, "CLOSED"},
+	} {
+		if got := s.proxyAgentExchange(tc.args, time.Now()); len(got) != 1 || got[0] != tc.want {
+			t.Fatalf("axchg(%v)=%v, want %q", tc.args, got, tc.want)
+		}
+	}
+	op, peer := net.Pipe()
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer op.Close()
+	defer peer.Close()
+	if got := s.proxyAgentExchange([]string{cid, "0", "1", "wrong"}, time.Now()); got[0] != proxyAuthFailResponse {
+		t.Fatalf("bad MAC axchg=%v", got)
+	}
+	nonce := uint64(2)
+	if got := s.proxyAgentExchange([]string{cid, "1", "2", protocol.SessionMAC(rc.sessionKey, "axchg", nonce)}, time.Now()); got[0] != "ERR malformed" {
+		t.Fatalf("missing write payload axchg=%v", got)
+	}
+
+	rc.mu.Lock()
+	rc.agentClosed = true
+	rc.mu.Unlock()
+	if got := s.applyAxchgWrite(rc, 1, []string{"a"}, time.Now()); got != "ERR closed" {
+		t.Fatalf("closed write=%q", got)
+	}
+	rc.mu.Lock()
+	rc.agentClosed = false
+	rc.seqAgentIn = 5
+	rc.mu.Unlock()
+	if got := s.applyAxchgWrite(rc, 5, []string{"a"}, time.Now()); got != "ACK 5" {
+		t.Fatalf("duplicate write=%q", got)
+	}
+	if got := s.applyAxchgWrite(rc, 5+awriteWindow+1, []string{"a"}, time.Now()); got != "ERR seq" {
+		t.Fatalf("far-ahead write=%q", got)
+	}
+	rc.mu.Lock()
+	rc.seqAgentIn = 0
+	rc.mu.Unlock()
+	if got := s.applyAxchgWrite(rc, 1, []string{"!"}, time.Now()); !strings.HasPrefix(got, "ERR ") {
+		t.Fatalf("bad Base32 write=%q", got)
+	}
+	badOpen := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte("not-an-aead-record"))
+	if got := s.applyAxchgWrite(rc, 1, []string{badOpen}, time.Now()); got != "ERR open" {
+		t.Fatalf("bad AEAD write=%q", got)
+	}
+	badCompressed := gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, 1, []byte{0xff})
+	badCompressedLabel := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(badCompressed)
+	if got := s.applyAxchgWrite(rc, 1, []string{badCompressedLabel}, time.Now()); got != "ERR decompress" {
+		t.Fatalf("bad compressed write=%q", got)
+	}
+	_ = peer.Close()
+	valid := gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, 1, rc.compressor.Encode([]byte("write fails")))
+	validLabel := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(valid)
+	if got := s.applyAxchgWrite(rc, 1, []string{validLabel}, time.Now()); got != "ERR write" {
+		t.Fatalf("operator write failure=%q", got)
 	}
 }
 

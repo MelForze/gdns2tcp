@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,10 +13,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"gdns2tcp/internal/codec"
+	secure "gdns2tcp/internal/crypto"
 	"gdns2tcp/internal/dnsserver"
 	"gdns2tcp/internal/protocol"
 
@@ -37,9 +40,88 @@ func startEmbeddedServer(t *testing.T, cfg dnsserver.Config) (ip, port string) {
 	}
 
 	dnsSrv := &dns.Server{PacketConn: pc, Net: "udp", Handler: srv}
-	go func() { _ = dnsSrv.ActivateAndServe() }()
-	t.Cleanup(func() { _ = dnsSrv.Shutdown() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = dnsSrv.ActivateAndServe()
+	}()
+	t.Cleanup(func() {
+		_ = dnsSrv.Shutdown()
+		<-done
+		srv.Shutdown()
+	})
 	return "127.0.0.1", strconv.Itoa(addr.Port)
+}
+
+func startEmbeddedTCPServer(t *testing.T, cfg dnsserver.Config) (ip, port string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().(*net.TCPAddr)
+	srv, err := dnsserver.New(cfg)
+	if err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	dnsSrv := &dns.Server{Listener: listener, Net: "tcp", Handler: srv, MaxTCPQueries: -1}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = dnsSrv.ActivateAndServe()
+	}()
+	t.Cleanup(func() {
+		_ = dnsSrv.Shutdown()
+		<-done
+		srv.Shutdown()
+	})
+	return "127.0.0.1", strconv.Itoa(addr.Port)
+}
+
+func TestShardRotorAndAuthenticatedNameCompatibility(t *testing.T) {
+	rotor := &atomic.Uint64{}
+	cfg := config{
+		domain: "one.test", shardDomains: []string{"one.test", "two.test"},
+		shardAuthDomains: []string{protocol.AuthDomain("one.test"), protocol.AuthDomain("two.test")},
+		shardRotor:       rotor, pass: "secret",
+	}
+	if first, second := cfg.pickShardAuthDomain(), cfg.pickShardAuthDomain(); first == second {
+		t.Fatalf("rotor did not advance: %q %q", first, second)
+	}
+	auth := cfg.retryShardAuthDomains()
+	plain := cfg.retryShardDomains()
+	if len(auth) != 2 || len(plain) != 2 || auth[0] == auth[1] || plain[0] == plain[1] {
+		t.Fatalf("retry shards auth=%v plain=%v", auth, plain)
+	}
+	name := authenticatedName("secret", cfg.domain, auth[0], "c", []string{"1"})
+	if !strings.Contains(name, ".c.") || !strings.HasSuffix(name, auth[0]) {
+		t.Fatalf("authenticated name=%q", name)
+	}
+	if fallback := (config{domain: "fallback.test"}).pickShardAuthDomain(); fallback != protocol.AuthDomain("fallback.test") {
+		t.Fatalf("fallback shard=%q", fallback)
+	}
+}
+
+func TestPublishOutputNoOverwriteBranches(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, "tmp")
+	out := filepath.Join(dir, "out")
+	if err := os.WriteFile(tmp, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishOutputNoOverwrite(tmp, out); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("temporary file retained: %v", err)
+	}
+	if err := os.WriteFile(tmp, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishOutputNoOverwrite(tmp, out); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("overwrite error=%v", err)
+	}
 }
 
 func newServerCfg(t *testing.T, dataDir string) dnsserver.Config {
@@ -226,12 +308,23 @@ func TestQueryOnceSuccess(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestValidateConfigDomainRequired(t *testing.T) {
+	if err := validateConfig(config{domainErr: errors.New("invalid domain")}); err == nil || err.Error() != "invalid domain" {
+		t.Fatalf("domain validation error=%v", err)
+	}
 	for _, mode := range []string{"test", "list", "upload", "download"} {
 		err := validateConfig(config{mode: mode})
 		if err == nil || !strings.Contains(err.Error(), "domain is required") {
 			t.Fatalf("mode=%q: got error %v, want 'domain is required'", mode, err)
 		}
 	}
+}
+
+func TestProgressBarIgnoresRegressionAndHandlesZeroTotal(t *testing.T) {
+	pb := newProgressBar("test", 0, 1)
+	pb.last = 2
+	pb.render(1)
+	pb.last = 0
+	pb.render(0)
 }
 
 func TestValidateConfigPassRequired(t *testing.T) {
@@ -341,6 +434,317 @@ func TestUploadDownloadFileIntegration(t *testing.T) {
 	}
 	if !bytes.Equal(got, inputContent) {
 		t.Fatal("downloaded content mismatch")
+	}
+}
+
+func TestUploadDownloadFileIntegrationOverTCP(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedTCPServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 2, useTCP: true, timeout: 2 * time.Second}
+	defer resolver.close()
+	payload := make([]byte, 16*1024)
+	for i := range payload {
+		payload[i] = byte(i*37%251 + i/251)
+	}
+	input := filepath.Join(t.TempDir(), "tcp-transfer.bin")
+	if err := os.WriteFile(input, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := config{
+		domain: "files.test", pass: "integration-test-secret",
+		dnsServer: ip, dnsPort: port, retries: 2, tcp: true,
+		chunkSize: 120, parallelism: 8, batch: 8,
+		maxDownloadBytes: defaultMaxDownloadBytes, noResume: true,
+	}
+	uploadCfg := base
+	uploadCfg.inFile = input
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("TCP upload: %v", err)
+	}
+	output := filepath.Join(t.TempDir(), "downloaded.bin")
+	downloadCfg := base
+	downloadCfg.filename = filepath.Base(input)
+	downloadCfg.outFile = output
+	if err := downloadFile(resolver, downloadCfg); err != nil {
+		t.Fatalf("TCP download: %v", err)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("TCP transfer mismatch: len=%d err=%v", len(got), err)
+	}
+}
+
+func TestRunClientDispatchesAllModes(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dataDir, "listed.txt"), []byte("listed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	base := config{
+		domain: "files.test", pass: "integration-test-secret",
+		dnsServer: ip, dnsPort: port, retries: 1,
+		chunkSize: 60, maxDownloadBytes: defaultMaxDownloadBytes,
+		parallelism: 2, batch: 2, noResume: true,
+	}
+
+	testCfg := base
+	testCfg.mode = "test"
+	if err := runClient(testCfg); err != nil {
+		t.Fatalf("test mode: %v", err)
+	}
+
+	listCfg := base
+	listCfg.mode = "list"
+	if err := runClient(listCfg); err != nil {
+		t.Fatalf("list mode: %v", err)
+	}
+
+	payload := bytes.Repeat([]byte("run-client-dispatch-"), 32)
+	input := filepath.Join(t.TempDir(), "dispatch.bin")
+	if err := os.WriteFile(input, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uploadCfg := base
+	uploadCfg.mode = "upload"
+	uploadCfg.inFile = input
+	if err := runClient(uploadCfg); err != nil {
+		t.Fatalf("upload mode: %v", err)
+	}
+
+	output := filepath.Join(t.TempDir(), "dispatch.out")
+	downloadCfg := base
+	downloadCfg.mode = "download"
+	downloadCfg.filename = filepath.Base(input)
+	downloadCfg.outFile = output
+	if err := runClient(downloadCfg); err != nil {
+		t.Fatalf("download mode: %v", err)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("downloaded payload differs: len=%d err=%v", len(got), err)
+	}
+
+	unknownCfg := base
+	unknownCfg.mode = "unknown"
+	if err := runClient(unknownCfg); err == nil || !strings.Contains(err.Error(), "unsupported mode") {
+		t.Fatalf("unsupported mode error=%v", err)
+	}
+}
+
+func TestSystemResolverAddressIsUsableWhenAvailable(t *testing.T) {
+	address, err := systemResolverAddress()
+	if err != nil {
+		t.Logf("system resolver is unavailable on this host: %v", err)
+		return
+	}
+	if net.ParseIP(address) == nil {
+		t.Fatalf("systemResolverAddress returned non-IP %q", address)
+	}
+}
+
+func TestRunClientPromotesTruncatedUDPProbeToTCP(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := pc.LocalAddr().(*net.UDPAddr)
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(addr.Port)))
+	if err != nil {
+		_ = pc.Close()
+		t.Fatal(err)
+	}
+	backend, err := dnsserver.New(newServerCfg(t, ""))
+	if err != nil {
+		_ = pc.Close()
+		_ = ln.Close()
+		t.Fatal(err)
+	}
+	udp := &dns.Server{PacketConn: pc, Net: "udp", Handler: dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Truncated = true
+		_ = w.WriteMsg(response)
+	})}
+	tcp := &dns.Server{Listener: ln, Net: "tcp", Handler: backend}
+	udpDone := make(chan struct{})
+	tcpDone := make(chan struct{})
+	go func() { defer close(udpDone); _ = udp.ActivateAndServe() }()
+	go func() { defer close(tcpDone); _ = tcp.ActivateAndServe() }()
+	t.Cleanup(func() {
+		_ = udp.Shutdown()
+		_ = tcp.Shutdown()
+		<-udpDone
+		<-tcpDone
+		backend.Shutdown()
+	})
+
+	cfg := config{
+		domain: "files.test", mode: "test", dnsServer: "127.0.0.1",
+		dnsPort: strconv.Itoa(addr.Port), retries: 1,
+	}
+	if err := runClient(cfg); err != nil {
+		t.Fatalf("UDP-to-TCP promotion: %v", err)
+	}
+}
+
+func TestDecodeDownloadedFileFailureMatrix(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain.bin")
+	gzipPath := filepath.Join(dir, "plain.gz")
+	protected := filepath.Join(dir, "plain.gdt")
+	spool := filepath.Join(dir, "plain.txt")
+	payload := bytes.Repeat([]byte("decode-matrix-"), 32)
+	if err := os.WriteFile(plain, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := codec.CompressFile(plain, gzipPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := secure.ProtectFile("password", gzipPath, protected); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := codec.EncodeDNSFile(protected, spool, "base64"); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := fileSHA256(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := decodeDownloadedFile(spool, "password", filepath.Join(dir, "ok.bin"), int64(len(payload)+1), digest); err != nil {
+		t.Fatalf("valid decode: %v", err)
+	}
+	if err := decodeDownloadedFile(spool, "wrong", filepath.Join(dir, "wrong-pass.bin"), 1<<20, digest); err == nil {
+		t.Fatal("wrong password was accepted")
+	}
+	if err := decodeDownloadedFile(spool, "password", filepath.Join(dir, "limited.bin"), 1, digest); err == nil {
+		t.Fatal("decompression limit was ignored")
+	}
+	if err := decodeDownloadedFile(spool, "password", filepath.Join(dir, "digest.bin"), 1<<20, strings.Repeat("0", 64)); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("digest mismatch error=%v", err)
+	}
+	existing := filepath.Join(dir, "existing.bin")
+	if err := os.WriteFile(existing, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeDownloadedFile(spool, "password", existing, 1<<20, digest); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("existing output error=%v", err)
+	}
+	badSpool := filepath.Join(dir, "bad.txt")
+	if err := os.WriteFile(badSpool, []byte("%%%"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeDownloadedFile(badSpool, "password", filepath.Join(dir, "bad.bin"), 1<<20, digest); err == nil || !strings.Contains(err.Error(), "decode download payload") {
+		t.Fatalf("invalid encoded spool error=%v", err)
+	}
+}
+
+func TestValidateDownloadShapeAndSpoolReadErrors(t *testing.T) {
+	for _, tc := range []struct {
+		chunks, batch  int
+		encoded, limit int64
+	}{
+		{0, 1, 1, 1}, {1, 0, 1, 1}, {1, 1, 0, 1}, {1, 1, 1, 0},
+		{1, 1, 100, 1}, {2, 1, 10, 100},
+	} {
+		if err := validateDownloadShape(tc.chunks, tc.batch, tc.encoded, tc.limit); err == nil {
+			t.Fatalf("invalid shape accepted: %+v", tc)
+		}
+	}
+	f, err := os.CreateTemp(t.TempDir(), "spool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("abc"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSpoolChunk(f, 10, 4); err == nil {
+		t.Fatal("out-of-range spool read succeeded")
+	}
+	if _, err := readSpoolChunk(f, 0, 0); err == nil {
+		t.Fatal("zero-size spool read succeeded")
+	}
+	if _, err := fileSHA256(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("hashing a missing file succeeded")
+	}
+	if err := publishOutputNoOverwrite(filepath.Join(t.TempDir(), "missing"), filepath.Join(t.TempDir(), "output")); err == nil {
+		t.Fatal("publishing a missing temporary file succeeded")
+	}
+}
+
+func TestMultiShardFailoverListUploadAndDownload(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dataDir, "catalog-seed.txt"), []byte("seed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server, err := dnsserver.New(dnsserver.Config{
+		Domain: "bad.test,good.test", Secret: "integration-test-secret", DataDir: dataDir,
+		AllowList: true, MaxUploadBytes: dnsserver.DefaultMaxUploadBytes, MaxDownloadBytes: dnsserver.DefaultMaxDownloadBytes,
+		Logger: log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failedShardQueries atomic.Int32
+	handler := dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		if len(request.Question) > 0 && strings.HasSuffix(strings.ToLower(request.Question[0].Name), ".bad.test.") {
+			failedShardQueries.Add(1)
+			response := new(dns.Msg)
+			response.SetRcode(request, dns.RcodeServerFailure)
+			_ = w.WriteMsg(response)
+			return
+		}
+		server.ServeDNS(w, request)
+	})
+	dnsSrv := &dns.Server{PacketConn: pc, Net: "udp", Handler: handler}
+	done := make(chan struct{})
+	go func() { defer close(done); _ = dnsSrv.ActivateAndServe() }()
+	t.Cleanup(func() { _ = dnsSrv.Shutdown(); <-done; server.Shutdown() })
+	addr := pc.LocalAddr().(*net.UDPAddr)
+	rotor := &atomic.Uint64{}
+	cfg := config{
+		domain: "bad.test", shardDomains: []string{"bad.test", "good.test"},
+		shardAuthDomains: []string{protocol.AuthDomain("bad.test"), protocol.AuthDomain("good.test")},
+		shardLongest:     "good.test", shardRotor: rotor, pass: "integration-test-secret",
+		dnsServer: "127.0.0.1", dnsPort: strconv.Itoa(addr.Port), retries: 2, chunkSize: 60,
+		parallelism: 4, batch: 4, maxDownloadBytes: defaultMaxDownloadBytes, noResume: true,
+	}
+	// Final upload publication includes fsync/decrypt/decompress work and can
+	// legitimately exceed 100 ms under the race detector. Keep the timeout
+	// below the production default while avoiding a test-only false failure.
+	resolver := &txtResolver{server: cfg.dnsServer, port: cfg.dnsPort, retries: cfg.retries, timeout: 2 * time.Second}
+	defer resolver.close()
+	if err := listFiles(resolver, cfg); err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("shard-failover-order-"), 200)
+	input := filepath.Join(t.TempDir(), "sharded.bin")
+	if err := os.WriteFile(input, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uploadCfg := cfg
+	uploadCfg.inFile = input
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(t.TempDir(), "downloaded.bin")
+	downloadCfg := cfg
+	downloadCfg.filename = "sharded.bin"
+	downloadCfg.outFile = output
+	if err := downloadFile(resolver, downloadCfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("downloaded bytes differ after shard failover: len=%d err=%v", len(got), err)
+	}
+	if failedShardQueries.Load() == 0 {
+		t.Fatal("test never exercised the failing shard")
 	}
 }
 
@@ -788,6 +1192,48 @@ func TestUploadFileStatusMismatch(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "upload initialization failed") {
 		t.Fatalf("uploadFile wrong-pass error=%v, want 'upload initialization failed'", err)
+	}
+}
+
+func TestUploadFileRejectsInvalidServerNextIndexes(t *testing.T) {
+	for _, tc := range []struct {
+		name, response, want string
+	}{
+		{name: "non-numeric", response: "not-an-index", want: "server returned upload error"},
+		{name: "negative", response: "-2", want: "server signaled upload failure"},
+		{name: "outside range", response: "999999", want: "outside prepared range"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ip, port := startCustomDNSServer(t, func(w dns.ResponseWriter, request *dns.Msg) {
+				value := tc.response
+				name := strings.ToLower(request.Question[0].Name)
+				switch {
+				case strings.Contains(name, "encoding.test."):
+					value = "base64"
+				case strings.Contains(name, ".uinit."):
+					value = "Ready to file uploading"
+				}
+				message := new(dns.Msg)
+				message.SetReply(request)
+				message.Answer = []dns.RR{&dns.TXT{
+					Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+					Txt: []string{value},
+				}}
+				_ = w.WriteMsg(message)
+			})
+			input := filepath.Join(t.TempDir(), "input.bin")
+			if err := os.WriteFile(input, []byte("payload"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			resolver := &txtResolver{server: ip, port: port, retries: 1}
+			err := uploadFile(resolver, config{
+				domain: "files.test", pass: "secret", inFile: input,
+				chunkSize: 60, retries: 1, dnsServer: ip, dnsPort: port,
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("upload error=%v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

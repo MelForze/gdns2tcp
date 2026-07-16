@@ -17,6 +17,8 @@ import (
 
 const dnsTypeTXT uint16 = 16
 
+var errDNSResponseTruncated = errors.New("DNS response truncated (TC=1)")
+
 // ednsUDPBufferSize is the EDNS0 buffer advertised on outgoing queries.
 // The proxy assumes a direct agent→server DNS path — pick 8 KB so a
 // single aread/axchg response can carry ~28 base64 chunks in one UDP
@@ -86,6 +88,10 @@ func buildTXTQuery(name string, id uint16) ([]byte, error) {
 // have a different backing array if buf grew). Caller passes a pooled
 // buffer from getDNSQueryBuf when on the hot path.
 func buildTXTQueryInto(buf []byte, name string, id uint16) ([]byte, error) {
+	name = strings.TrimSuffix(name, ".")
+	if len(name) > 253 {
+		return nil, fmt.Errorf("DNS name too long: %d bytes", len(name))
+	}
 	var hdr [12]byte
 	binary.BigEndian.PutUint16(hdr[0:2], id)
 	hdr[2] = 0x01
@@ -132,7 +138,7 @@ func parseTXTSegments(resp []byte, expectID uint16) ([]string, error) {
 		return nil, fmt.Errorf("DNS response code %s", name)
 	}
 	if resp[2]&0x02 != 0 {
-		return nil, errors.New("DNS response truncated (TC=1); use -tcp")
+		return nil, fmt.Errorf("%w; use -tcp", errDNSResponseTruncated)
 	}
 	qdcount := int(binary.BigEndian.Uint16(resp[4:6]))
 	ancount := int(binary.BigEndian.Uint16(resp[6:8]))
@@ -256,6 +262,7 @@ type udpPool struct {
 	addr  string
 	conns []*udpConnEntry
 	next  atomic.Uint64
+	wg    sync.WaitGroup
 }
 
 func newUDPPool(addr string) (*udpPool, error) {
@@ -266,9 +273,7 @@ func newUDPPool(addr string) (*udpPool, error) {
 		err := e.ensureLocked(5 * time.Second)
 		e.mu.Unlock()
 		if err != nil {
-			for j := 0; j < i; j++ {
-				p.conns[j].close()
-			}
+			p.close()
 			return nil, err
 		}
 		p.conns[i] = e
@@ -319,11 +324,13 @@ func (e *udpConnEntry) ensureLocked(timeout time.Duration) error {
 	}
 	e.conn = conn
 	e.closed = false
+	e.parent.wg.Add(1)
 	go e.readLoop(conn)
 	return nil
 }
 
 func (e *udpConnEntry) readLoop(conn *net.UDPConn) {
+	defer e.parent.wg.Done()
 	buf := make([]byte, ednsUDPBufferSize)
 	for {
 		n, err := conn.Read(buf)
@@ -440,6 +447,7 @@ func (p *udpPool) close() {
 			e.close()
 		}
 	}
+	p.wg.Wait()
 }
 
 func exchangeTCP(addr string, q []byte, timeout time.Duration) ([]byte, error) {
@@ -488,8 +496,7 @@ const tcpPoolConns = 16
 
 type tcpConnEntry struct {
 	parent     *tcpPool
-	mu         sync.Mutex // serializes writes on this conn
-	pendingMu  sync.Mutex
+	mu         sync.Mutex // owns connection generation, pending IDs and writes
 	pending    map[uint16]chan []byte
 	nextID     uint16
 	conn       net.Conn
@@ -499,15 +506,19 @@ type tcpConnEntry struct {
 }
 
 type tcpPool struct {
-	addr  string
-	conns []*tcpConnEntry
-	next  atomic.Uint64 // round-robin cursor across p.conns
-	dial  func(addr string, timeout time.Duration) (net.Conn, error)
+	addr      string
+	conns     []*tcpConnEntry
+	next      atomic.Uint64 // round-robin cursor across p.conns
+	dial      func(addr string, timeout time.Duration) (net.Conn, error)
+	mu        sync.Mutex
+	closed    bool
+	wg        sync.WaitGroup
+	closeDone chan struct{}
 }
 
 func newTCPPool(addr string) *tcpPool {
 	p := &tcpPool{
-		addr: addr,
+		addr: addr, closeDone: make(chan struct{}),
 		dial: func(a string, t time.Duration) (net.Conn, error) { return net.DialTimeout("tcp", a, t) },
 	}
 	p.conns = make([]*tcpConnEntry, tcpPoolConns)
@@ -521,7 +532,13 @@ func newTCPPool(addr string) *tcpPool {
 // Caller must hold entry.mu. Returns an error if the redial fails — caller
 // returns it to the exchange invoker, who may retry on another conn.
 func (e *tcpConnEntry) ensure(timeout time.Duration) error {
+	e.parent.mu.Lock()
+	if e.parent.closed {
+		e.parent.mu.Unlock()
+		return errors.New("tcp pool closed")
+	}
 	if e.conn != nil && !e.closed {
+		e.parent.mu.Unlock()
 		return nil
 	}
 	old := e.conn
@@ -534,15 +551,14 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 	if old != nil {
 		_ = old.Close()
 	}
-	e.pendingMu.Lock()
 	for id, ch := range e.pending {
 		close(ch)
 		delete(e.pending, id)
 	}
-	e.pendingMu.Unlock()
 	conn, err := e.parent.dial(e.parent.addr, timeout)
 	if err != nil {
 		e.connectErr = err
+		e.parent.mu.Unlock()
 		return err
 	}
 	// Шаг G: tune the long-lived DNS-over-TCP socket. NoDelay matters most
@@ -557,6 +573,8 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 	e.closed = false
 	e.connectErr = nil
 	gen := e.generation
+	e.parent.wg.Add(1)
+	e.parent.mu.Unlock()
 	go e.readLoop(conn, gen)
 	return nil
 }
@@ -566,24 +584,19 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 // Termination: any read error closes the conn and trips all pending senders,
 // so they observe the failure instead of waiting forever.
 func (e *tcpConnEntry) readLoop(conn net.Conn, generation uint64) {
+	defer e.parent.wg.Done()
 	defer func() {
 		e.mu.Lock()
-		owned := e.conn == conn && e.generation == generation
-		if owned {
+		if e.conn == conn && e.generation == generation {
 			e.closed = true
 			_ = conn.Close()
 			e.conn = nil
+			for id, ch := range e.pending {
+				close(ch)
+				delete(e.pending, id)
+			}
 		}
 		e.mu.Unlock()
-		if !owned {
-			return
-		}
-		e.pendingMu.Lock()
-		for id, ch := range e.pending {
-			close(ch)
-			delete(e.pending, id)
-		}
-		e.pendingMu.Unlock()
 	}()
 	var prefix [2]byte
 	for {
@@ -599,12 +612,12 @@ func (e *tcpConnEntry) readLoop(conn net.Conn, generation uint64) {
 			return
 		}
 		id := binary.BigEndian.Uint16(buf[:2])
-		e.pendingMu.Lock()
+		e.mu.Lock()
 		ch, ok := e.pending[id]
 		if ok {
 			delete(e.pending, id)
 		}
-		e.pendingMu.Unlock()
+		e.mu.Unlock()
 		if ok {
 			ch <- buf
 		}
@@ -626,15 +639,12 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		e.mu.Unlock()
 		return nil, err
 	}
-	e.pendingMu.Lock()
 	id, err := dnshelpers.ReserveDNSIDLocked(e.pending, &e.nextID, ch)
 	if err != nil {
-		e.pendingMu.Unlock()
 		e.mu.Unlock()
 		return nil, err
 	}
 	binary.BigEndian.PutUint16(q[:2], id)
-	e.pendingMu.Unlock()
 
 	var prefix [2]byte
 	binary.BigEndian.PutUint16(prefix[:], uint16(len(q)))
@@ -651,16 +661,12 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 			e.closed = true
 			e.conn = nil
 			_ = conn.Close()
-			e.pendingMu.Lock()
 			for pendingID, pendingCh := range e.pending {
 				close(pendingCh)
 				delete(e.pending, pendingID)
 			}
-			e.pendingMu.Unlock()
 		} else {
-			e.pendingMu.Lock()
 			dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
-			e.pendingMu.Unlock()
 		}
 		e.mu.Unlock()
 		return nil, werr
@@ -676,9 +682,9 @@ func (e *tcpConnEntry) exchange(q []byte, timeout time.Duration) ([]byte, error)
 		}
 		return resp, nil
 	case <-timer.C:
-		e.pendingMu.Lock()
+		e.mu.Lock()
 		dnshelpers.DeletePendingIfOwnedLocked(e.pending, id, ch)
-		e.pendingMu.Unlock()
+		e.mu.Unlock()
 		return nil, errors.New("tcp exchange timeout")
 	}
 }
@@ -701,6 +707,12 @@ func writeAll(conn net.Conn, data []byte) error {
 // conns are usually enough to absorb a transient failure on one socket
 // without bouncing the call to the caller.
 func (p *tcpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return nil, errors.New("tcp pool closed")
+	}
 	if len(p.conns) == 0 {
 		return nil, errors.New("tcp pool empty")
 	}
@@ -717,6 +729,15 @@ func (p *tcpPool) exchange(q []byte, timeout time.Duration) ([]byte, error) {
 }
 
 func (p *tcpPool) close() {
+	p.mu.Lock()
+	if p.closed {
+		done := p.closeDone
+		p.mu.Unlock()
+		<-done
+		return
+	}
+	p.closed = true
+	p.mu.Unlock()
 	for _, e := range p.conns {
 		e.mu.Lock()
 		if e.conn != nil {
@@ -725,12 +746,12 @@ func (p *tcpPool) close() {
 		e.conn = nil
 		e.closed = true
 		e.generation++
-		e.mu.Unlock()
-		e.pendingMu.Lock()
 		for id, ch := range e.pending {
 			close(ch)
 			delete(e.pending, id)
 		}
-		e.pendingMu.Unlock()
+		e.mu.Unlock()
 	}
+	p.wg.Wait()
+	close(p.closeDone)
 }

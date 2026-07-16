@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,6 +65,35 @@ func TestRunInvalidMaxDownloadBytes(t *testing.T) {
 	}
 }
 
+func TestRunAdditionalLimitValidation(t *testing.T) {
+	for _, tc := range []struct {
+		flag, want string
+	}{
+		{"-max-client-artifact-bytes=0", "max-client-artifact-bytes"},
+		{"-cache-max-bytes=0", "cache-max-bytes"},
+		{"-cache-ttl=0s", "cache-ttl"},
+	} {
+		resetFlagCommandLine(t, "-domain=files.test", "-listen=127.0.0.1", "-p=s", tc.flag)
+		if err := run(); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s error=%v, want %q", tc.flag, err, tc.want)
+		}
+	}
+}
+
+func TestRunProxyInterfaceFailsBeforeStartingListeners(t *testing.T) {
+	clientsDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(clientsDir, "gdns2tcp-client.ps1"), []byte("# client"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetFlagCommandLine(t,
+		"-domain=one.test,two.test", "-listen=127.0.0.1", "-p=s", "-clients-dir="+clientsDir,
+		"-allow-proxy", "-socks-iface=definitely-missing-interface",
+	)
+	if err := run(); err == nil || !strings.Contains(err.Error(), "socks-iface") {
+		t.Fatalf("proxy interface error=%v", err)
+	}
+}
+
 func TestDNSTCPServerDoesNotCloseAfterDefaultQueryLimit(t *testing.T) {
 	udp, tcp := newDNSServers("127.0.0.1:0", dns.HandlerFunc(func(dns.ResponseWriter, *dns.Msg) {}))
 	if udp.Net != "udp" || tcp.Net != "tcp" {
@@ -113,6 +143,58 @@ func TestRunListenAndServeFails(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("run() did not return within 5 s; listen address may have been accepted")
+	}
+}
+
+func TestRunProxyNoAuthNonLoopbackAndInvalidDNSListen(t *testing.T) {
+	clientsDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(clientsDir, "gdns2tcp-client.ps1"), []byte("# client"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetFlagCommandLine(t,
+		"-domain=files.test", "-listen=256.256.256.256", "-p=test-secret",
+		"-clients-dir="+clientsDir, "-allow-proxy", "-socks-listen=0.0.0.0:0",
+	)
+	if err := run(); err == nil || !strings.Contains(err.Error(), "dns server stopped") {
+		t.Fatalf("proxy server stop error=%v", err)
+	}
+}
+
+func TestRunProxyInterfaceRejectsMalformedSocksAddress(t *testing.T) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	interfaceName := ""
+	for _, iface := range interfaces {
+		addrs, addrErr := iface.Addrs()
+		if addrErr != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip, _, parseErr := net.ParseCIDR(addr.String())
+			if parseErr == nil && ip.To4() != nil && !ip.IsLoopback() {
+				interfaceName = iface.Name
+				break
+			}
+		}
+		if interfaceName != "" {
+			break
+		}
+	}
+	if interfaceName == "" {
+		t.Skip("host has no non-loopback IPv4 interface")
+	}
+	clientsDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(clientsDir, "gdns2tcp-client.ps1"), []byte("# client"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetFlagCommandLine(t,
+		"-domain=files.test", "-listen=127.0.0.1", "-p=test-secret", "-clients-dir="+clientsDir,
+		"-allow-proxy", "-socks-iface="+interfaceName, "-socks-listen=malformed",
+	)
+	if err := run(); err == nil || !strings.Contains(err.Error(), "parse -socks-listen") {
+		t.Fatalf("malformed socks address error=%v", err)
 	}
 }
 

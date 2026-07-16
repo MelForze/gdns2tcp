@@ -16,11 +16,13 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gdns2tcp/internal/clihelp"
@@ -31,6 +33,12 @@ import (
 )
 
 const defaultDNSPort = "53"
+
+const (
+	agentProtocolUnknown int32 = iota
+	agentProtocolLegacy
+	agentProtocolV2
+)
 
 type config struct {
 	// domain is the canonical DNS domain — the one baked into HMAC
@@ -52,6 +60,11 @@ type config struct {
 	// don't have a natural per-worker index). axchg workers hold their
 	// own local counter for cheaper contention-free rotation.
 	shardRotor *atomic.Uint64
+	domainErr  error
+	// protocolMode is shared by config copies. A v2-capable agent only
+	// downgrades after the old server explicitly rejects the v2 marker;
+	// timeouts and other transport errors leave negotiation unchanged.
+	protocolMode *atomic.Int32
 
 	pass          string
 	dnsServer     string
@@ -93,8 +106,42 @@ func (c config) pickShardAuthDomain() string {
 	if len(c.shardAuthDomains) == 1 || c.shardRotor == nil {
 		return c.shardAuthDomains[0]
 	}
-	idx := c.shardRotor.Add(1) % uint64(len(c.shardAuthDomains))
+	idx := (c.shardRotor.Add(1) - 1) % uint64(len(c.shardAuthDomains))
 	return c.shardAuthDomains[idx]
+}
+
+func (c config) retryShardAuthDomains() []string {
+	domains := c.shardAuthDomains
+	if len(domains) == 0 {
+		return []string{protocol.AuthDomain(c.domain)}
+	}
+	if len(domains) == 1 || c.shardRotor == nil {
+		return domains[:1]
+	}
+	start := int((c.shardRotor.Add(1) - 1) % uint64(len(domains)))
+	ordered := make([]string, len(domains))
+	for i := range ordered {
+		ordered[i] = domains[(start+i)%len(domains)]
+	}
+	return ordered
+}
+
+func (c config) retryShardAuthDomain(first string, attempt int) string {
+	domains := c.shardAuthDomains
+	if len(domains) == 0 {
+		return protocol.AuthDomain(c.domain)
+	}
+	if len(domains) == 1 {
+		return domains[0]
+	}
+	start := 0
+	for i, domain := range domains {
+		if domain == first {
+			start = i
+			break
+		}
+	}
+	return domains[(start+attempt)%len(domains)]
 }
 
 func main() {
@@ -105,27 +152,54 @@ func main() {
 }
 
 func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runWithContext(ctx)
+}
+
+func runWithContext(ctx context.Context) error {
 	cfg := parseFlags()
+	return runAgentWithContext(ctx, cfg)
+}
+
+func runAgentWithContext(ctx context.Context, cfg config) error {
+	if cfg.domainErr != nil {
+		return cfg.domainErr
+	}
 	if cfg.domain == "" {
 		return errors.New("domain is required")
 	}
 	if cfg.pass == "" {
 		return errors.New("password is required")
 	}
-	if cfg.dnsServer == "" {
-		addr, err := autoResolverAddr(cfg.domain)
-		if err != nil {
-			return err
-		}
-		cfg.dnsServer = addr
+	selection, err := selectDNSPath(ctx, cfg, discoverAuthoritativeDNS, systemResolverAddress)
+	if err != nil {
+		return err
+	}
+	cfg.dnsServer = selection.server
+	if selection.tcpRequired && !cfg.tcp {
+		cfg.tcp = true
+		fmt.Printf("authoritative DNS %s:%s requires TCP; promoting tunnel DNS transport to TCP\n", cfg.dnsServer, cfg.dnsPort)
+	}
+	if selection.source == dnsSelectionDelegation {
+		fmt.Printf("discovered authoritative DNS %s:%s via delegation %s -> %s\n", cfg.dnsServer, cfg.dnsPort, selection.parent, selection.nameServer)
 	}
 	resolver := newTxtResolver(cfg)
-	defer resolver.close()
+	defer func() { resolver.close() }()
 
-	probeName := "encoding.test." + cfg.domain
-	authoritative, probeErr := resolver.probeAuthoritative(probeName)
+	authoritative, probeErr := probeConfiguredDomains(cfg, resolver)
+	if !cfg.tcp && errors.Is(probeErr, errDNSResponseTruncated) {
+		resolver.close()
+		cfg.tcp = true
+		resolver = newTxtResolver(cfg)
+		fmt.Printf("DNS probe for %s was truncated over UDP; promoting tunnel DNS transport to TCP\n", cfg.domain)
+		authoritative, probeErr = probeConfiguredDomains(cfg, resolver)
+	}
 	cfg.dnsPathKnown = true
-	cfg.dnsAuthoritative = probeErr == nil && authoritative
+	// A recursive fallback always keeps conservative tuning. Some forwarding
+	// caches incorrectly relay AA from an upstream response, which must not
+	// make a system resolver look like a direct authoritative connection.
+	cfg.dnsAuthoritative = dnsPathIsAuthoritative(selection.source, authoritative, probeErr)
 	if cfg.dnsAuthoritative {
 		fmt.Printf("using direct authoritative DNS server %s:%s for %s\n", cfg.dnsServer, cfg.dnsPort, cfg.domain)
 	} else {
@@ -136,7 +210,11 @@ func run() error {
 			cfg.retries = 5
 			resolver.retries = cfg.retries
 		}
-		fmt.Fprintf(os.Stderr, "warning: DNS server %s:%s is not authoritative for %s; using conservative resolver mode (%d retries). For reliable high-volume tunnels, pass -ds with the gdns2tcp server IP.\n", cfg.dnsServer, cfg.dnsPort, cfg.domain, cfg.retries)
+		if selection.source == dnsSelectionSystem && selection.discoveryErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: authoritative DNS discovery failed: %v; using recursive DNS %s:%s with conservative resolver mode (%d retries). For reliable high-volume tunnels, pass -ds with the gdns2tcp server IP.\n", selection.discoveryErr, cfg.dnsServer, cfg.dnsPort, cfg.retries)
+		} else {
+			fmt.Fprintf(os.Stderr, "warning: DNS server %s:%s is not authoritative for %s; using conservative resolver mode (%d retries). For reliable high-volume tunnels, pass -ds with the gdns2tcp server IP.\n", cfg.dnsServer, cfg.dnsPort, cfg.domain, cfg.retries)
+		}
 		if probeErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: authoritative DNS probe failed: %v\n", probeErr)
 		}
@@ -144,20 +222,34 @@ func run() error {
 	fmt.Printf("polling %s for tunnel requests (max %d concurrent)\n", cfg.domain, cfg.maxConn)
 
 	var live atomic.Int64
+	var tunnelWG sync.WaitGroup
 	delay := cfg.pollMin
 	for {
+		select {
+		case <-ctx.Done():
+			resolver.close()
+			tunnelWG.Wait()
+			return nil
+		default:
+		}
 		if int(live.Load()) >= cfg.maxConn {
-			time.Sleep(cfg.pollMax)
+			if !sleepContext(ctx, cfg.pollMax) {
+				continue
+			}
 			continue
 		}
-		cid, target, pollID, err := agentPoll(cfg, resolver)
+		cid, target, pollID, v2, err := agentPollVersioned(cfg, resolver)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "apoll: %v\n", err)
-			time.Sleep(cfg.pollMax)
+			if !sleepContext(ctx, cfg.pollMax) {
+				continue
+			}
 			continue
 		}
 		if cid == "" {
-			time.Sleep(delay)
+			if !sleepContext(ctx, delay) {
+				continue
+			}
 			delay *= 2
 			if delay > cfg.pollMax {
 				delay = cfg.pollMax
@@ -166,22 +258,35 @@ func run() error {
 		}
 		delay = cfg.pollMin
 		live.Add(1)
-		go func(cid, target, pollID string) {
+		tunnelWG.Add(1)
+		go func(cid, target, pollID string, v2 bool) {
+			defer tunnelWG.Done()
 			defer live.Add(-1)
-			handleTunnel(cfg, resolver, cid, target, pollID)
-		}(cid, target, pollID)
+			handleTunnelContext(ctx, cfg, resolver, cid, target, pollID, v2)
+		}(cid, target, pollID, v2)
+	}
+}
+
+func sleepContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
 func parseFlags() config {
-	cfg := config{}
+	cfg := config{protocolMode: &atomic.Int32{}}
 	installUsage()
 	flag.StringVar(&cfg.domain, "domain", "", "authoritative gdns2tcp domain. Accepts a single name or CSV list (a.com,b.com,c.com) — the first is used as the canonical HMAC domain, all are rotated round-robin as QNAME suffixes to spread load across resolver per-zone rate-limits.")
 	flag.StringVar(&cfg.domain, "d", "", "short alias for -domain")
 	flag.StringVar(&cfg.pass, "password", "", "shared encryption secret (must match server's -password)")
 	flag.StringVar(&cfg.pass, "p", "", "short alias for -password")
 	flag.StringVar(&cfg.pass, "pass", "", "deprecated alias for -password")
-	flag.StringVar(&cfg.dnsServer, "dns-server", "", "DNS server address; empty uses the system resolver")
+	flag.StringVar(&cfg.dnsServer, "dns-server", "", "DNS server address; empty discovers the delegated authoritative server and falls back to the system resolver")
 	flag.StringVar(&cfg.dnsServer, "ds", "", "short alias for -dns-server")
 	flag.StringVar(&cfg.dnsPort, "dns-port", defaultDNSPort, "DNS server port; defaults to 53")
 	flag.StringVar(&cfg.dnsPort, "dp", defaultDNSPort, "short alias for -dns-port")
@@ -198,7 +303,7 @@ func parseFlags() config {
 		}
 	})
 
-	cfg.domain, cfg.shardDomains, cfg.shardAuthDomains, cfg.shardLongest = protocol.ParseDomainCSV(cfg.domain)
+	cfg.domain, cfg.shardDomains, cfg.shardAuthDomains, cfg.shardLongest, cfg.domainErr = protocol.ParseDomainCSV(cfg.domain)
 	cfg.shardRotor = new(atomic.Uint64)
 	cfg.dnsPort = strings.TrimSpace(cfg.dnsPort)
 	if cfg.dnsPort == "" {
@@ -249,7 +354,7 @@ func installUsage() {
 				{
 					Title: "DNS transport",
 					Flags: []clihelp.Flag{
-						{Names: "-dns-server, -ds <ip>", Description: "DNS server address; use the authoritative gdns2tcp IP for full throughput"},
+						{Names: "-dns-server, -ds <ip>", Description: "explicit DNS server; empty auto-discovers the delegated authoritative server"},
 						{Names: "-dns-port, -dp <port>", Description: "DNS server port (default " + defaultDNSPort + ")"},
 						{Names: "-tcp", Description: "use TCP instead of UDP for DNS queries"},
 						{Names: "-retries <n>", Description: "DNS query attempts before failing (default 3)"},
@@ -278,73 +383,37 @@ func installUsage() {
 			},
 			[]string{
 				"Run this on the target side; the operator connects to the server's SOCKS listener.",
-				"Without -ds, recursive DNS is auto-detected and uses a conservative worker profile; direct authoritative DNS is recommended for long-lived tunnels.",
+				"Without -ds, system DNS bootstraps delegation discovery; tunnel traffic goes direct unless recursive fallback is required.",
+				"Recursive fallback uses unique nonce-bearing QNAMEs so intermediate DNS caches cannot replay stale tunnel state.",
 				"Go's flag parser accepts both -flag and --flag forms.",
 			},
 		)
 	}
 }
 
-// autoResolverAddr picks a DNS server address for the agent when -ds wasn't
-// provided.  On Unix it uses resolv.conf.  On platforms without it (notably
-// Windows), it resolves the zone's NS records through the system resolver and
-// dials the authoritative nameserver — the zone apex itself commonly has no
-// A/AAAA record, so looking it up as an IP was not a valid fallback.
-func autoResolverAddr(domain string) (string, error) {
-	if addr, err := resolvConfNameserver(); err == nil {
-		return addr, nil
+func probeConfiguredDomains(cfg config, resolver *txtResolver) (bool, error) {
+	domains := cfg.shardDomains
+	if len(domains) == 0 {
+		domains = []string{cfg.domain}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	nss, err := net.DefaultResolver.LookupNS(ctx, domain)
-	if err == nil {
-		for _, ns := range nss {
-			ips, lookupErr := net.DefaultResolver.LookupIP(ctx, "ip", ns.Host)
-			if lookupErr != nil {
-				continue
-			}
-			for _, ip := range ips {
-				if v4 := ip.To4(); v4 != nil {
-					return v4.String(), nil
-				}
-			}
-			if len(ips) > 0 {
-				return ips[0].String(), nil
-			}
+	for _, domain := range domains {
+		probeName, err := newAuthoritativeProbeName(domain)
+		if err != nil {
+			return false, err
+		}
+		authoritative, err := resolver.probeAuthoritative(probeName)
+		if err != nil {
+			return false, fmt.Errorf("%s: %w", domain, err)
+		}
+		if !authoritative {
+			return false, nil
 		}
 	}
-	// Non-standard private deployments sometimes put an A record at the
-	// apex; retain that as a final compatibility fallback.
-	ips, ipErr := net.DefaultResolver.LookupIP(ctx, "ip", domain)
-	if ipErr == nil {
-		for _, ip := range ips {
-			if v4 := ip.To4(); v4 != nil {
-				return v4.String(), nil
-			}
-		}
-		if len(ips) > 0 {
-			return ips[0].String(), nil
-		}
-	}
-	return "", fmt.Errorf("cannot discover an authoritative nameserver for %s; specify -dns-server explicitly", domain)
+	return true, nil
 }
 
-func resolvConfNameserver() (string, error) {
-	data, err := os.ReadFile("/etc/resolv.conf")
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "#") || line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == "nameserver" {
-			return fields[1], nil
-		}
-	}
-	return "", errors.New("no nameserver line in /etc/resolv.conf")
+func dnsPathIsAuthoritative(source dnsSelectionSource, probeAuthoritative bool, probeErr error) bool {
+	return source != dnsSelectionSystem && probeErr == nil && probeAuthoritative
 }
 
 // --- Tunnel handling -------------------------------------------------------
@@ -366,12 +435,16 @@ func (ts *tunnelSession) nextNonce() uint64 {
 
 // handleTunnel dials the target locally and bridges bytes through the DNS
 // tunnel until either side closes.
-func handleTunnel(cfg config, resolver *txtResolver, cid, target, pollID string) {
+func handleTunnel(cfg config, resolver *txtResolver, cid, target, pollID string, v2 bool) {
+	handleTunnelContext(context.Background(), cfg, resolver, cid, target, pollID, v2)
+}
+
+func handleTunnelContext(parent context.Context, cfg config, resolver *txtResolver, cid, target, pollID string, v2 bool) {
 	dialer := net.Dialer{Timeout: cfg.targetTimeout, KeepAlive: 30 * time.Second}
-	upstream, err := dialer.Dial("tcp", target)
+	upstream, err := dialer.DialContext(parent, "tcp", target)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dial %s for cid=%s: %v\n", target, cid, err)
-		_ = agentOpen(cfg, resolver, cid, pollID, dialFailureStatus(err))
+		_ = confirmAgentOpen(cfg, resolver, cid, pollID, dialFailureStatus(err), v2)
 		return
 	}
 	defer upstream.Close()
@@ -383,12 +456,12 @@ func handleTunnel(cfg config, resolver *txtResolver, cid, target, pollID string)
 
 	aead, err := gproxy.SessionAEAD(cfg.pass, cid)
 	if err != nil {
-		_ = agentOpen(cfg, resolver, cid, pollID, "unreachable")
+		_ = confirmAgentOpen(cfg, resolver, cid, pollID, "unreachable", v2)
 		return
 	}
 	compressor, err := gproxy.GetCompressor()
 	if err != nil {
-		_ = agentOpen(cfg, resolver, cid, pollID, "unreachable")
+		_ = confirmAgentOpen(cfg, resolver, cid, pollID, "unreachable", v2)
 		return
 	}
 	ts := &tunnelSession{
@@ -396,7 +469,7 @@ func handleTunnel(cfg config, resolver *txtResolver, cid, target, pollID string)
 		sessionKey: protocol.DeriveSessionKey(cfg.pass, cid),
 		compressor: compressor,
 	}
-	if err := agentOpen(cfg, resolver, cid, pollID, "ok"); err != nil {
+	if err := confirmAgentOpen(cfg, resolver, cid, pollID, "ok", v2); err != nil {
 		fmt.Fprintf(os.Stderr, "aopen cid=%s: %v\n", cid, err)
 		return
 	}
@@ -417,9 +490,10 @@ func handleTunnel(cfg config, resolver *txtResolver, cid, target, pollID string)
 		return
 	}
 
-	done := make(chan struct{})
-	var once sync.Once
-	stop := func() { once.Do(func() { close(done) }) }
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	done := ctx.Done()
+	stop := cancel
 
 	runBidirectionalTunnel(cfg, tuningForCfg(cfg), resolver, ts, cid, upstream, done, stop)
 
@@ -535,13 +609,12 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 		stopOnce.Do(func() { close(internalStop) })
 		stop()
 	}
-	// Guarantee `done` closes regardless of which exit path runs. Without
-	// this, the EOF path (close(writeJobs); return) leaves the upstream
-	// deadline-poke goroutine parked on done/internalStop forever.
-	defer stop()
+	var lifecycleWG sync.WaitGroup
 	writerDone := make(chan struct{})
 	writerErr := make(chan error, 1)
+	lifecycleWG.Add(1)
 	go func() {
+		defer lifecycleWG.Done()
 		defer close(writerDone)
 		for result := range orderedReads {
 			if err := writeAll(upstream, result.readData); err != nil {
@@ -562,7 +635,11 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 		}
 		<-writerDone
 	}
-	defer finishWriter()
+	defer func() {
+		stopAll()
+		finishWriter()
+		lifecycleWG.Wait()
+	}()
 
 	var workerWG sync.WaitGroup
 	for i := 0; i < tuning.workers; i++ {
@@ -717,7 +794,9 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 	// bufSize reserves one byte of plaintext budget for the compressor's
 	// flag prefix; without it an incompressible chunk would overflow the
 	// axchg name-length cap.
+	lifecycleWG.Add(1)
 	go func() {
+		defer lifecycleWG.Done()
 		select {
 		case <-done:
 		case <-internalStop:
@@ -725,7 +804,9 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 		_ = upstream.SetReadDeadline(time.Unix(1, 0))
 		_ = upstream.SetWriteDeadline(time.Unix(1, 0))
 	}()
+	lifecycleWG.Add(1)
 	go func() {
+		defer lifecycleWG.Done()
 		var seq uint64
 		// Budget only changes when hexWidth(seq+1) rolls over the next
 		// power-of-16 boundary (seq = 15, 255, 4095, 65535, …). Caching
@@ -800,7 +881,9 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 		}
 	}()
 
+	lifecycleWG.Add(1)
 	go func() {
+		defer lifecycleWG.Done()
 		workerWG.Wait()
 		close(readResults)
 	}()
@@ -837,7 +920,13 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 	// Queue any final contiguous reads, then warn if a gap left data stranded:
 	// the operator will see EOF mid-stream rather than silent truncation.
 	_ = enqueueContiguous(pending, &nextSeq, orderedReads, done, internalStop)
+	deadline := cfg.targetTimeout
+	if deadline <= 0 {
+		deadline = 5 * time.Second
+	}
+	_ = upstream.SetWriteDeadline(time.Now().Add(deadline))
 	finishWriter()
+	stopAll()
 	select {
 	case err := <-writerErr:
 		fmt.Fprintf(os.Stderr, "axchg cid=%s: target write: %v\n", cid, err)
@@ -980,40 +1069,64 @@ var b32 = dnshelpers.B32LowerNoPad
 // agentPoll asks the server "any pending opens?". Returns (cid, target,
 // nil) on a hit, ("", "", nil) on EMPTY, or an error.
 func agentPoll(cfg config, resolver *txtResolver) (cid, target, pollID string, err error) {
+	cid, target, pollID, _, err = agentPollVersioned(cfg, resolver)
+	return cid, target, pollID, err
+}
+
+func agentPollVersioned(cfg config, resolver *txtResolver) (cid, target, pollID string, v2 bool, err error) {
 	pollID, err = protocol.NewSID()
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", false, err
 	}
-	name := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "apoll", []string{pollID})
-	resp, err := resolver.query(name)
+	mode := cfg.protocolMode
+	if mode == nil {
+		mode = &atomic.Int32{}
+	}
+	args := []string{pollID, "v2"}
+	if mode.Load() == agentProtocolLegacy {
+		args = args[:1]
+	}
+	resp, err := resolver.queryNames(authenticatedNames(cfg, "apoll", args))
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", false, err
 	}
+	if len(args) == 2 && resp == "ERR malformed" {
+		if mode.CompareAndSwap(agentProtocolUnknown, agentProtocolLegacy) {
+			fmt.Fprintln(os.Stderr, "warning: server does not support proxy protocol v2; using legacy aopen semantics")
+		}
+		resp, err = resolver.queryNames(authenticatedNames(cfg, "apoll", args[:1]))
+		if err != nil {
+			return "", "", "", false, err
+		}
+	} else if len(args) == 2 {
+		mode.CompareAndSwap(agentProtocolUnknown, agentProtocolV2)
+	}
+	v2 = mode.Load() == agentProtocolV2
 	if resp == "EMPTY" {
-		return "", "", "", nil
+		return "", "", "", v2, nil
 	}
 	if strings.HasPrefix(resp, "ERR ") {
-		return "", "", "", errors.New(resp)
+		return "", "", "", v2, errors.New(resp)
 	}
 	if !strings.HasPrefix(resp, "OPEN ") {
-		return "", "", "", fmt.Errorf("unexpected apoll response: %q", resp)
+		return "", "", "", v2, fmt.Errorf("unexpected apoll response: %q", resp)
 	}
 	parts := strings.SplitN(resp[len("OPEN "):], " ", 2)
 	if len(parts) != 2 {
-		return "", "", "", fmt.Errorf("malformed OPEN response: %q", resp)
+		return "", "", "", v2, fmt.Errorf("malformed OPEN response: %q", resp)
 	}
 	cid = parts[0]
 	if !gproxy.ValidCID(cid) {
-		return "", "", "", fmt.Errorf("bad cid in OPEN: %q", cid)
+		return "", "", "", v2, fmt.Errorf("bad cid in OPEN: %q", cid)
 	}
 	// Target is base32-encoded by the server; older servers send uppercase,
 	// newer ones lowercase. dnshelpers.B32DecodeAny handles both without
 	// paying a strings.ToUpper allocation on the common (lowercase) path.
 	rawTarget, err := dnshelpers.B32DecodeAny(parts[1])
 	if err != nil {
-		return "", "", "", fmt.Errorf("decode target: %w", err)
+		return "", "", "", v2, fmt.Errorf("decode target: %w", err)
 	}
-	return cid, string(rawTarget), pollID, nil
+	return cid, string(rawTarget), pollID, v2, nil
 }
 
 // exchangeResult captures what one axchg DNS round-trip yielded: the write
@@ -1065,8 +1178,6 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 	// is already lowercase — skip protocol.AuthDomain + strings.ToLower
 	// per query. The shard varies per call (RR from workers/rotor);
 	// HMAC/session MAC live in args and are unaffected by suffix choice.
-	name := protocol.JoinNameFast(shardAuthDomain, "axchg", args)
-
 	// A response timeout is ambiguous: the server may already have drained
 	// a stream chunk. Retry the exact same nonce and QNAME so its response
 	// cache returns byte-identical segments. Never mint a fresh nonce here.
@@ -1079,6 +1190,8 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 		err  error
 	)
 	for attempt := 0; attempt < retries; attempt++ {
+		retryShard := cfg.retryShardAuthDomain(shardAuthDomain, attempt)
+		name := protocol.JoinNameFast(retryShard, "axchg", args)
 		segs, err = resolver.queryStringsNoRetry(name)
 		if err == nil {
 			break
@@ -1164,11 +1277,14 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 // agentOpen confirms a modern apoll lease after the local target dial.  The
 // request is naturally idempotent: retries carry the same cid/poll ID/status.
 func agentOpen(cfg config, resolver *txtResolver, cid, pollID, status string) error {
+	return agentOpenUntil(cfg, resolver, cid, pollID, status, time.Time{})
+}
+
+func agentOpenUntil(cfg config, resolver *txtResolver, cid, pollID, status string, deadline time.Time) error {
 	if pollID == "" {
 		return nil
 	}
-	name := authenticatedName(cfg.pass, cfg.domain, cfg.pickShardAuthDomain(), "aopen", []string{cid, pollID, status})
-	resp, err := resolver.query(name)
+	resp, err := resolver.queryNamesUntil(authenticatedNames(cfg, "aopen", []string{cid, pollID, status}), deadline)
 	if err != nil {
 		return err
 	}
@@ -1176,6 +1292,71 @@ func agentOpen(cfg config, resolver *txtResolver, cid, pollID, status string) er
 		return fmt.Errorf("unexpected aopen response: %q", resp)
 	}
 	return nil
+}
+
+func agentStatus(cfg config, resolver *txtResolver, cid, pollID string) (string, error) {
+	return agentStatusUntil(cfg, resolver, cid, pollID, time.Time{})
+}
+
+func agentStatusUntil(cfg config, resolver *txtResolver, cid, pollID string, deadline time.Time) (string, error) {
+	resp, err := resolver.queryNamesUntil(authenticatedNames(cfg, "astatus", []string{cid, pollID}), deadline)
+	if err != nil {
+		return "", err
+	}
+	switch resp {
+	case "PENDING", "OPEN", "CLOSED":
+		return resp, nil
+	default:
+		return "", fmt.Errorf("unexpected astatus response: %q", resp)
+	}
+}
+
+// confirmAgentOpen keeps an already-dialled target alive while resolving an
+// ambiguous aopen response. Repeating the same cid/pollID/status is
+// idempotent; only an explicit OPEN allows tunnel traffic to start.
+func confirmAgentOpen(cfg config, resolver *txtResolver, cid, pollID, status string, v2 bool) error {
+	if !v2 {
+		return agentOpen(cfg, resolver, cid, pollID, status)
+	}
+	return confirmAgentOpenUntil(cfg, resolver, cid, pollID, status, time.Now().Add(15*time.Second))
+}
+
+func confirmAgentOpenUntil(cfg config, resolver *txtResolver, cid, pollID, status string, deadline time.Time) error {
+	var lastErr error
+	for {
+		if err := agentOpenUntil(cfg, resolver, cid, pollID, status, deadline); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		state, err := agentStatusUntil(cfg, resolver, cid, pollID, deadline)
+		if err == nil {
+			switch state {
+			case "OPEN":
+				if status == "ok" {
+					return nil
+				}
+				return fmt.Errorf("aopen status mismatch: server reports OPEN after %s", status)
+			case "CLOSED":
+				if status != "ok" {
+					return nil
+				}
+				return fmt.Errorf("aopen closed before confirmation: %w", lastErr)
+			}
+		} else {
+			lastErr = err
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("aopen confirmation deadline: %w", lastErr)
+		}
+		delay := retryBackoff
+		if remaining := time.Until(deadline); delay > remaining {
+			delay = remaining
+		}
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+	}
 }
 
 // agentClose tells the server we're done with cid. The MAC binds the nonce
@@ -1193,8 +1374,12 @@ func agentClose(cfg config, resolver *txtResolver, ts *tunnelSession, cid string
 		strconv.FormatUint(nonce, 16),
 		protocol.SessionMAC(ts.sessionKey, "aclose", nonce),
 	}
-	name := protocol.JoinNameFast(cfg.pickShardAuthDomain(), "aclose", args)
-	_, err := resolver.query(name)
+	domains := cfg.retryShardAuthDomains()
+	names := make([]string, len(domains))
+	for i, domain := range domains {
+		names[i] = protocol.JoinNameFast(domain, "aclose", args)
+	}
+	_, err := resolver.queryNames(names)
 	return err
 }
 
@@ -1212,4 +1397,18 @@ func authenticatedName(secret, canonicalDomain, shardAuthDomain, command string,
 	labels = append(labels, args...)
 	labels = append(labels, ts, token)
 	return protocol.JoinNameFast(shardAuthDomain, command, labels)
+}
+
+func authenticatedNames(cfg config, command string, args []string) []string {
+	timestamp := protocol.CurrentTimestamp(time.Now())
+	token := protocol.AuthToken(cfg.pass, cfg.domain, command, timestamp, args)
+	labels := make([]string, 0, len(args)+2)
+	labels = append(labels, args...)
+	labels = append(labels, timestamp, token)
+	domains := cfg.retryShardAuthDomains()
+	names := make([]string, len(domains))
+	for i, domain := range domains {
+		names[i] = protocol.JoinNameFast(domain, command, labels)
+	}
+	return names
 }
