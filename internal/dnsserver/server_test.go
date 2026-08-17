@@ -911,6 +911,96 @@ func TestFinishUploadSizeLimit(t *testing.T) {
 	}
 }
 
+// TestUploadInitReplayReturnsCompletionResult asserts that a duplicate
+// `uinit` for the same sid+fingerprint issued AFTER the first pass has
+// already produced a completion returns the actual finish result —
+// notably a diagnostic string when finishUpload failed — rather than a
+// blanket "Error. File already exist." that used to make a failed
+// upload look like a successful one to the client.
+//
+// Regression guard for the Medium finding in the 2026-08-17 review:
+// "uploadInit returns 'Error. File already exist.' instead of
+// completion.result".
+func TestUploadInitReplayReturnsCompletionResult(t *testing.T) {
+	s := newTestServer(t)
+	sid := "replaysid1"
+	// Force finishUpload to fail: send garbage as the final (only) chunk so
+	// codec.DecodeDNSFile bails with "Upload decode error.".
+	badChunk := "!!!notvalidbase64!!!"
+	filename := "replaycompletion.txt"
+
+	initArgs := append([]string{sid, "1", "63", "base64"}, filenameLabels(t, filename)...)
+	initResp := s.handleTXT(signedName("uinit", initArgs), "127.0.0.1")
+	if len(initResp) != 1 || initResp[0] != "Ready to file uploading" {
+		t.Fatalf("initial uinit: %v", initResp)
+	}
+	chunkArgs := append([]string{sid, "0"}, codec.ChunkString(badChunk, 63)...)
+	chunkResp := s.handleTXT(signedName("u", chunkArgs), "127.0.0.1")
+	if len(chunkResp) != 1 {
+		t.Fatalf("final chunk: %v", chunkResp)
+	}
+	firstResult := chunkResp[0]
+	if !strings.Contains(strings.ToLower(firstResult), "decode error") {
+		t.Fatalf("expected first pass to record a decode error, got %q", firstResult)
+	}
+
+	// Replay uinit with the same sid+fingerprint AFTER the completion has
+	// been recorded. The client-side effect of the old bug was a false
+	// "File already exist." — user thinks server has the file, but it does
+	// not, and no diagnostic is surfaced. Post-fix: the replay must report
+	// the actual finish result so the caller can distinguish success (-1)
+	// from failure diagnostics.
+	replayResp := s.handleTXT(signedName("uinit", initArgs), "127.0.0.1")
+	if len(replayResp) != 1 {
+		t.Fatalf("replay uinit: %v", replayResp)
+	}
+	if replayResp[0] != firstResult {
+		t.Fatalf("uinit replay returned %q; want the recorded finish result %q", replayResp[0], firstResult)
+	}
+	// Explicitly guard against the historical false-positive string so a
+	// well-meaning refactor cannot re-introduce the same regression.
+	if replayResp[0] == "Error. File already exist." {
+		t.Fatalf("uinit replay returned the historical false-positive %q — must instead return the recorded completion result", replayResp[0])
+	}
+}
+
+// TestUploadInitReplayAfterSuccessKeepsHistoricalMessage documents the
+// wire-compat guarantee that a uinit replay after a *successful*
+// completion still returns the historical "Error. File already exist."
+// — the client's uinit parser only understands "Ready to file
+// uploading" and treats every other string as an error, so returning
+// the "-1" success sentinel from a legacy retry would confuse the
+// error path.  Only FAILURE completions expose their real diagnostic
+// (see TestUploadInitReplayReturnsCompletionResult).
+func TestUploadInitReplayAfterSuccessKeepsHistoricalMessage(t *testing.T) {
+	s := newTestServer(t)
+	sid := "replaysid2"
+	data := []byte("replay-success-payload")
+	chunks := protectedUploadChunks(t, data, "base64", 60)
+	filename := "replaysuccess.txt"
+
+	initArgs := append([]string{sid, strconv.Itoa(len(chunks)), "60", "base64"}, filenameLabels(t, filename)...)
+	if resp := s.handleTXT(signedName("uinit", initArgs), "127.0.0.1"); len(resp) != 1 || resp[0] != "Ready to file uploading" {
+		t.Fatalf("uinit: %v", resp)
+	}
+	var lastResp string
+	for i, chunk := range chunks {
+		chunkArgs := append([]string{sid, strconv.Itoa(i)}, codec.ChunkString(chunk, 63)...)
+		got := s.handleTXT(signedName("u", chunkArgs), "127.0.0.1")
+		if len(got) != 1 {
+			t.Fatalf("chunk %d: %v", i, got)
+		}
+		lastResp = got[0]
+	}
+	if lastResp != "-1" {
+		t.Fatalf("expected success sentinel '-1' from final chunk, got %q", lastResp)
+	}
+	replay := s.handleTXT(signedName("uinit", initArgs), "127.0.0.1")
+	if len(replay) != 1 || replay[0] != "Error. File already exist." {
+		t.Fatalf("post-success uinit replay: got %v; want [\"Error. File already exist.\"] for client wire-compat", replay)
+	}
+}
+
 func TestCleanupExpiredDownload(t *testing.T) {
 	s := newTestServer(t)
 	data := []byte("cleanup test")
@@ -3198,6 +3288,84 @@ func TestSignalOneReaderWakesExactlyOne(t *testing.T) {
 	wg.Wait()
 }
 
+// TestSignalReadersForBufferWakesEnoughForBurst is the regression
+// guard for the Medium finding "signalOneReaderLocked wakes only one
+// waiter — burst larger than one worker's clamp stalls until parked
+// workers self-poll (~150 ms latency spike)". The fix wakes ceil(len /
+// maxRead) workers per pump write, capped by parked count.
+//
+// The test parks N waiters, fills opToAgent past several worker
+// clamps, and asserts multiple wakes fire (not just one). A single-
+// wake regression would leave data stranded until the parked workers'
+// own longPollWindow expired.
+func TestSignalReadersForBufferWakesEnoughForBurst(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+
+	// Park N waiters to have several candidates to wake.
+	const N = 8
+	woke := make(chan int, N)
+	var wg sync.WaitGroup
+	for i := range N {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			if rc.awaitReadData(3 * time.Second) {
+				woke <- id
+			}
+		}(i)
+	}
+	// Give the goroutines time to park.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		rc.mu.Lock()
+		parked := len(rc.readWaiters)
+		rc.mu.Unlock()
+		if parked == N {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	rc.mu.Lock()
+	if got := len(rc.readWaiters); got != N {
+		rc.mu.Unlock()
+		t.Fatalf("expected %d parked waiters, got %d", N, got)
+	}
+
+	// Fill opToAgent well past a single UDP worker's clamp
+	// (gproxy.MaxReadBytes). Enough for at least 3 workers.
+	burst := 3*gproxy.MaxReadBytes + 100
+	rc.opToAgent.Write(bytes.Repeat([]byte("x"), burst))
+	rc.signalReadersForBufferLocked()
+	rc.mu.Unlock()
+
+	// Collect wakes within a tight window.
+	timeout := time.After(300 * time.Millisecond)
+	wakes := 0
+	minExpectedWakes := 3 // ceil(3*maxRead+100 / maxRead) == 4; require at least 3 as a safety margin
+gather:
+	for {
+		select {
+		case <-woke:
+			wakes++
+		case <-timeout:
+			break gather
+		}
+	}
+	if wakes < minExpectedWakes {
+		t.Fatalf("burst wake fired only %d workers (want ≥ %d) — single-wake regression?", wakes, minExpectedWakes)
+	}
+	if wakes > N {
+		t.Fatalf("wakes=%d exceeds parked count N=%d", wakes, N)
+	}
+
+	// Cleanup: close remaining waiters via closeAllReadersLocked.
+	rc.mu.Lock()
+	rc.closeAllReadersLocked()
+	rc.mu.Unlock()
+	wg.Wait()
+}
+
 func TestReverseModernPollLeaseAndOpenAcknowledgement(t *testing.T) {
 	s := proxyTestServer(t)
 	op, peer := net.Pipe()
@@ -3392,6 +3560,101 @@ func TestProxyResponseCacheInflightMaterializationAndEviction(t *testing.T) {
 	rc.mu.Unlock()
 	if !owner || len(rc.responseCache) > maxProxyResponseCache {
 		t.Fatalf("cache owner=%v size=%d", owner, len(rc.responseCache))
+	}
+}
+
+// TestProxyResponseCacheExpiredNotReadyEntryIsReclaimed guards the High
+// finding in the 2026-08-17 review: `proxyCleanupExpiredLocked` only
+// removed `ready` expired entries, so a `!ready` entry whose owner
+// disappeared (panic, forgotten error path, etc.) lived forever, its
+// `done` channel was never closed, and any parked axchg waiter blocked
+// indefinitely.  Under sustained accumulation the responseCache would
+// hit maxProxyResponseCache and further axchg on the cid would fail
+// authentication.
+//
+// The test reserves a nonce (becoming owner), abandons it without
+// calling finishResponse, forces cleanup with the owner deadline in
+// the past, and asserts:
+//   - the entry is removed from responseCache;
+//   - the entry's done channel is closed so any parked waiter wakes.
+func TestProxyResponseCacheExpiredNotReadyEntryIsReclaimed(t *testing.T) {
+	s := newTestServer(t, func(cfg *Config) { cfg.AllowProxy = true })
+	op, peer := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = peer.Close() })
+	_, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Signal open so the cid is a fully live tunnel from cleanup's POV.
+	rc.signalOpen(0x00)
+
+	// Reserve a nonce (become owner). Snapshot the done channel — the
+	// bug used to leave this open forever.
+	rc.mu.Lock()
+	_, _, owner := rc.beginResponse(1, time.Now().UTC())
+	entry := rc.responseCache[1]
+	rc.mu.Unlock()
+	if !owner || entry == nil || entry.done == nil {
+		t.Fatalf("beginResponse: owner=%v entry=%v", owner, entry)
+	}
+	waiterDone := entry.done
+
+	// Force the owner deadline into the past AND make the whole tunnel
+	// look idle so proxyCleanupExpiredLocked processes it. reverseTTL
+	// is 30 min; we go well past.
+	rc.mu.Lock()
+	entry.expires = time.Now().UTC().Add(-time.Hour)
+	rc.mu.Unlock()
+
+	// Cleanup only touches the responseCache; it does not require the
+	// whole conn to be expired. Run it and assert the !ready entry is
+	// gone and its channel closed.
+	s.mu.Lock()
+	s.proxyCleanupExpiredLocked(time.Now().UTC())
+	s.mu.Unlock()
+
+	rc.mu.Lock()
+	_, stillThere := rc.responseCache[1]
+	rc.mu.Unlock()
+	if stillThere {
+		t.Fatal("expired !ready responseCache entry was not reclaimed by cleanup")
+	}
+	select {
+	case <-waiterDone:
+		// good — parked waiters would wake up here.
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not close entry.done; waiters would block forever")
+	}
+}
+
+// TestProxyResponseCacheEvictionUnderNotReadyPressure is the second
+// safety net for the High finding: even if cleanup has not run yet,
+// beginResponse must be able to evict past-deadline !ready entries so
+// a burst of stranded owners cannot fill responseCache and starve
+// further axchg on the cid.
+func TestProxyResponseCacheEvictionUnderNotReadyPressure(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	past := time.Now().UTC().Add(-time.Hour)
+
+	rc.mu.Lock()
+	// Pre-populate the cache with maxProxyResponseCache stale !ready
+	// entries. Ready-only eviction paths cannot recover this state.
+	rc.responseCache = make(map[uint64]*cachedProxyResponse, maxProxyResponseCache)
+	for i := uint64(1); i <= uint64(maxProxyResponseCache); i++ {
+		rc.responseCache[i] = &cachedProxyResponse{done: make(chan struct{}), expires: past}
+	}
+	// Fresh nonce arriving now: without the third-pass eviction we
+	// would either grow the map past its cap or fail to reserve.
+	cached, wait, owner := rc.beginResponse(uint64(maxProxyResponseCache+7), time.Now().UTC())
+	sz := len(rc.responseCache)
+	rc.mu.Unlock()
+
+	if !owner || cached != nil || wait != nil {
+		t.Fatalf("under !ready pressure beginResponse should own a fresh slot: owner=%v cached=%v wait=%v", owner, cached, wait)
+	}
+	if sz > maxProxyResponseCache {
+		t.Fatalf("responseCache grew past cap: len=%d cap=%d", sz, maxProxyResponseCache)
 	}
 }
 

@@ -751,10 +751,16 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 			s.mu.Unlock()
 			return []string{"Transfer already exists."}
 		}
+		// Same sid+fingerprint replay of uinit after the first pass already
+		// produced a completion. Report the actual outcome (may be "-1" for
+		// success or a diagnostic string if finishUpload failed) instead of a
+		// blanket "File already exist." — the latter is a false-positive
+		// success signal when finishUpload actually errored and the file is
+		// not on disk.
 		done := completion.done
 		s.mu.Unlock()
 		<-done
-		return []string{"Error. File already exist."}
+		return []string{s.uploadCompletionResult(sid)}
 	}
 	if existing, exists := s.uploads[sid]; exists {
 		if existing.fingerprint == fingerprint {
@@ -791,7 +797,7 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 		_ = spool.Close()
 		_ = os.Remove(spool.Name())
 		<-completion.done
-		return []string{"Error. File already exist."}
+		return []string{s.uploadCompletionResult(sid)}
 	}
 	if _, exists := s.uploads[sid]; exists {
 		s.mu.Unlock()
@@ -945,6 +951,35 @@ func (s *Server) finishUpload(sid string, state uploadState) string {
 	failed = false
 	s.logger.Printf("stored upload %q from %s (%d bytes)", state.filename, sid, written)
 	return "-1"
+}
+
+// uploadCompletionResult returns the response string a same-sid+
+// fingerprint replay of uinit should return.  The completion.done
+// channel must already be closed by the caller.
+//
+// Historically the server returned a blanket "Error. File already
+// exist." here — friendly-looking, but a false-positive whenever the
+// first finishUpload actually FAILED (decompress error, size limit,
+// publish error): the user saw "already exists" and assumed the file
+// was safely on disk, when in fact it was not.  The fix surfaces the
+// real diagnostic on failure while preserving the old friendly message
+// for the success path (result == "-1"), since the client's uinit
+// parser only understands "Ready to file uploading" and treats
+// everything else as an error string.
+func (s *Server) uploadCompletionResult(sid string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	completion, ok := s.uploadCompletions[sid]
+	if !ok {
+		return "Error. File already exist."
+	}
+	if completion.result == "-1" {
+		// Success replay: the file is on disk; keep the historical
+		// "already exists" phrasing so existing clients (Go + the
+		// PowerShell script) surface a sensible message.
+		return "Error. File already exist."
+	}
+	return completion.result
 }
 
 func publishNoOverwrite(tmpPath, finalPath string) error {

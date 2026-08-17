@@ -171,6 +171,29 @@ func (rc *reverseConn) signalOneReaderLocked() {
 	close(ch)
 }
 
+// signalReadersForBufferLocked wakes as many parked aread/axchg workers
+// as it takes to drain the current opToAgent backlog under one worker's
+// clamp.  One aread/axchg pulls at most (maxRead-1) bytes; when a pump
+// write leaves the buffer larger than that, a single wake would let the
+// remainder sit in opToAgent until another parked worker's own
+// longPollWindow expires — a ~150 ms latency spike per burst.
+//
+// Divide by the SMALLER per-worker clamp (UDP MaxReadBytes) so the
+// estimate leans toward waking one worker more than strictly needed.
+// Extra wakes cost at most one DNS round-trip apiece (worker sees EMPTY
+// and re-parks); under-counting is the failure mode we want to avoid.
+//
+// Caller must hold rc.mu. Safe to call when readWaiters is empty.
+func (rc *reverseConn) signalReadersForBufferLocked() {
+	desired := (rc.opToAgent.Len() + gproxy.MaxReadBytes - 1) / gproxy.MaxReadBytes
+	if desired < 1 {
+		desired = 1
+	}
+	for wakes := 0; wakes < desired && len(rc.readWaiters) > 0; wakes++ {
+		rc.signalOneReaderLocked()
+	}
+}
+
 // closeAllReadersLocked wakes every currently parked aread/axchg at once.
 // Used on tunnel teardown (reverseCloseConn) so every worker observes
 // CLOSED and exits — none should keep parking on a dead cid.
@@ -340,9 +363,22 @@ func (rc *reverseConn) beginResponse(nonce uint64, now time.Time) (cached []stri
 			return rc.materializeCachedResponseLocked(entry), nil, false
 		}
 		if !entry.ready {
-			return nil, entry.done, false
+			// If the owner has run past its deadline it is presumed dead
+			// (goroutine leak, panic before finishResponse, ...). Free the
+			// slot and re-become owner so the request does not stall on a
+			// waiter chain to a channel nobody will close.
+			if !now.Before(entry.expires) {
+				if entry.done != nil {
+					close(entry.done)
+					entry.done = nil
+				}
+				delete(rc.responseCache, nonce)
+			} else {
+				return nil, entry.done, false
+			}
+		} else {
+			delete(rc.responseCache, nonce)
 		}
-		delete(rc.responseCache, nonce)
 	}
 	if len(rc.responseCache) >= maxProxyResponseCache {
 		// Keep the map bounded even under a broken resolver continually
@@ -363,8 +399,28 @@ func (rc *reverseConn) beginResponse(nonce uint64, now time.Time) (cached []stri
 				}
 			}
 		}
+		// Third pass: an entry whose owner has passed the deadline is also
+		// safe to evict — closing its `done` lets any parked waiter fall
+		// through to `ERR retry` instead of blocking forever.  Without this
+		// pass a burst of !ready leaks (panics in the owner path, etc.)
+		// could fill the map and lock further axchg out of the cid.
+		if len(rc.responseCache) >= maxProxyResponseCache {
+			for key, entry := range rc.responseCache {
+				if !entry.ready && !now.Before(entry.expires) {
+					if entry.done != nil {
+						close(entry.done)
+						entry.done = nil
+					}
+					delete(rc.responseCache, key)
+					break
+				}
+			}
+		}
 	}
-	rc.responseCache[nonce] = &cachedProxyResponse{done: make(chan struct{})}
+	// expires here bounds how long an owner may take before being reclaimed.
+	// finishResponse resets it once the entry becomes ready.  proxyResponseTTL
+	// is generous compared to the ~150 ms longPollWindow the read side uses.
+	rc.responseCache[nonce] = &cachedProxyResponse{done: make(chan struct{}), expires: now.Add(proxyResponseTTL)}
 	return nil, nil, true
 }
 
@@ -843,10 +899,7 @@ func (s *Server) reversePumpOperator(cid string, rc *reverseConn) {
 			}
 			rc.opToAgent.Write(buf[:n])
 			rc.expires = time.Now().Add(reverseTTL)
-			// Шаг C+fairness: wake one parked worker — they drain the
-			// chunk; waking all 16 would spawn 15 wasted DNS round-trips
-			// since only one can take the data.
-			rc.signalOneReaderLocked()
+			rc.signalReadersForBufferLocked()
 			rc.mu.Unlock()
 		}
 		if err != nil {
@@ -1758,6 +1811,22 @@ func (s *Server) proxyCleanupExpiredLocked(now time.Time) {
 		}
 		for nonce, entry := range item.rc.responseCache {
 			if entry.ready && !now.Before(entry.expires) {
+				delete(item.rc.responseCache, nonce)
+				continue
+			}
+			// A !ready entry past its owner deadline means the goroutine
+			// that reserved the nonce never called finishResponse — panic
+			// mid-work, forgotten error path, whatever the cause.  Close
+			// entry.done so any parked axchg waiter unblocks with ERR
+			// retry, then drop the slot.  Without this pass those entries
+			// would live until the whole cid was closed, and if enough of
+			// them accumulated the map would hit maxProxyResponseCache
+			// with only unready entries, jamming further axchg on the cid.
+			if !entry.ready && !now.Before(entry.expires) {
+				if entry.done != nil {
+					close(entry.done)
+					entry.done = nil
+				}
 				delete(item.rc.responseCache, nonce)
 			}
 		}

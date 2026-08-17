@@ -173,6 +173,122 @@ func TestEffectiveUploadChunkSize(t *testing.T) {
 	}
 }
 
+// TestEffectiveUploadChunkSizeReservesForLargeIndex is the regression
+// guard for the Medium finding "effectiveUploadChunkSize uses 6-digit
+// placeholder — QNAME overflows at chunkCount >= 1_000_000". The bug
+// caused uploads to abort mid-transfer once the running chunk index
+// crossed the placeholder width. Post-fix, the returned chunk size
+// must leave enough headroom for indices up to the server-side
+// maxTransferChunks-1 (currently 1_999_999 — 7 digits) with a small
+// safety margin.
+//
+// The rebuild here uses `protocol.CurrentTimestamp(time.Now())` — the
+// same timestamp function the function-under-test invokes — so we
+// compare like against like.  The bug is specifically about the index
+// placeholder being too narrow; timestamp width is not what this test
+// asserts.
+func TestEffectiveUploadChunkSizeReservesForLargeIndex(t *testing.T) {
+	sid := "sid12345"
+	// Simulate the worst-case index a server accepts today.
+	const maxServerIndex = 1_999_999
+	for _, domain := range []string{
+		"gd.tv",              // 5 chars — tightest fit at chunk size 180
+		"files.example.com",  // common default
+		"a.b.c.d.example.co", // 18 chars
+	} {
+		t.Run(domain, func(t *testing.T) {
+			size, err := effectiveUploadChunkSize(domain, sid, defaultChunkSize)
+			if err != nil {
+				t.Fatalf("effectiveUploadChunkSize(%s): %v", domain, err)
+			}
+			// Rebuild the QNAME with a REAL max index rather than the
+			// placeholder used inside effectiveUploadChunkSize. The
+			// return value must still fit the 253-byte DNS name limit
+			// under the timestamp width the function itself used.
+			ts := protocol.CurrentTimestamp(time.Now())
+			args := append([]string{sid, strconv.Itoa(maxServerIndex)}, codec.ChunkString(strings.Repeat("a", size), 63)...)
+			name := authenticatedNameWithTimestamp("secret", domain, protocol.AuthDomain(domain), "u", args, ts)
+			if len(name) > 253 {
+				t.Fatalf("chunk size %d + index %d gives %d-byte QNAME (>253); "+
+					"placeholder in effectiveUploadChunkSize is too narrow",
+					size, maxServerIndex, len(name))
+			}
+			// Also validate that the placeholder width in the source is
+			// at least as wide as the real max index. This is a direct
+			// guard against re-introducing the historical hard-coded
+			// "999999" (6-char) placeholder for a 7-digit maxServerIndex.
+			if uploadIndexPlaceholderWidth < len(strconv.Itoa(maxServerIndex)) {
+				t.Fatalf("uploadIndexPlaceholderWidth=%d < digits in max server index (%d)",
+					uploadIndexPlaceholderWidth, len(strconv.Itoa(maxServerIndex)))
+			}
+		})
+	}
+}
+
+// TestPowerShellClientUploadPlaceholderMatchesGo pins the PS↔Go
+// invariant that the upload-index placeholder used by
+// Get-UploadChunkSize (PowerShell) has the same width as
+// uploadIndexPlaceholderWidth (Go). A drift between them re-opens
+// the Medium finding for whichever client uses the narrower value:
+// uploads with chunkCount > 10^narrow-width abort mid-transfer.
+//
+// The test scans both the source-of-truth script and the shipped
+// build artifact (kept in sync by the Makefile) so a stale build
+// artifact does not silently linger with the old constant.
+func TestPowerShellClientUploadPlaceholderMatchesGo(t *testing.T) {
+	// Paths are relative to the test's package directory.
+	psPaths := []string{
+		"../../scripts/gdns2tcp-client.ps1",
+		"../../clients/gdns2tcp-client.ps1",
+	}
+	expectedPlaceholder := "'" + strings.Repeat("9", uploadIndexPlaceholderWidth) + "'"
+	for _, path := range psPaths {
+		t.Run(path, func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Skipf("cannot read %s: %v", path, err)
+			}
+			body := string(data)
+			// Reject the historical narrow placeholder even if a NEW
+			// (wider) one is also present — both must disappear on
+			// upgrade.
+			if strings.Contains(body, "'999999'") && !strings.Contains(body, "'9999999'") {
+				t.Fatalf("%s still contains historical 6-digit placeholder '999999'", path)
+			}
+			// Confirm the current-width placeholder is present. Not
+			// finding it means either the constant was widened only
+			// in Go (drift) or the PS script was refactored to derive
+			// it a different way — either case wants a review.
+			if !strings.Contains(body, expectedPlaceholder) {
+				t.Fatalf("%s does not contain the placeholder %s that matches Go's uploadIndexPlaceholderWidth=%d",
+					path, expectedPlaceholder, uploadIndexPlaceholderWidth)
+			}
+		})
+	}
+}
+
+// TestLongestNameLenPicksMax guards the Low finding "per-chunk length
+// check only validates requestNames[0]": longestNameLen must scan every
+// shard so a longer non-canonical shard cannot silently produce an
+// oversized QNAME on retry rotation.
+func TestLongestNameLenPicksMax(t *testing.T) {
+	names := []string{"short", "medium-length", "the-longest-of-them-all"}
+	if got, want := longestNameLen(names), len(names[2]); got != want {
+		t.Fatalf("longestNameLen=%d, want %d", got, want)
+	}
+	// Regression: single-element slice, empty slice, and cases where the
+	// canonical shard is longest must all be handled.
+	if got := longestNameLen(nil); got != 0 {
+		t.Fatalf("nil slice: got %d, want 0", got)
+	}
+	if got := longestNameLen([]string{"solo"}); got != 4 {
+		t.Fatalf("single element: got %d, want 4", got)
+	}
+	if got := longestNameLen([]string{"aaaaaaaa", "b"}); got != 8 {
+		t.Fatalf("canonical-longest: got %d, want 8", got)
+	}
+}
+
 func TestDnsSafeChunk(t *testing.T) {
 	if got := dnsSafeChunk("abc+DEF/ghi=", "base64"); got != "abc_DEF-ghi" {
 		t.Fatalf("base64 safe chunk=%q", got)

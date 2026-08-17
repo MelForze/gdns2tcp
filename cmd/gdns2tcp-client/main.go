@@ -41,6 +41,14 @@ const (
 	retryBackoff               = 250 * time.Millisecond
 	defaultDownloadParallelism = 32
 	maxDownloadParallelism     = 64
+	// uploadIndexPlaceholderWidth is the number of decimal digits reserved
+	// when effectiveUploadChunkSize probes the QNAME budget. Must be at
+	// least large enough to hold strconv.Itoa(server.maxTransferChunks-1)
+	// on the wire, otherwise uploads whose real chunkCount exceeds
+	// 10^placeholder crash mid-transfer when a per-chunk `len(name) > 253`
+	// guard aborts. Server limit is currently 2_000_000, i.e. 7 digits;
+	// budget 8 for headroom in case the server bumps it.
+	uploadIndexPlaceholderWidth = 8
 	// defaultDownloadBatch is the number of chunks bundled into a single TXT
 	// response when using the batched download endpoint. 14 keeps the entire
 	// response (~3.5 KB plus headers) safely under the EDNS0 4096-byte UDP
@@ -684,8 +692,8 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 	defer encodedFile.Close()
 	initArgs := append([]string{sid, strconv.Itoa(chunkCount), strconv.Itoa(effectiveChunkSize), encoding}, filenameLabels...)
 	initNames := authenticatedNames(cfg, "uinit", initArgs)
-	if len(initNames[0]) > 253 {
-		return fmt.Errorf("DNS upload init name is %d characters (limit 253); use a shorter filename or domain", len(initNames[0]))
+	if longest := longestNameLen(initNames); longest > 253 {
+		return fmt.Errorf("DNS upload init name is %d characters (limit 253); use a shorter filename or domain", longest)
 	}
 	status, err := resolver.queryNames(initNames)
 	if err != nil {
@@ -709,8 +717,8 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 		labels := codec.ChunkString(wireChunk, 63)
 		requestArgs := append([]string{sid, strconv.Itoa(index)}, labels...)
 		requestNames := authenticatedNames(cfg, "u", requestArgs)
-		if len(requestNames[0]) > 253 {
-			return fmt.Errorf("DNS query name for chunk %d is %d characters (limit 253); reduce -chunk-size or use a shorter domain", index, len(requestNames[0]))
+		if longest := longestNameLen(requestNames); longest > 253 {
+			return fmt.Errorf("DNS query name for chunk %d is %d characters (limit 253); reduce -chunk-size or use a shorter domain", index, longest)
 		}
 		response, err := resolver.queryNames(requestNames)
 		if err != nil {
@@ -756,8 +764,8 @@ func downloadFile(resolver *txtResolver, cfg config) error {
 	}
 	initArgs := append([]string{sid}, filenameLabels...)
 	initNames := authenticatedNames(cfg, "dinit", initArgs)
-	if len(initNames[0]) > 253 {
-		return fmt.Errorf("DNS download init name is %d characters (limit 253); use a shorter filename or domain", len(initNames[0]))
+	if longest := longestNameLen(initNames); longest > 253 {
+		return fmt.Errorf("DNS download init name is %d characters (limit 253); use a shorter filename or domain", longest)
 	}
 	chunkCountText, err := resolver.queryNames(initNames)
 	if err != nil {
@@ -1104,9 +1112,14 @@ func effectiveUploadChunkSize(domain, sid string, requested int) (int, error) {
 	if requested > defaultChunkSize {
 		requested = defaultChunkSize
 	}
+	// Reserve an index placeholder wide enough for every legal chunk
+	// index the server will accept. Using a fixed narrow width here
+	// caused uploads with chunkCount > 10^width to overflow the
+	// 253-char QNAME budget mid-transfer.
+	indexPlaceholder := strings.Repeat("9", uploadIndexPlaceholderWidth)
 	for size := requested; size >= minChunkSize; size-- {
 		dummy := strings.Repeat("a", size)
-		args := append([]string{sid, "999999"}, codec.ChunkString(dummy, 63)...)
+		args := append([]string{sid, indexPlaceholder}, codec.ChunkString(dummy, 63)...)
 		name := authenticatedNameWithTimestamp("secret", domain, protocol.AuthDomain(domain), "u", args, protocol.CurrentTimestamp(time.Now()))
 		if len(name) <= 253 {
 			return size, nil
@@ -1153,6 +1166,22 @@ func authenticatedNameWithTimestamp(secret, canonicalDomain, shardAuthDomain, co
 	labels = append(labels, timestamp, token)
 	// command must already be lowercase — JoinNameFast's contract.
 	return protocol.JoinNameFast(shardAuthDomain, command, labels)
+}
+
+// longestNameLen returns the maximum wire length across a slice of
+// authenticatedNames outputs. Callers check against 253 to reject a
+// QNAME that would overflow the DNS name limit on ANY shard, not just
+// the canonical one — a longer shard could otherwise trip the
+// in-flight `len(name) > 253` guard in queryOnce after the first
+// resolve fails and the retry rotates onto that shard.
+func longestNameLen(names []string) int {
+	max := 0
+	for _, n := range names {
+		if len(n) > max {
+			max = len(n)
+		}
+	}
+	return max
 }
 
 func authenticatedNames(cfg config, command string, args []string) []string {

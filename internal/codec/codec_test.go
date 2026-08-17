@@ -241,8 +241,21 @@ func TestStreamingCodecErrorCleanupAndDNSAlphabet(t *testing.T) {
 func TestStreamingAdapters(t *testing.T) {
 	var lower bytes.Buffer
 	input := []byte("AbCZ09")
-	if _, err := (lowerWriter{w: &lower}).Write(input); err != nil || lower.String() != "abcz09" {
+	if _, err := (&lowerWriter{w: &lower}).Write(input); err != nil || lower.String() != "abcz09" {
 		t.Fatalf("lower writer=%q err=%v", lower.String(), err)
+	}
+	// Regression: lowerWriter must not mutate the caller's buffer (io.Writer
+	// contract). Prior in-place implementation happened to work because base32
+	// encoder didn't re-read, but violated the contract.
+	original := []byte("AbCZ09")
+	preserved := make([]byte, len(original))
+	copy(preserved, original)
+	var sink bytes.Buffer
+	if _, err := (&lowerWriter{w: &sink}).Write(preserved); err != nil {
+		t.Fatalf("lower writer preserves-input write: %v", err)
+	}
+	if !bytes.Equal(preserved, original) {
+		t.Fatalf("lowerWriter mutated caller buffer: got %q want %q", preserved, original)
 	}
 	upperBytes, err := io.ReadAll(upperReader{r: strings.NewReader("abCZ09")})
 	if err != nil || string(upperBytes) != "ABCZ09" {

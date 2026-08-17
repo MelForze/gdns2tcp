@@ -1381,11 +1381,20 @@ function Get-UploadChunkSize {
         [Parameter(Mandatory = $true)][string]$Sid,
         [Parameter(Mandatory = $true)][int]$Requested
     )
+    # Index placeholder must be at least as wide as the decimal form of
+    # the server's maxTransferChunks-1 (currently 1_999_999 — 7 digits).
+    # A narrower placeholder makes the returned chunk size fit the
+    # 253-byte DNS name budget at low indices but overflow it once the
+    # running chunkIndex crosses 10^placeholderWidth mid-upload; the
+    # per-chunk guard at line ~1596 then aborts the transfer.
+    # Kept in sync with the Go client's uploadIndexPlaceholderWidth
+    # constant (see cmd/gdns2tcp-client/main.go).
+    $uploadIndexPlaceholder = '99999999'
     $size = [Math]::Min($Requested, 180)
     for ($candidate = $size; $candidate -ge 32; $candidate--) {
         $dummy = 'a' * $candidate
         $labels = @(Split-StringFixed -Value $dummy -Size 63)
-        $args = @($Sid, '999999') + $labels
+        $args = @($Sid, $uploadIndexPlaceholder) + $labels
         $name = New-AuthenticatedName -Command 'u' -Args $args
         if ($name.Length -le 253) {
             return $candidate
