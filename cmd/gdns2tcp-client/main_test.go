@@ -1311,45 +1311,40 @@ func TestUploadFileStatusMismatch(t *testing.T) {
 	}
 }
 
-func TestUploadFileRejectsInvalidServerNextIndexes(t *testing.T) {
-	for _, tc := range []struct {
-		name, response, want string
-	}{
-		{name: "non-numeric", response: "not-an-index", want: "server returned upload error"},
-		{name: "negative", response: "-2", want: "server signaled upload failure"},
-		{name: "outside range", response: "999999", want: "outside prepared range"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ip, port := startCustomDNSServer(t, func(w dns.ResponseWriter, request *dns.Msg) {
-				value := tc.response
-				name := strings.ToLower(request.Question[0].Name)
-				switch {
-				case strings.Contains(name, "encoding.test."):
-					value = "base64"
-				case strings.Contains(name, ".uinit."):
-					value = "Ready to file uploading"
-				}
-				message := new(dns.Msg)
-				message.SetReply(request)
-				message.Answer = []dns.RR{&dns.TXT{
-					Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET},
-					Txt: []string{value},
-				}}
-				_ = w.WriteMsg(message)
-			})
-			input := filepath.Join(t.TempDir(), "input.bin")
-			if err := os.WriteFile(input, []byte("payload"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			resolver := &txtResolver{server: ip, port: port, retries: 1}
-			err := uploadFile(resolver, config{
-				domain: "files.test", pass: "secret", inFile: input,
-				chunkSize: 60, retries: 1, dnsServer: ip, dnsPort: port,
-			})
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("upload error=%v, want %q", err, tc.want)
-			}
-		})
+func TestUploadFileRejectsServerErrorString(t *testing.T) {
+	// In the parallel upload protocol the client no longer follows
+	// server-directed next-index navigation. It sends all chunks from
+	// its own queue and only checks: "-1" (done), numeric ack (continue),
+	// or non-numeric string (server error). This test verifies the error
+	// path.
+	ip, port := startCustomDNSServer(t, func(w dns.ResponseWriter, request *dns.Msg) {
+		value := "not-an-index" // non-numeric = server error
+		name := strings.ToLower(request.Question[0].Name)
+		switch {
+		case strings.Contains(name, "encoding.test."):
+			value = "base64"
+		case strings.Contains(name, ".uinit."):
+			value = "Ready to file uploading"
+		}
+		message := new(dns.Msg)
+		message.SetReply(request)
+		message.Answer = []dns.RR{&dns.TXT{
+			Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+			Txt: []string{value},
+		}}
+		_ = w.WriteMsg(message)
+	})
+	input := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(input, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &txtResolver{server: ip, port: port, retries: 1}
+	err := uploadFile(resolver, config{
+		domain: "files.test", pass: "secret", inFile: input,
+		chunkSize: 60, retries: 1, dnsServer: ip, dnsPort: port,
+	})
+	if err == nil || !strings.Contains(err.Error(), "server returned upload error") {
+		t.Fatalf("upload error=%v, want 'server returned upload error'", err)
 	}
 }
 

@@ -364,7 +364,7 @@ func parseFlags() config {
 	flag.IntVar(&cfg.retries, "retries", 3, "DNS query attempts before failing")
 	flag.Int64Var(&cfg.maxDownloadBytes, "max-download-bytes", defaultMaxDownloadBytes, "maximum decompressed download size")
 	flag.BoolVar(&cfg.tcp, "tcp", false, "use TCP instead of UDP for DNS queries")
-	flag.IntVar(&cfg.parallelism, "parallelism", defaultDownloadParallelism, "concurrent DNS queries during download (1-64)")
+	flag.IntVar(&cfg.parallelism, "parallelism", defaultDownloadParallelism, "concurrent DNS queries during download and upload (1-64)")
 	flag.IntVar(&cfg.batch, "batch", defaultDownloadBatch, "chunks per DNS response when downloading (1-32; 1 disables batching)")
 	flag.BoolVar(&cfg.noResume, "no-resume", false, "disable resume from local cache and always fetch all chunks")
 	flag.StringVar(&cfg.cacheDir, "cache-dir", "", "download resume cache directory (default: OS user cache)")
@@ -472,7 +472,7 @@ func installUsage() {
 					Flags: []clihelp.Flag{
 						{Names: "-out <path>", Description: "local output path; default is the remote filename"},
 						{Names: "-max-download-bytes <n>", Description: fmt.Sprintf("maximum decompressed download size (default %d)", defaultMaxDownloadBytes)},
-						{Names: "-parallelism <n>", Description: fmt.Sprintf("concurrent download DNS queries, 1-%d (default %d)", maxDownloadParallelism, defaultDownloadParallelism)},
+						{Names: "-parallelism <n>", Description: fmt.Sprintf("concurrent DNS queries for download and upload, 1-%d (default %d)", maxDownloadParallelism, defaultDownloadParallelism)},
 						{Names: "-batch <n>", Description: fmt.Sprintf("chunks per download DNS response, 1-%d; 1 disables batching (default %d)", maxDownloadBatch, defaultDownloadBatch)},
 						{Names: "-no-resume", Description: "ignore local resume cache and fetch all chunks again"},
 						{Names: "-cache-dir <dir>", Description: "resume spool cache; default is OS user cache (1 GiB / 7 days)"},
@@ -703,39 +703,80 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 		return fmt.Errorf("upload initialization failed: %s", status)
 	}
 
+	parallelism := cfg.parallelism
+	if parallelism < 1 {
+		parallelism = defaultDownloadParallelism
+	}
+	if parallelism > chunkCount {
+		parallelism = chunkCount
+	}
+
 	pb := newProgressBar("uploading", chunkCount, effectiveChunkSize)
-	index := 0
-	for {
-		if index >= chunkCount {
-			return fmt.Errorf("server requested chunk %d outside prepared range", index)
-		}
-		chunk, err := readSpoolChunk(encodedFile, int64(index)*int64(effectiveChunkSize), effectiveChunkSize)
-		if err != nil {
-			return fmt.Errorf("read upload spool chunk %d: %w", index, err)
-		}
-		wireChunk := dnsSafeChunk(string(chunk), encoding)
-		labels := codec.ChunkString(wireChunk, 63)
-		requestArgs := append([]string{sid, strconv.Itoa(index)}, labels...)
-		requestNames := authenticatedNames(cfg, "u", requestArgs)
-		if longest := longestNameLen(requestNames); longest > 253 {
-			return fmt.Errorf("DNS query name for chunk %d is %d characters (limit 253); reduce -chunk-size or use a shorter domain", index, longest)
-		}
-		response, err := resolver.queryNames(requestNames)
-		if err != nil {
-			return err
-		}
-		nextIndex, err := strconv.Atoi(response)
-		if err != nil {
-			return fmt.Errorf("server returned upload error: %s", response)
-		}
-		if nextIndex == -1 {
-			break
-		}
-		if nextIndex < 0 {
-			return fmt.Errorf("server signaled upload failure with code %d", nextIndex)
-		}
-		index = nextIndex
-		pb.render(index)
+	jobs := make(chan int, chunkCount)
+	for i := 0; i < chunkCount; i++ {
+		jobs <- i
+	}
+	close(jobs)
+
+	var (
+		done      atomic.Bool
+		completed atomic.Int32
+		firstErr  sync.Once
+		uploadErr error
+	)
+
+	var wg sync.WaitGroup
+	for w := 0; w < parallelism; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				if done.Load() {
+					return
+				}
+				chunk, err := readSpoolChunk(encodedFile, int64(index)*int64(effectiveChunkSize), effectiveChunkSize)
+				if err != nil {
+					firstErr.Do(func() { uploadErr = fmt.Errorf("read upload spool chunk %d: %w", index, err) })
+					done.Store(true)
+					return
+				}
+				wireChunk := dnsSafeChunk(string(chunk), encoding)
+				labels := codec.ChunkString(wireChunk, 63)
+				requestArgs := append([]string{sid, strconv.Itoa(index)}, labels...)
+				requestNames := authenticatedNames(cfg, "u", requestArgs)
+				if longest := longestNameLen(requestNames); longest > 253 {
+					firstErr.Do(func() {
+						uploadErr = fmt.Errorf("DNS query name for chunk %d is %d characters (limit 253); reduce -chunk-size or use a shorter domain", index, longest)
+					})
+					done.Store(true)
+					return
+				}
+				response, err := resolver.queryNames(requestNames)
+				if err != nil {
+					firstErr.Do(func() { uploadErr = fmt.Errorf("upload chunk %d: %w", index, err) })
+					done.Store(true)
+					return
+				}
+				// Server returns: chunk index (ack) or "-1" (upload complete).
+				// An error is a non-numeric string.
+				respIdx, parseErr := strconv.Atoi(response)
+				if parseErr != nil {
+					firstErr.Do(func() { uploadErr = fmt.Errorf("server returned upload error: %s", response) })
+					done.Store(true)
+					return
+				}
+				if respIdx == -1 {
+					done.Store(true)
+				}
+				n := int(completed.Add(1))
+				pb.render(n)
+			}
+		}()
+	}
+
+	wg.Wait()
+	if uploadErr != nil {
+		return uploadErr
 	}
 	pb.finish(chunkCount)
 	return nil

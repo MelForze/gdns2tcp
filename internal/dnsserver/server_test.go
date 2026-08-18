@@ -162,9 +162,9 @@ func uploadFileThroughDNS(t *testing.T, s *Server, sid, filename string, data []
 	chunks := protectedUploadChunks(t, data, encoding, chunkSize)
 	startUpload(t, s, sid, filename, chunks, chunkSize, encoding)
 	for i, chunk := range chunks {
-		want := strconv.Itoa(i + 1)
+		want := strconv.Itoa(i) // ack = index of accepted chunk
 		if i == len(chunks)-1 {
-			want = "-1"
+			want = "-1" // last chunk triggers finalization
 		}
 		if got := sendUploadChunk(t, s, sid, i, chunk); got != want {
 			t.Fatalf("chunk %d response=%q, want %q", i, got, want)
@@ -376,7 +376,7 @@ func TestPublicTestDoesNotMutateActiveUploadEncoding(t *testing.T) {
 	chunks := protectedUploadChunks(t, original, "base64", 60)
 	startUpload(t, s, "uploadbase64", filename, chunks, 60, "base64")
 
-	if got := sendUploadChunk(t, s, "uploadbase64", 0, chunks[0]); got != "1" {
+	if got := sendUploadChunk(t, s, "uploadbase64", 0, chunks[0]); got != "0" {
 		t.Fatalf("first chunk response=%q", got)
 	}
 	resp := s.handleTXT("encoding.test.example.test.", "198.51.100.10")
@@ -384,7 +384,7 @@ func TestPublicTestDoesNotMutateActiveUploadEncoding(t *testing.T) {
 		t.Fatalf("test response=%v", resp)
 	}
 	for i := 1; i < len(chunks); i++ {
-		want := strconv.Itoa(i + 1)
+		want := strconv.Itoa(i) // ack = chunk index
 		if i == len(chunks)-1 {
 			want = "-1"
 		}
@@ -1240,7 +1240,7 @@ func TestUploadFinalChunkTombstoneIsIdempotent(t *testing.T) {
 	chunks := protectedUploadChunks(t, data, "base64", 60)
 	startUpload(t, s, sid, "tombstone.txt", chunks, 60, "base64")
 	for index := 0; index < len(chunks)-1; index++ {
-		if got := sendUploadChunk(t, s, sid, index, chunks[index]); got != strconv.Itoa(index+1) {
+		if got := sendUploadChunk(t, s, sid, index, chunks[index]); got != strconv.Itoa(index) {
 			t.Fatalf("chunk %d response=%q", index, got)
 		}
 	}
@@ -1272,7 +1272,7 @@ func TestUploadConcurrentFinalChunksShareCompletion(t *testing.T) {
 	chunks := protectedUploadChunks(t, data, "base64", 60)
 	startUpload(t, s, sid, "parallel-final.txt", chunks, 60, "base64")
 	for index := 0; index < len(chunks)-1; index++ {
-		if got := sendUploadChunk(t, s, sid, index, chunks[index]); got != strconv.Itoa(index+1) {
+		if got := sendUploadChunk(t, s, sid, index, chunks[index]); got != strconv.Itoa(index) {
 			t.Fatalf("chunk %d response=%q", index, got)
 		}
 	}
@@ -1309,17 +1309,53 @@ func TestUploadChunkSIDNotFound(t *testing.T) {
 	}
 }
 
-func TestUploadChunkWrongIndex(t *testing.T) {
+func TestUploadChunkOutOfOrderAccepted(t *testing.T) {
 	s := newTestServer(t)
-	sid := "wrongidxsid1"
-	chunks := protectedUploadChunks(t, []byte("hello world"), "base64", 60)
-	startUpload(t, s, sid, "wrongidx.txt", chunks, 60, "base64")
+	sid := "outofordersid"
+	data := []byte("out of order upload works")
+	chunks := protectedUploadChunks(t, data, "base64", 60)
+	if len(chunks) < 2 {
+		t.Skip("need at least 2 chunks")
+	}
+	startUpload(t, s, sid, "outoforder.txt", chunks, 60, "base64")
 
-	// Send chunk 5 instead of 0; expect the current nextIndex (0) returned
-	args := append([]string{sid, "5"}, codec.ChunkString(chunks[0], 63)...)
+	// Send chunk 1 before chunk 0 — server buffers it.
+	if got := sendUploadChunk(t, s, sid, 1, chunks[1]); got != "1" {
+		t.Fatalf("out-of-order chunk 1 response=%q, want ack \"1\"", got)
+	}
+	// Now send chunk 0 — server flushes both (0 then 1).
+	// If there are only 2 chunks, this completes the upload.
+	for i := 0; i < len(chunks); i++ {
+		if i == 1 {
+			continue // already sent
+		}
+		got := sendUploadChunk(t, s, sid, i, chunks[i])
+		if i == len(chunks)-1 {
+			if got != "-1" {
+				t.Fatalf("final chunk %d response=%q, want \"-1\"", i, got)
+			}
+		} else {
+			if got != strconv.Itoa(i) {
+				t.Fatalf("chunk %d response=%q, want %q", i, got, strconv.Itoa(i))
+			}
+		}
+	}
+	if stored := readStoredFile(t, s, "outoforder.txt"); !bytes.Equal(stored, data) {
+		t.Fatalf("stored data mismatch")
+	}
+}
+
+func TestUploadChunkOutOfRangeRejected(t *testing.T) {
+	s := newTestServer(t)
+	sid := "outofrangesid"
+	chunks := protectedUploadChunks(t, []byte("hello world"), "base64", 60)
+	startUpload(t, s, sid, "outofrange.txt", chunks, 60, "base64")
+
+	// Index beyond total — rejected.
+	args := append([]string{sid, "999"}, codec.ChunkString(chunks[0], 63)...)
 	got := s.handleTXT(signedName("u", args), "127.0.0.1")
-	if len(got) != 1 || got[0] != "0" {
-		t.Fatalf("expected '0' (nextIndex), got %v", got)
+	if len(got) != 1 || got[0] != "Wrong chunk number." {
+		t.Fatalf("expected 'Wrong chunk number.', got %v", got)
 	}
 }
 
@@ -1555,7 +1591,7 @@ func TestFinishUploadWriteError(t *testing.T) {
 
 	// Send all chunks except the last
 	for i := 0; i < len(chunks)-1; i++ {
-		want := strconv.Itoa(i + 1)
+		want := strconv.Itoa(i) // ack = chunk index
 		if got := sendUploadChunk(t, s, sid, i, chunks[i]); got != want {
 			t.Fatalf("chunk %d response=%q, want %q", i, got, want)
 		}
@@ -1568,7 +1604,7 @@ func TestFinishUploadWriteError(t *testing.T) {
 	s.uploads[sid] = state
 	s.mu.Unlock()
 
-	// Send the final chunk; finishUpload will attempt Write on the closed file
+	// Send the final chunk; writeAll on the closed spool will fail.
 	finalIdx := len(chunks) - 1
 	chunkArgs := append([]string{sid, strconv.Itoa(finalIdx)}, codec.ChunkString(chunks[finalIdx], 63)...)
 	got := s.handleTXT(signedName("u", chunkArgs), "127.0.0.1")

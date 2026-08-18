@@ -176,7 +176,8 @@ type uploadState struct {
 	total       int
 	chunkSize   int
 	encoding    string
-	nextIndex   int
+	nextIndex   int       // sequential write cursor — flushed up to (but not including) this index
+	received    map[int][]byte // out-of-order chunks buffered until their predecessors arrive
 	expires     time.Time
 }
 
@@ -788,7 +789,7 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 	state := uploadState{
 		spool: spool, filename: filename, path: path, spoolPath: spool.Name(),
 		fingerprint: fingerprint, total: total, chunkSize: chunkSize, encoding: encoding,
-		nextIndex: 0, expires: now.Add(transferTTL),
+		nextIndex: 0, received: make(map[int][]byte), expires: now.Add(transferTTL),
 	}
 	s.mu.Lock()
 	s.cleanupExpiredLocked(now)
@@ -835,7 +836,7 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 	s.cleanupExpiredLocked(now)
 	state, exists := s.uploads[sid]
 	if !exists {
-		if completion, ok := s.uploadCompletions[sid]; ok && index == completion.finalIndex {
+		if completion, ok := s.uploadCompletions[sid]; ok {
 			done := completion.done
 			s.mu.Unlock()
 			<-done
@@ -844,27 +845,60 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 		s.mu.Unlock()
 		return []string{"Upload is not initialized."}
 	}
-	if index != state.nextIndex {
-		next := state.nextIndex
+	if index < 0 || index >= state.total {
 		s.mu.Unlock()
-		return []string{strconv.Itoa(next)}
+		return []string{"Wrong chunk number."}
 	}
 	if len(wireChunk) > state.chunkSize {
 		s.mu.Unlock()
 		return []string{"Incorrect chunk length format."}
 	}
-	if err := writeAll(state.spool, []byte(wireChunk)); err != nil {
-		delete(s.uploads, sid)
+
+	// Duplicate: already flushed to spool or already buffered — ack silently.
+	if index < state.nextIndex || state.received[index] != nil {
+		state.expires = now.Add(transferTTL)
+		s.uploads[sid] = state
 		s.mu.Unlock()
-		_ = state.spool.Close()
-		_ = os.Remove(state.spoolPath)
-		return []string{"Cannot write file."}
+		return []string{strconv.Itoa(index)}
 	}
-	if index == state.total-1 {
+
+	// Accept the chunk: write directly if it's the next sequential one,
+	// otherwise buffer it for later flush.
+	if index == state.nextIndex {
+		if err := writeAll(state.spool, []byte(wireChunk)); err != nil {
+			delete(s.uploads, sid)
+			s.mu.Unlock()
+			_ = state.spool.Close()
+			_ = os.Remove(state.spoolPath)
+			return []string{"Cannot write file."}
+		}
+		state.nextIndex++
+		// Drain any consecutive buffered chunks.
+		for {
+			buf, ok := state.received[state.nextIndex]
+			if !ok {
+				break
+			}
+			if err := writeAll(state.spool, buf); err != nil {
+				delete(s.uploads, sid)
+				s.mu.Unlock()
+				_ = state.spool.Close()
+				_ = os.Remove(state.spoolPath)
+				return []string{"Cannot write file."}
+			}
+			delete(state.received, state.nextIndex)
+			state.nextIndex++
+		}
+	} else {
+		state.received[index] = []byte(wireChunk)
+	}
+
+	// All chunks flushed — finalize.
+	if state.nextIndex == state.total {
 		completion := &uploadCompletion{
 			done:        make(chan struct{}),
 			fingerprint: state.fingerprint,
-			finalIndex:  index,
+			finalIndex:  state.total - 1,
 			expires:     now.Add(transferTTL),
 		}
 		delete(s.uploads, sid)
@@ -881,12 +915,11 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 		s.mu.Unlock()
 		return []string{result}
 	}
-	state.nextIndex++
+
 	state.expires = now.Add(transferTTL)
 	s.uploads[sid] = state
-	next := state.nextIndex
 	s.mu.Unlock()
-	return []string{strconv.Itoa(next)}
+	return []string{strconv.Itoa(index)}
 }
 
 func (s *Server) finishUpload(sid string, state uploadState) string {
