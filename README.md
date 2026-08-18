@@ -19,26 +19,35 @@ HMAC-SHA256. Every DNS query carries a per-minute HMAC token.
 over the Internet, ~50 ms RTT). Incompressible random fixture; every
 transfer is SHA256-verified.
 
-| Mode           | Direction | DNS               | Size   | Elapsed | Throughput  |
-| -------------- | --------- | ----------------- | ------ | ------- | ----------- |
-| File client    | Download  | UDP direct        | 10 MiB |   7.50s | 11.18 Mbps  |
-| File client    | Download  | TCP direct        | 10 MiB |   8.46s |  9.92 Mbps  |
-| File client    | Download  | UDP public resolver | 10 MiB | 241.16s |  0.35 Mbps  |
-| File client    | Upload    | UDP direct        |  1 MiB | 466.15s |  0.02 Mbps  |
-| Proxy (SOCKS5) | Download  | UDP direct        | 10 MiB | 145.90s |  0.57 Mbps  |
-| Proxy (SOCKS5) | Download  | TCP direct        | 10 MiB | 222.29s |  0.38 Mbps  |
+| Mode           | Direction | DNS                  | Size   | Elapsed  | Throughput |
+| -------------- | --------- | -------------------- | ------ | -------- | ---------- |
+| File client    | Download  | UDP direct           | 10 MiB |    7.71s | 10.88 Mbps |
+| File client    | Download  | TCP direct           | 10 MiB |    8.67s |  9.68 Mbps |
+| File client    | Download  | UDP public resolver¹ | 10 MiB |  213.01s |  0.39 Mbps |
+| File client    | Download  | TCP public resolver² | 10 MiB |   35.29s |  2.38 Mbps |
+| File client    | Upload    | UDP direct           | 10 MiB |  327.29s |  0.26 Mbps |
+| File client    | Upload    | TCP direct           | 10 MiB |  152.27s |  0.55 Mbps |
+| File client    | Upload    | UDP public resolver  | 10 MiB |  371.11s |  0.23 Mbps |
+| File client    | Upload    | TCP public resolver  | 10 MiB |  251.22s |  0.33 Mbps |
+| Proxy (SOCKS5) | Download  | UDP direct           | 10 MiB |  351.26s |  0.24 Mbps |
+| Proxy (SOCKS5) | Download  | TCP direct           | 10 MiB |  226.52s |  0.37 Mbps |
 
 - **Direct** — client points `-ds` at the authoritative server IP,
   bypassing recursive resolvers.
-  **Public resolver** — queries go through the system's default recursive
-  resolver chain; most resolvers throttle or rate-limit bulk TXT lookups,
-  which cuts throughput ~30×.
-- **Download** uses 32 parallel workers × batches of 14 chunks and
-  scales well. **Upload** is chunk-serial (each chunk waits for its ack),
-  bottlenecked by RTT — ~50 ms per round-trip limits it to ~20 chunks/s.
-- **Proxy** row is a curl download through the reverse-SOCKS5 tunnel
-  (operator → SOCKS5 on server → DNS tunnel → agent → local HTTP target).
-  Data crosses the Internet twice per direction.
+  **Public resolver** — queries go through a recursive resolver (1.1.1.1);
+  most resolvers throttle or rate-limit bulk TXT lookups. TCP fares
+  better than UDP through public resolvers (~2–6× faster).
+- **Download** uses 32 parallel workers × batches of 14 chunks.
+  **Upload** uses 32 parallel workers (16 for UDP direct to avoid socket
+  saturation); each worker sends one chunk per DNS query.
+- ¹ Public resolver UDP downloads require `-batch 1` — the default
+  batch of 14 chunks exceeds the UDP response size limit through
+  recursive resolvers.
+- ² TCP public resolver download may intermittently SERVFAIL under
+  sustained load; the number shown is from an isolated run.
+- **Proxy** rows are curl downloads through the reverse-SOCKS5 tunnel
+  (operator → SOCKS5 on server → DNS tunnel → agent → HTTP target).
+  Data crosses the DNS tunnel in both directions.
 
 ---
 
