@@ -1359,6 +1359,39 @@ func TestUploadChunkOutOfRangeRejected(t *testing.T) {
 	}
 }
 
+func TestUploadChunkDuplicateIsAcked(t *testing.T) {
+	s := newTestServer(t)
+	sid := "dupchunksid1"
+	chunks := protectedUploadChunks(t, []byte("duplicate chunk test data"), "base64", 60)
+	if len(chunks) < 2 {
+		t.Skip("need at least 2 chunks")
+	}
+	startUpload(t, s, sid, "dupchunk.txt", chunks, 60, "base64")
+
+	// Send chunk 0.
+	if got := sendUploadChunk(t, s, sid, 0, chunks[0]); got != "0" {
+		t.Fatalf("first send of chunk 0: got %q, want \"0\"", got)
+	}
+	// Send chunk 0 again — duplicate, should still ack with "0".
+	if got := sendUploadChunk(t, s, sid, 0, chunks[0]); got != "0" {
+		t.Fatalf("duplicate send of chunk 0: got %q, want \"0\"", got)
+	}
+}
+
+func TestUploadInitIdempotentSameFingerprint(t *testing.T) {
+	s := newTestServer(t)
+	sid := "idempotentinit1"
+	chunks := protectedUploadChunks(t, []byte("idempotent init"), "base64", 60)
+	startUpload(t, s, sid, "idempotent.txt", chunks, 60, "base64")
+
+	// Second uinit with the same SID and same parameters — idempotent, should succeed.
+	args := append([]string{sid, strconv.Itoa(len(chunks)), "60", "base64"}, filenameLabels(t, "idempotent.txt")...)
+	got := s.handleTXT(signedName("uinit", args), "127.0.0.1")
+	if len(got) != 1 || got[0] != "Ready to file uploading" {
+		t.Fatalf("idempotent re-init: got %v, want [\"Ready to file uploading\"]", got)
+	}
+}
+
 func TestUploadChunkTooLong(t *testing.T) {
 	s := newTestServer(t)
 	sid := "toolongsid1"
