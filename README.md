@@ -13,6 +13,47 @@ HMAC-SHA256. Every DNS query carries a per-minute HMAC token.
 
 ---
 
+## Throughput
+
+100 MiB (≈ 838 Mbit) end-to-end throughput on macOS (Apple Silicon)
+loopback, 2026-08-17. Incompressible random fixture; every transfer is
+SHA256-verified against the source.
+
+| Mode              | Direction | DNS | Cache | Elapsed  | Throughput  | MiB/s |
+| ----------------- | --------- | --- | ----- | -------- | ----------- | ----- |
+| File client       | Download  | UDP | Cold  |   5.76s  | 145.64 Mbps | 17.36 |
+| File client       | Download  | UDP | Warm  |   4.42s  | 189.88 Mbps | 22.64 |
+| File client       | Download  | TCP | Cold  |   5.07s  | 165.56 Mbps | 19.74 |
+| File client       | Download  | TCP | Warm  |   3.65s  | 229.79 Mbps | 27.39 |
+| File client       | Upload    | UDP | —     |  86.38s  |   9.71 Mbps |  1.16 |
+| File client       | Upload    | TCP | —     |  36.98s  |  22.69 Mbps |  2.70 |
+| Proxy (SOCKS5)    | Bidir echo| UDP | —     |  22.30s  |  75.24 Mbps |  4.48 |
+| Proxy (SOCKS5)    | Bidir echo| TCP | —     | 147.99s  |  11.34 Mbps |  0.68 |
+
+- **Cold / Warm** — server built the encoded spool from scratch on first
+  request vs. served it from the LRU cache on the second (steady state).
+- **Upload** is chunk-serial in the client protocol (each chunk waits for
+  its ack); throughput plateaus regardless of size. Download uses 32
+  parallel workers × batches of 14 chunks and scales.
+- **Proxy** row is a synchronous echo through the reverse-SOCKS5 tunnel
+  (operator writes 100 MiB → agent forwards → upstream echoes → agent
+  forwards back → operator reads). Every axchg round-trip carries data
+  in both directions, so the numbers are the worst case for a
+  request/response tunnel. Reported throughput is the effective
+  one-direction rate; the tunnel actually moves 2× that in bytes/sec.
+  On this workload UDP DNS beats TCP DNS by ~7× because the agent runs
+  96 UDP workers vs. 32 TCP workers, and loopback UDP round-trip is
+  ~0.1 ms vs. ~0.3 ms for TCP DNS through the framed pool.
+
+Reproduce with (both take ~5 min combined):
+
+```sh
+go test -tags bench_e2e -run TestThroughputMatrix       -v -timeout 30m ./cmd/gdns2tcp-client
+go test -tags bench_e2e -run TestReverseSocksThroughput -v -timeout 60m ./cmd/gdns2tcp-client-proxy
+```
+
+---
+
 ## Quick start
 
 ### 1. Build
