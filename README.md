@@ -21,16 +21,16 @@ transfer is SHA256-verified.
 
 | Mode           | Direction | DNS                  | Size   | Elapsed  | Throughput |
 | -------------- | --------- | -------------------- | ------ | -------- | ---------- |
-| File client    | Download  | UDP direct           | 10 MiB |    7.71s | 10.88 Mbps |
-| File client    | Download  | TCP direct           | 10 MiB |    8.67s |  9.68 Mbps |
-| File client    | Download  | UDP public resolver¹ | 10 MiB |  213.01s |  0.39 Mbps |
-| File client    | Download  | TCP public resolver² | 10 MiB |   35.29s |  2.38 Mbps |
-| File client    | Upload    | UDP direct           | 10 MiB |  327.29s |  0.26 Mbps |
-| File client    | Upload    | TCP direct           | 10 MiB |  152.27s |  0.55 Mbps |
-| File client    | Upload    | UDP public resolver  | 10 MiB |  371.11s |  0.23 Mbps |
-| File client    | Upload    | TCP public resolver  | 10 MiB |  251.22s |  0.33 Mbps |
-| Proxy (SOCKS5) | Download  | UDP direct           | 10 MiB |  351.26s |  0.24 Mbps |
-| Proxy (SOCKS5) | Download  | TCP direct           | 10 MiB |  226.52s |  0.37 Mbps |
+| File client    | Download  | UDP direct           | 10 MiB |    8.19s |  9.77 Mbps |
+| File client    | Download  | TCP direct           | 10 MiB |    8.76s |  9.13 Mbps |
+| File client    | Download  | UDP public resolver¹ | 10 MiB |  191.13s |  0.42 Mbps |
+| File client    | Download  | TCP public resolver  | 10 MiB |   27.58s |  2.90 Mbps |
+| File client    | Upload    | UDP direct           | 10 MiB |  317.88s |  0.25 Mbps |
+| File client    | Upload    | TCP direct           | 10 MiB |  153.35s |  0.52 Mbps |
+| File client    | Upload    | UDP public resolver  | 10 MiB |  322.48s |  0.25 Mbps |
+| File client    | Upload    | TCP public resolver  | 10 MiB |  196.28s |  0.41 Mbps |
+| Proxy (SOCKS5) | Download  | UDP direct           | 10 MiB |   78.28s |  1.02 Mbps |
+| Proxy (SOCKS5) | Download  | TCP direct           | 10 MiB |  221.35s |  0.36 Mbps |
 
 - **Direct** — client points `-ds` at the authoritative server IP,
   bypassing recursive resolvers.
@@ -38,13 +38,12 @@ transfer is SHA256-verified.
   most resolvers throttle or rate-limit bulk TXT lookups. TCP fares
   better than UDP through public resolvers (~2–6× faster).
 - **Download** uses 32 parallel workers × batches of 14 chunks.
-  **Upload** uses 32 parallel workers (16 for UDP direct to avoid socket
-  saturation); each worker sends one chunk per DNS query.
+  **Upload** uses 32 parallel workers; each worker sends one chunk per
+  DNS query. The server accepts out-of-order chunks and buffers them
+  until their predecessors arrive.
 - ¹ Public resolver UDP downloads require `-batch 1` — the default
   batch of 14 chunks exceeds the UDP response size limit through
   recursive resolvers.
-- ² TCP public resolver download may intermittently SERVFAIL under
-  sustained load; the number shown is from an isolated run.
 - **Proxy** rows are curl downloads through the reverse-SOCKS5 tunnel
   (operator → SOCKS5 on server → DNS tunnel → agent → HTTP target).
   Data crosses the DNS tunnel in both directions.
