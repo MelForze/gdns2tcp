@@ -19,6 +19,7 @@ build: | .clients-dir .servers-dir
 	go build -o $(SERVER_DIR)/gdns2tcp $(SERVER_PKG)
 	go build -o $(BUILD_DIR)/gdns2tcp-client $(CLIENT_PKG)
 	go build -o $(BUILD_DIR)/gdns2tcp-client-proxy $(PROXY_PKG)
+	chmod +x $(SERVER_DIR)/gdns2tcp $(BUILD_DIR)/gdns2tcp-client $(BUILD_DIR)/gdns2tcp-client-proxy
 
 .clients-dir:
 	mkdir -p $(BUILD_DIR)
@@ -49,54 +50,72 @@ servers: \
 
 $(SERVER_DIR)/gdns2tcp-server-linux-amd64: .FORCE | .servers-dir
 	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
+	chmod +x $@
 
 $(SERVER_DIR)/gdns2tcp-server-linux-arm64: .FORCE | .servers-dir
 	GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
+	chmod +x $@
 
 $(SERVER_DIR)/gdns2tcp-server-darwin-amd64: .FORCE | .servers-dir
 	GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
+	chmod +x $@
 
 $(SERVER_DIR)/gdns2tcp-server-darwin-arm64: .FORCE | .servers-dir
 	GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o $@ $(SERVER_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-linux-amd64: .FORCE | .clients-dir
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-linux-arm64: .FORCE | .clients-dir
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-darwin-amd64: .FORCE | .clients-dir
 	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-darwin-arm64: .FORCE | .clients-dir
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-windows-amd64.exe: .FORCE | .clients-dir
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-windows-arm64.exe: .FORCE | .clients-dir
 	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
+	chmod +x $@
 
-$(BUILD_DIR)/gdns2tcp-client.ps1: scripts/gdns2tcp-client.ps1 | .clients-dir
+$(BUILD_DIR)/gdns2tcp-client.ps1: scripts/gdns2tcp-client.ps1 .FORCE | .clients-dir
 	cp $< $@
+	chmod +x $@
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-proxy-linux-amd64: .FORCE | .clients-dir
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-proxy-linux-arm64: .FORCE | .clients-dir
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-proxy-darwin-amd64: .FORCE | .clients-dir
 	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-proxy-darwin-arm64: .FORCE | .clients-dir
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-proxy-windows-amd64.exe: .FORCE | .clients-dir
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
+	chmod +x $@
 
 $(BUILD_DIR)/gdns2tcp-client-proxy-windows-arm64.exe: .FORCE | .clients-dir
 	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(PROXY_PKG)
+	chmod +x $@
 
 test:
 	go test -race ./...
