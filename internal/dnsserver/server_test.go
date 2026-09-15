@@ -2234,6 +2234,50 @@ func TestClientBatchUnknownAlias(t *testing.T) {
 	}
 }
 
+func TestClientBootstrap(t *testing.T) {
+	s, _ := newClientArtifactServer(t)
+	for _, tc := range []struct {
+		kind   string
+		substr string // expected substring in decoded script
+		noExec bool   // should NOT contain chmod +x
+	}{
+		{"", `A="$os-$a"`, false},
+		{"proxy", `A="client-proxy-$os-$a"`, false},
+		{"ps1", `A=win`, true},
+	} {
+		got := s.clientBootstrap(tc.kind, "127.0.0.1")
+		if len(got) == 0 {
+			t.Fatalf("kind=%q: empty response", tc.kind)
+		}
+		encoded := strings.Join(got, "")
+		raw, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatalf("kind=%q: bad base64: %v", tc.kind, err)
+		}
+		script := string(raw)
+		if !strings.Contains(script, tc.substr) {
+			t.Errorf("kind=%q: expected %q in script", tc.kind, tc.substr)
+		}
+		if !strings.Contains(script, "set -e") {
+			t.Errorf("kind=%q: missing set -e", tc.kind)
+		}
+		if !strings.Contains(script, "shasum -a 256") {
+			t.Errorf("kind=%q: missing shasum verification", tc.kind)
+		}
+		domain := strings.TrimSuffix(s.domain, ".")
+		if !strings.Contains(script, "D='"+domain+"'") {
+			t.Errorf("kind=%q: domain not baked in", tc.kind)
+		}
+		hasChmod := strings.Contains(script, "chmod +x")
+		if tc.noExec && hasChmod {
+			t.Errorf("kind=%q: should not have chmod +x for ps1", tc.kind)
+		}
+		if !tc.noExec && !hasChmod {
+			t.Errorf("kind=%q: missing chmod +x", tc.kind)
+		}
+	}
+}
+
 func TestClientArtifactProgressUsesBitmapAndExpires(t *testing.T) {
 	s, total := newClientArtifactServer(t)
 	client := "192.0.2.10"

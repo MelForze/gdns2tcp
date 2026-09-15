@@ -123,6 +123,8 @@ func run() error {
 			{Alias: "linux-arm64", Path: filepath.Join(clientsDir, "gdns2tcp-client-linux-arm64")},
 			{Alias: "darwin-amd64", Path: filepath.Join(clientsDir, "gdns2tcp-client-darwin-amd64")},
 			{Alias: "darwin-arm64", Path: filepath.Join(clientsDir, "gdns2tcp-client-darwin-arm64")},
+			{Alias: "windows-amd64", Path: filepath.Join(clientsDir, "gdns2tcp-client-windows-amd64.exe")},
+			{Alias: "windows-arm64", Path: filepath.Join(clientsDir, "gdns2tcp-client-windows-arm64.exe")},
 			{Alias: "client-proxy-linux-amd64", Path: filepath.Join(clientsDir, "gdns2tcp-client-proxy-linux-amd64")},
 			{Alias: "client-proxy-linux-arm64", Path: filepath.Join(clientsDir, "gdns2tcp-client-proxy-linux-arm64")},
 			{Alias: "client-proxy-darwin-amd64", Path: filepath.Join(clientsDir, "gdns2tcp-client-proxy-darwin-amd64")},

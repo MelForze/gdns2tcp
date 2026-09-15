@@ -31,6 +31,8 @@ clients: \
 	$(BUILD_DIR)/gdns2tcp-client-linux-arm64 \
 	$(BUILD_DIR)/gdns2tcp-client-darwin-amd64 \
 	$(BUILD_DIR)/gdns2tcp-client-darwin-arm64 \
+	$(BUILD_DIR)/gdns2tcp-client-windows-amd64.exe \
+	$(BUILD_DIR)/gdns2tcp-client-windows-arm64.exe \
 	$(BUILD_DIR)/gdns2tcp-client.ps1 \
 	$(BUILD_DIR)/gdns2tcp-client-proxy-linux-amd64 \
 	$(BUILD_DIR)/gdns2tcp-client-proxy-linux-arm64 \
@@ -68,6 +70,12 @@ $(BUILD_DIR)/gdns2tcp-client-darwin-amd64: .FORCE | .clients-dir
 
 $(BUILD_DIR)/gdns2tcp-client-darwin-arm64: .FORCE | .clients-dir
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
+
+$(BUILD_DIR)/gdns2tcp-client-windows-amd64.exe: .FORCE | .clients-dir
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
+
+$(BUILD_DIR)/gdns2tcp-client-windows-arm64.exe: .FORCE | .clients-dir
+	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $@ $(CLIENT_PKG)
 
 $(BUILD_DIR)/gdns2tcp-client.ps1: scripts/gdns2tcp-client.ps1 | .clients-dir
 	cp $< $@
@@ -111,6 +119,8 @@ clean:
 		$(BUILD_DIR)/gdns2tcp-client-linux-arm64 \
 		$(BUILD_DIR)/gdns2tcp-client-darwin-amd64 \
 		$(BUILD_DIR)/gdns2tcp-client-darwin-arm64 \
+		$(BUILD_DIR)/gdns2tcp-client-windows-amd64.exe \
+		$(BUILD_DIR)/gdns2tcp-client-windows-arm64.exe \
 		$(BUILD_DIR)/gdns2tcp-client-proxy-linux-amd64 \
 		$(BUILD_DIR)/gdns2tcp-client-proxy-linux-arm64 \
 		$(BUILD_DIR)/gdns2tcp-client-proxy-darwin-amd64 \

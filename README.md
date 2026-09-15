@@ -1,15 +1,20 @@
 # gdns2tcp
 
-File-transfer utility that tunnels uploads and downloads through DNS TXT
-records.
+DNS tunnel that moves files and proxies TCP traffic through TXT records.
 
-- **Server** (Go) — authoritative DNS handler that stores files and serves
-  client binaries
-- **Unix client** (Go) — ~3 MB stripped, no CGO, no external dependencies
-- **Windows client** (PowerShell 5.1+) — single self-contained script
+- **File transfer** — upload / download files up to 32 / 256 MiB
+- **Client self-distribution** — server serves its own client binaries via DNS, no pre-installed tooling required
+- **Reverse SOCKS5** — agent inside a private network polls the server; operator connects to the server's SOCKS5 port and exits from the agent
 
-Payloads are gzip+AES-256-CBC (PBKDF2-SHA256, 100k iterations) with
-HMAC-SHA256. Every DNS query carries a per-minute HMAC token.
+All payloads are gzip + AES-256-CBC (PBKDF2-SHA256, 100 k iter) with HMAC-SHA256.
+Every DNS query carries a per-minute HMAC token.
+
+| Component | Platform | Notes |
+|---|---|---|
+| `gdns2tcp` | Linux, macOS | Authoritative DNS server |
+| `gdns2tcp-client` | Linux, macOS, Windows | ~3 MB, static, no CGO |
+| `gdns2tcp-client.ps1` | Windows (PS 5.1+) | Single self-contained script, no .exe needed |
+| `gdns2tcp-client-proxy` | Linux, macOS, Windows | Reverse SOCKS5 agent |
 
 ---
 
@@ -19,34 +24,28 @@ HMAC-SHA256. Every DNS query carries a per-minute HMAC token.
 over the Internet, ~50 ms RTT). Incompressible random fixture; every
 transfer is SHA256-verified.
 
-| Mode           | Direction | DNS                  | Size   | Elapsed  | Throughput |
-| -------------- | --------- | -------------------- | ------ | -------- | ---------- |
-| File client    | Download  | UDP direct           | 10 MiB |    8.19s |  9.77 Mbps |
-| File client    | Download  | TCP direct           | 10 MiB |    8.76s |  9.13 Mbps |
-| File client    | Download  | UDP public resolver¹ | 10 MiB |  191.13s |  0.42 Mbps |
-| File client    | Download  | TCP public resolver  | 10 MiB |   27.58s |  2.90 Mbps |
-| File client    | Upload    | UDP direct           | 10 MiB |  317.88s |  0.25 Mbps |
-| File client    | Upload    | TCP direct           | 10 MiB |  153.35s |  0.52 Mbps |
-| File client    | Upload    | UDP public resolver  | 10 MiB |  322.48s |  0.25 Mbps |
-| File client    | Upload    | TCP public resolver  | 10 MiB |  196.28s |  0.41 Mbps |
-| Proxy (SOCKS5) | Download  | UDP direct           | 10 MiB |   78.28s |  1.02 Mbps |
-| Proxy (SOCKS5) | Download  | TCP direct           | 10 MiB |  221.35s |  0.36 Mbps |
+| Client                        | Direction | DNS                  | Size   | Elapsed  | Throughput |
+| ----------------------------- | --------- | -------------------- | ------ | -------- | ---------- |
+| `gdns2tcp-client`             | Download  | UDP direct           | 10 MiB |    8.19s |  9.77 Mbps |
+| `gdns2tcp-client`             | Download  | TCP direct           | 10 MiB |    8.76s |  9.13 Mbps |
+| `gdns2tcp-client`             | Download  | UDP public resolver¹ | 10 MiB |  191.13s |  0.42 Mbps |
+| `gdns2tcp-client`             | Download  | TCP public resolver  | 10 MiB |   27.58s |  2.90 Mbps |
+| `gdns2tcp-client`             | Upload    | UDP direct           | 10 MiB |  317.88s |  0.25 Mbps |
+| `gdns2tcp-client`             | Upload    | TCP direct           | 10 MiB |  153.35s |  0.52 Mbps |
+| `gdns2tcp-client`             | Upload    | UDP public resolver  | 10 MiB |  322.48s |  0.25 Mbps |
+| `gdns2tcp-client`             | Upload    | TCP public resolver  | 10 MiB |  196.28s |  0.41 Mbps |
+| `gdns2tcp-client.ps1`         | Download  | UDP direct           | 10 MiB |   11.02s |  7.26 Mbps |
+| `gdns2tcp-client.ps1`         | Download  | TCP direct           | 10 MiB |   13.31s |  6.01 Mbps |
+| `gdns2tcp-client.ps1`         | Upload    | UDP direct           | 10 MiB |  207.67s |  0.39 Mbps |
+| `gdns2tcp-client.ps1`         | Upload    | TCP direct           | 10 MiB |  174.09s |  0.46 Mbps |
+| `gdns2tcp-client-proxy`       | Download  | UDP direct           | 10 MiB |   78.28s |  1.02 Mbps |
+| `gdns2tcp-client-proxy`       | Download  | TCP direct           | 10 MiB |  221.35s |  0.36 Mbps |
 
-- **Direct** — client points `-ds` at the authoritative server IP,
-  bypassing recursive resolvers.
-  **Public resolver** — queries go through a recursive resolver (1.1.1.1);
-  most resolvers throttle or rate-limit bulk TXT lookups. TCP fares
-  better than UDP through public resolvers (~2–6× faster).
-- **Download** uses 32 parallel workers × batches of 14 chunks.
-  **Upload** uses 32 parallel workers; each worker sends one chunk per
-  DNS query. The server accepts out-of-order chunks and buffers them
-  until their predecessors arrive.
-- ¹ Public resolver UDP downloads require `-batch 1` — the default
-  batch of 14 chunks exceeds the UDP response size limit through
-  recursive resolvers.
-- **Proxy** rows are curl downloads through the reverse-SOCKS5 tunnel
-  (operator → SOCKS5 on server → DNS tunnel → agent → HTTP target).
-  Data crosses the DNS tunnel in both directions.
+- **Direct** — `-ds` points at the authoritative server IP, bypassing recursion.
+  **Public resolver** — queries go through 1.1.1.1; most resolvers rate-limit bulk TXT lookups. TCP is ~2–6× faster than UDP through public resolvers.
+- ¹ Public resolver UDP downloads require `-batch 1` (default batch of 14 exceeds the UDP response size through recursion).
+- Downloads use 32 parallel workers × 14-chunk batches. Uploads use 32 parallel workers, one chunk per query, out-of-order delivery.
+- **Proxy** rows are curl through the reverse-SOCKS5 tunnel (operator → server:9050 → DNS → agent → target).
 
 ---
 
@@ -55,384 +54,168 @@ transfer is SHA256-verified.
 ### 1. Build
 
 ```sh
-make clients servers     # cross-compile everything into ./clients + ./servers
-make build               # current platform → ./gdns2tcp, ./gdns2tcp-client, ./gdns2tcp-client-proxy
+make clients servers     # cross-compile all binaries → ./clients + ./servers
+make build               # current platform only → ./gdns2tcp, ./gdns2tcp-client, ./gdns2tcp-client-proxy
 ```
 
 ### 2. Delegate the DNS zone
 
-The parent zone must delegate the subzone to the host running gdns2tcp:
+Add NS + A records in the **parent** zone so that recursive resolvers
+forward queries for `files.example.com` to your server:
 
 | Type | Name | Value |
 |---|---|---|
 | `NS` | `files.example.com.` | `ns1.example.com.` |
-| `A`  | `ns1.example.com.` | `11.11.11.11` |
+| `A`  | `ns1.example.com.` | `<server-ip>` |
 
-gdns2tcp answers TXT queries for names under `-domain` and marks those
-responses authoritative (`AA`). Other record types below the delegated zone
-receive authoritative NODATA rather than NXDOMAIN, so recursive resolvers do
-not negatively cache a valid tunnel name. Resolvers follow the parent
-delegation and send tunnel TXT queries on UDP+TCP port 53.
+After starting the server (step 3), verify that delegation works:
 
 ```sh
-dig +short NS files.example.com
-dig +short TXT EnCoDiNg.test.files.example.com    # → "base64" (or "base32")
+dig +short TXT EnCoDiNg.test.files.example.com    # → "base64"
 ```
 
-The proxy agent discovers this delegation through the system resolver and
-then sends tunnel traffic directly to the authoritative IP. For local/private
-testing without real DNS, add `-ds <server-ip>` to every client.
+If you see `"base64"` — the recursive resolver successfully reached
+gdns2tcp through the delegation. gdns2tcp only answers TXT queries;
+`dig NS` against it will return an empty response — that is expected.
 
-#### Multi-domain sharding (optional)
-
-Public resolvers (`1.1.1.1`, `8.8.8.8`, …) rate-limit queries **per
-authoritative zone**. Delegating several zones to the same nameserver
-and passing them as a CSV list to `-domain` lets clients rotate QNAME
-suffixes round-robin, so each shard eats its own rate-limit budget.
-
-Zone records add one line per shard; the same A-record for `ns1`
-serves all of them:
-
-| Type | Name | Value |
-|---|---|---|
-| `NS` | `files.example.com.`  | `ns1.example.com.` |
-| `NS` | `files1.example.com.` | `ns1.example.com.` |
-| `NS` | `files2.example.com.` | `ns1.example.com.` |
-| `A`  | `ns1.example.com.`    | `11.11.11.11` |
-
-The **first** domain in the CSV is *canonical* — HMAC signatures are
-always computed under it, so a query routed through any shard still
-authenticates. Non-canonical shards are pure suffix rotation; there is
-no per-shard state.
+For local/private testing without delegation, pass `-ds <server-ip>` to
+every client instead.
 
 ### 3. Run the server
 
 ```sh
 sudo ./gdns2tcp -domain files.example.com -p "change-me"
-
-# multi-domain sharding: canonical + 2 shards
-sudo ./gdns2tcp -domain files.example.com,files1.example.com,files2.example.com -p "change-me"
 ```
 
-Listens on UDP+TCP port 53 and serves client binaries from `./clients`.
-Port 53 requires root.
-
-Clients (`gdns2tcp-client`, `gdns2tcp-client-proxy`) accept the same
-CSV form for their `-domain` flag; single-domain configs remain fully
-backward compatible.
+Listens on UDP+TCP :53 and serves client binaries from `./clients`.
 
 ### 4. Fetch a client over DNS
 
-The server publishes its own client binaries under public DNS endpoints —
-no secret required. `S=<dns-server>` is optional: leave unset to use the
-system resolver, set to hit a specific server directly (useful before
-delegation is live or on private networks).
-
-**Linux / macOS** (needs `dig`, `base64`, `shasum`):
+The server returns a bootstrap shell script as a DNS TXT record — no
+pre-installed client needed:
 
 ```sh
-D=files.example.com S= B=14 P=16 sh <<'EOF'
-# S="" → system resolver; S=192.0.2.10 → send queries straight to that IP
-os=$(uname -s | tr A-Z a-z); a=$(uname -m)
-case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
-A="$os-$a"
-NL=$(printf '\n')
-qm(){ for i in 1 2 3 4 5; do
-        o=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT | tr -d "\"$NL ")
-        [ -n "$o" ] && { printf %s "$o"; return; }
-        sleep 0.4
-    done
-    echo "no TXT for $1" >&2; return 1
-}
-qb(){ for i in 1 2 3 4 5; do
-        raw=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT | tr -d \" | tr "$NL" ' ')
-        s=$(printf %s "$raw" | awk '{print $1}')
-        d=$(printf %s "$raw" | awk '{for(i=2;i<=NF;i++) printf "%s",$i}')
-        if [ -n "$s" ] && [ -n "$d" ] && [ "${s%${s#s:}}" = "s:" ]; then
-            actual=$(printf %s "$d" | sha256sum | awk '{print $1}')
-            if [ "${s#s:}" = "$actual" ]; then printf %s "$d"; return; fi
-        fi
-        sleep 0.4
-    done
-    echo "batch verify failed for $1" >&2; return 1
-}
-m=$(qm "client-$A.$D") || exit 1
-NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
-TOTAL=$(( (N + B - 1) / B ))
-T=$(mktemp -d); i=0; k=0
-while [ $i -lt $N ]; do
-    c=$B; [ $((i + c)) -gt $N ] && c=$((N - i))
-    (qb "$i.$c.clb-$A.$D" > "$T/$k" || touch "$T/.err") &
-    i=$((i + c)); k=$((k + 1))
-    [ $((k % P)) -eq 0 ] && { wait; printf "\rfetched %d/%d batches" "$k" "$TOTAL" >&2; }
-done
-wait
-printf "\rfetched %d/%d batches\n" "$k" "$TOTAL" >&2
-[ -f "$T/.err" ] && { rm -rf "$T"; echo "fetch failed" >&2; exit 1; }
-F=$(mktemp); j=0
-while [ $j -lt $k ]; do cat "$T/$j" >> "$F"; j=$((j + 1)); done
-rm -rf "$T"
-base64 -d < "$F" > "$NAME" 2>/dev/null || base64 -D < "$F" > "$NAME"
-rm "$F"
-printf "%s  %s\n" "$SHA" "$NAME" | shasum -a 256 -c - || { rm -f "$NAME"; exit 1; }
-chmod +x "$NAME"; echo "saved ./$NAME"
-EOF
+# Go file client — auto-detects OS/arch
+dig +short +tcp TXT boot.files.example.com | tr -d '" ' | base64 -d | sh
+
+# Go proxy agent
+dig +short +tcp TXT boot-proxy.files.example.com | tr -d '" ' | base64 -d | sh
+
+# PowerShell client
+dig +short +tcp TXT boot-ps1.files.example.com | tr -d '" ' | base64 -d | sh
 ```
 
-**Windows PowerShell** — uses TCP DNS (`nslookup -vc`) to bypass the
-512-byte UDP cap. `$S=""` uses the system resolver; set it to an IP to
-target a specific server:
+To query the server directly (before delegation is live):
 
-```powershell
-$D="files.example.com"; $S=""; $B=14
-function qm($n){ for($i=1;$i -le 5;$i++){ $r = if ($S) { nslookup -vc -type=TXT $n $S 2>$null } else { nslookup -vc -type=TXT $n 2>$null }
-  $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
-  if($m.Count){ return (($m | %{ $_.Groups[1].Value }) -join "") }
-  Start-Sleep -Milliseconds 400 }; throw "no TXT for $n" }
-function qb($n){ for($i=1;$i -le 5;$i++){ $r = if ($S) { nslookup -vc -type=TXT $n $S 2>$null } else { nslookup -vc -type=TXT $n 2>$null }
-  $m=[regex]::Matches(($r -join "`n"),'"([^"]*)"')
-  if($m.Count -ge 2 -and $m[0].Groups[1].Value.StartsWith("s:")){
-    $expected = $m[0].Groups[1].Value.Substring(2).ToLower()
-    $data = ($m | Select-Object -Skip 1 | %{ $_.Groups[1].Value }) -join ""
-    $bytes = [System.Text.Encoding]::ASCII.GetBytes($data)
-    $actual = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | %{ "{0:x2}" -f $_ })
-    if($expected -eq $actual){ return $data }
-  }
-  Start-Sleep -Milliseconds 400 }; throw "batch verify failed for $n" }
-$man=qm "client-win.$D"; $p=$man.Split('|')
-$name=$p[0]; $n=[int]$p[1]; $sha=$p[2].ToLower()
-$total = [int][Math]::Ceiling($n / $B)
-$b64=''; $i=0; $j=0
-while ($i -lt $n) {
-    $c = [Math]::Min($B, $n - $i)
-    $b64 += qb "$i.$c.clb-win.$D"
-    $i += $c; $j++
-    Write-Progress -Activity "Fetching client" -Status "$j of $total batches" -PercentComplete ([Math]::Min(100, [Math]::Round($j * 100 / $total, 1)))
-}
-Write-Progress -Activity "Fetching client" -Completed
-$out=Join-Path (Get-Location) $name
-[IO.File]::WriteAllBytes($out, [Convert]::FromBase64String($b64))
-if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){
-    Remove-Item $out -Force; throw "sha256 mismatch" }
-"Saved $out"
+```sh
+dig +short +tcp @<server-ip> TXT boot.files.example.com | tr -d '" ' | base64 -d | S=<server-ip> sh
 ```
 
 ### 5. Transfer files
 
 ```sh
 # Linux / macOS
-./gdns2tcp-client-linux-amd64 -d files.example.com -p "change-me" --list
-./gdns2tcp-client-linux-amd64 -d files.example.com -p "change-me" --upload ./sample.txt
-./gdns2tcp-client-linux-amd64 -d files.example.com -p "change-me" --download sample.txt -out ./sample.copy.txt
+./gdns2tcp-client -d files.example.com -p "change-me" --list
+./gdns2tcp-client -d files.example.com -p "change-me" --upload ./sample.txt
+./gdns2tcp-client -d files.example.com -p "change-me" --download sample.txt -out ./sample.copy.txt
 ```
 
 ```powershell
-# Windows
+# Windows — Go client (.exe) or PowerShell (.ps1)
+.\gdns2tcp-client-windows-amd64.exe -d files.example.com -p "change-me" --list
 .\gdns2tcp-client.ps1 -Domain files.example.com -Pass "change-me" -Mode List
 .\gdns2tcp-client.ps1 -Domain files.example.com -Pass "change-me" -Mode Upload -InFile .\sample.txt
 .\gdns2tcp-client.ps1 -Domain files.example.com -Pass "change-me" -Mode Download -Filename sample.txt -OutFile .\sample.copy.txt
 ```
 
-Add `-tcp` (Go) or `-Tcp` (PowerShell) if UDP is blocked or truncates.
-
-### Transfer limits, cache and resume
-
-- The server accepts uploads up to **32 MiB** and serves source files up to
-  **256 MiB** by default. Override these limits with
-  `-max-upload-bytes` and `-max-download-bytes` only when both peers have
-  enough disk space for the temporary spool files.
-- Downloads are compressed, encrypted and encoded as streaming disk spools;
-  neither endpoint holds the complete transfer in RAM. A server-side encoded
-  cache is kept in `<data-dir>/.gdns2tcp-cache` for 24 hours, with a 1 GiB
-  hard LRU quota that also reserves space for in-progress cache builds. A new
-  build is rejected when inactive entries cannot free enough space. Use
-  `-cache-dir`, `-cache-max-bytes` and `-cache-ttl` to change it.
-- The Go client keeps incomplete downloads in the OS user cache (1 GiB,
-  seven-day cleanup) and resumes them from one spool file plus a bitmap.
-  It reserves quota before creating the spool and locks each transfer across
-  processes. `-cache-dir <dir>` selects another location; `-no-resume` keeps
-  all temporary state only for the current invocation.
-- Direct PowerShell TCP downloads reuse a bounded pool of 16 DNS connections
-  with connect/read/write timeouts; a broken stream is discarded without
-  affecting the other pool entries.
-- The legacy Go spellings `-pass`, `-in` and `-filename` remain accepted as
-  aliases for `-password`, `-upload` and `-download`. PowerShell accepts
-  `-in`, `-chunk-size` and `-max-download-bytes` alongside its canonical
-  parameter names. The Go file client requires exactly one mode flag and
-  rejects conflicting modes.
+Add `-tcp` (Go) or `-Tcp` (PowerShell) if UDP is blocked.
 
 ---
 
-## Reverse SOCKS5 — browse the agent's network
-
-An agent inside a private network polls the public server through DNS
-and dials upstream services locally. You connect to the server's SOCKS5
-listener; traffic exits from the agent.
+## Reverse SOCKS5
 
 ```
 operator ── TCP/SOCKS5 ──> server:9050 ── DNS tunnel ──> agent ──> upstream
 ```
 
-Agent↔server DNS is AES-256-GCM under `(secret, cid)`. Sessions
-multiplex via 16-hex `cid` per tunnel.
+The agent polls the server from inside a private network. The operator
+connects to the server's SOCKS5 port; traffic exits from the agent.
+Tunnel encryption: AES-256-GCM keyed by `(secret, cid)`.
 
-### Enable on the server
+### Setup
 
 ```sh
-sudo ./gdns2tcp -domain files.example.com -p "change-me" -allow-proxy
+# Server — enable proxy and expose SOCKS5
+sudo ./gdns2tcp -domain files.example.com -p "change-me" \
+  -allow-proxy -socks-listen 0.0.0.0:9050 -socks-no-auth
 ```
 
-The SOCKS5 listener binds `127.0.0.1:9050` after the first authenticated
-agent poll. To expose it publicly use `-socks-listen 0.0.0.0:9050`
-paired with `-socks-no-auth=false` (RFC 1929 user=`gdns2tcp` /
-password=`-p` value).
-
-### Fetch the agent binary
-
-Same bootstrap pattern as the file client — swap the alias from
-`$os-$arch` to `client-proxy-$os-$arch`. `S=<dns-server>` is optional
-(see the file-client fetch above).
-
 ```sh
-D=files.example.com S= B=14 P=16 sh <<'EOF'
-os=$(uname -s | tr A-Z a-z); a=$(uname -m)
-case "$a" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "bad arch $a" >&2; exit 1;; esac
-A="client-proxy-$os-$a"
-NL=$(printf '\n')
-qm(){ for i in 1 2 3 4 5; do
-        o=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT | tr -d "\"$NL ")
-        [ -n "$o" ] && { printf %s "$o"; return; }
-        sleep 0.4
-    done
-    echo "no TXT for $1" >&2; return 1
-}
-qb(){ for i in 1 2 3 4 5; do
-        raw=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT | tr -d \" | tr "$NL" ' ')
-        s=$(printf %s "$raw" | awk '{print $1}')
-        d=$(printf %s "$raw" | awk '{for(i=2;i<=NF;i++) printf "%s",$i}')
-        if [ -n "$s" ] && [ -n "$d" ] && [ "${s%${s#s:}}" = "s:" ]; then
-            actual=$(printf %s "$d" | sha256sum | awk '{print $1}')
-            if [ "${s#s:}" = "$actual" ]; then printf %s "$d"; return; fi
-        fi
-        sleep 0.4
-    done
-    echo "batch verify failed for $1" >&2; return 1
-}
-m=$(qm "client-$A.$D") || exit 1
-NAME=${m%%|*}; rest=${m#*|}; N=${rest%%|*}; SHA=${rest#*|}
-TOTAL=$(( (N + B - 1) / B ))
-T=$(mktemp -d); i=0; k=0
-while [ $i -lt $N ]; do
-    c=$B; [ $((i + c)) -gt $N ] && c=$((N - i))
-    (qb "$i.$c.clb-$A.$D" > "$T/$k" || touch "$T/.err") &
-    i=$((i + c)); k=$((k + 1))
-    [ $((k % P)) -eq 0 ] && { wait; printf "\rfetched %d/%d batches" "$k" "$TOTAL" >&2; }
-done
-wait
-printf "\rfetched %d/%d batches\n" "$k" "$TOTAL" >&2
-[ -f "$T/.err" ] && { rm -rf "$T"; echo "fetch failed" >&2; exit 1; }
-F=$(mktemp); j=0
-while [ $j -lt $k ]; do cat "$T/$j" >> "$F"; j=$((j + 1)); done
-rm -rf "$T"
-base64 -d < "$F" > "$NAME" 2>/dev/null || base64 -D < "$F" > "$NAME"
-rm "$F"
-printf "%s  %s\n" "$SHA" "$NAME" | shasum -a 256 -c - || { rm -f "$NAME"; exit 1; }
-chmod +x "$NAME"; echo "saved ./$NAME"
-EOF
+# Agent — fetch and run
+dig +short +tcp TXT boot-proxy.files.example.com | tr -d '" ' | base64 -d | sh
+./gdns2tcp-client-proxy -d files.example.com -p "change-me"
 ```
 
 ```powershell
-# Windows — uses Resolve-DnsName when available, falls back to nslookup -vc.
-# $S="" = system resolver; set to an IP to target a specific server.
-$D="files.example.com"; $S=""; $B=14
-$ARCH = if ([System.Environment]::Is64BitOperatingSystem) { "amd64" } else { "arm64" }
-$A = "client-proxy-windows-$ARCH"
-$ProgressPreference='SilentlyContinue'
-$rdn = $null -ne (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)
-function qraw($n){
-  if($rdn){
-    $p = @{Name=$n; Type='TXT'; TcpOnly=$true; DnsOnly=$true; NoHostsFile=$true; QuickTimeout=$true; ErrorAction='Stop'}
-    if ($S) { $p['Server'] = $S }
-    $r = Resolve-DnsName @p
-    return @(foreach($rec in $r){ if($rec.Strings){ $rec.Strings } })
-  }
-  $r = if ($S) { nslookup -vc -type=TXT $n $S 2>$null } else { nslookup -vc -type=TXT $n 2>$null }
-  return @([regex]::Matches(($r -join "`n"),'"([^"]*)"') | %{ $_.Groups[1].Value })
-}
-function qm($n){ for($k=1;$k -le 5;$k++){
-  try { $m = qraw $n; if($m.Count){ return ($m -join "") } } catch {}
-  Start-Sleep -Milliseconds 400 }
-  throw "no TXT for $n (is TCP:53 through the configured resolver reachable?)" }
-function qb($n){ for($k=1;$k -le 5;$k++){
-  try {
-    $m = qraw $n
-    if($m.Count -ge 2 -and $m[0].StartsWith("s:")){
-      $expected = $m[0].Substring(2).ToLower()
-      $data = ($m | Select-Object -Skip 1) -join ""
-      $bytes = [System.Text.Encoding]::ASCII.GetBytes($data)
-      $actual = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | %{ "{0:x2}" -f $_ })
-      if($expected -eq $actual){ return $data }
-    }
-  } catch {}
-  Start-Sleep -Milliseconds 400 }
-  throw "batch verify failed for $n (is TCP:53 through the configured resolver reachable?)" }
-$manifestName="client-$A.$D"
-$man=qm $manifestName; $p=@($man.Split('|')); [int]$n=0
-if($p.Count -ne 3 -or [string]::IsNullOrWhiteSpace($p[0]) -or
-   -not [int]::TryParse($p[1],[ref]$n) -or $n -lt 1 -or
-   $p[2] -notmatch '^[0-9a-fA-F]{64}$'){
-  throw "Unexpected TXT response for ${manifestName}: $man. Check D and NS delegation."
-}
-$name=[IO.Path]::GetFileName($p[0])
-if($name -ne $p[0]){ throw "Unsafe artifact filename in manifest: $($p[0])" }
-$sha=$p[2].ToLowerInvariant()
-$total = [int][Math]::Ceiling($n / $B)
-$b64 = [System.Text.StringBuilder]::new($n * 260)
-$i=0; $j=0; $tick=[DateTime]::UtcNow
-Write-Host "Fetching $name ($total batches over TCP:53 via $(if($rdn){'Resolve-DnsName'}else{'nslookup'}))..."
-while ($i -lt $n) {
-    $c = [Math]::Min($B, $n - $i)
-    [void]$b64.Append((qb "$i.$c.clb-$A.$D"))
-    $i += $c; $j++
-    if(([DateTime]::UtcNow - $tick).TotalMilliseconds -ge 500){
-        Write-Host -NoNewline ("`r  {0}/{1} batches" -f $j, $total)
-        $tick = [DateTime]::UtcNow
-    }
-}
-Write-Host ("`r  {0}/{0} batches done" -f $total)
-$out=Join-Path (Get-Location) $name
-[IO.File]::WriteAllBytes($out, [Convert]::FromBase64String($b64.ToString()))
-if((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $sha){
-    Remove-Item $out -Force; throw "sha256 mismatch" }
-"Saved $out"
-```
-
-### Run the agent
-
-```sh
-./gdns2tcp-client-proxy-linux-amd64 -d files.example.com -p "change-me"
-```
-
-```powershell
+# Agent (Windows)
 .\gdns2tcp-client-proxy-windows-amd64.exe -d files.example.com -p "change-me"
 ```
 
-The agent doesn't listen — it polls the server and dials whatever
-target the operator's SOCKS5 CONNECT requests.
+SOCKS5 binds `127.0.0.1:9050` by default after the first agent connects.
+Add `-socks-no-auth=false` to enable RFC 1929 auth (user `gdns2tcp`,
+password = `-p` value).
 
-When `-ds` is omitted, the proxy agent uses the system resolver only to
-discover the zone's parent delegation, then validates and connects directly
-to the authoritative gdns2tcp server. The selected IP must return an
-authoritative (`AA`) TXT probe for every configured shard. If delegation
-discovery fails (for example, for a private undelegated zone), the agent warns
-and falls back to the system recursive resolver with a conservative worker
-profile and extra retries. An explicit `-ds <gdns2tcp-server-ip>` skips
-discovery and remains useful for private networks and non-standard DNS ports.
+---
 
-If the network permits DNS only through an internal recursive server, the
-fallback remains cache-safe: dynamic proxy operations carry unique poll IDs,
-stream nonces and sequence numbers in their QNAMEs, while gdns2tcp answers
-with TTL 0. A retry intentionally repeats the same QNAME to obtain the same
-idempotent response after packet loss. Startup probes include an additional
-random label so a cached `encoding.test` response cannot masquerade as a live
-authoritative path.
+## Advanced
+
+### Deploy to a remote host
+
+```sh
+make clients servers
+HOST=root@<server-ip>
+ssh $HOST 'mkdir -p ~/gdns2tcp/clients ~/gdns2tcp/data'
+scp servers/gdns2tcp-server-linux-amd64 $HOST:~/gdns2tcp/gdns2tcp
+scp clients/* $HOST:~/gdns2tcp/clients/
+ssh $HOST '~/gdns2tcp/gdns2tcp \
+  -domain files.example.com \
+  -p "change-me" \
+  -listen 0.0.0.0 \
+  -data-dir ~/gdns2tcp/data \
+  -clients-dir ~/gdns2tcp/clients'
+```
+
+For ARM64 hosts, replace `linux-amd64` with `linux-arm64`. Add
+`-allow-proxy -socks-listen 0.0.0.0:9050 -socks-no-auth` to enable
+the reverse SOCKS5 tunnel.
+
+### Multi-domain sharding
+
+Public resolvers rate-limit per authoritative zone. Delegating several
+zones to the same server lets clients round-robin QNAME suffixes:
+
+| Type | Name | Value |
+|---|---|---|
+| `NS` | `files.example.com.`  | `ns1.example.com.` |
+| `NS` | `files1.example.com.` | `ns1.example.com.` |
+| `NS` | `files2.example.com.` | `ns1.example.com.` |
+| `A`  | `ns1.example.com.`    | `<server-ip>` |
+
+```sh
+sudo ./gdns2tcp -domain files.example.com,files1.example.com,files2.example.com -p "change-me"
+```
+
+The first domain is canonical (HMAC signatures are computed under it).
+Clients accept the same CSV form in their `-domain` flag.
+
+### Transfer limits
+
+| Parameter | Default | Flag |
+|---|---|---|
+| Max upload size | 32 MiB | `-max-upload-bytes` |
+| Max download source | 256 MiB | `-max-download-bytes` |
+| Server cache | 1 GiB, 24 h TTL | `-cache-max-bytes`, `-cache-ttl` |
+
+Downloads are compressed and encrypted as streaming disk spools — neither
+side holds the full transfer in RAM. The Go client resumes incomplete
+downloads automatically (`-no-resume` to disable).

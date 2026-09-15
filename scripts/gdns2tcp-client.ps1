@@ -443,7 +443,7 @@ using System.Threading.Tasks;
 
 public static class Gdns2TcpDownload {
     private static readonly char[] B32 = "abcdefghijklmnopqrstuvwxyz234567".ToCharArray();
-    private const int TcpDnsPoolSize = 16;
+    private const int DnsPoolSize = 32;
 
     private sealed class TcpDnsSlot {
         public readonly object Gate = new object();
@@ -457,7 +457,7 @@ public static class Gdns2TcpDownload {
     private static int TcpDnsCursor = -1;
 
     private static TcpDnsSlot[] CreateTcpDnsPool() {
-        var slots = new TcpDnsSlot[TcpDnsPoolSize];
+        var slots = new TcpDnsSlot[DnsPoolSize];
         for (int i = 0; i < slots.Length; i++) slots[i] = new TcpDnsSlot();
         return slots;
     }
@@ -494,6 +494,47 @@ public static class Gdns2TcpDownload {
         tcp.NoDelay = true;
         slot.Client = tcp;
         slot.Stream = tcp.GetStream();
+        slot.Server = server;
+        slot.Port = port;
+    }
+
+    private sealed class UdpDnsSlot {
+        public readonly object Gate = new object();
+        public UdpClient Client;
+        public string Server;
+        public int Port;
+    }
+
+    private static readonly UdpDnsSlot[] UdpDnsPool = CreateUdpDnsPool();
+    private static int UdpDnsCursor = -1;
+
+    private static UdpDnsSlot[] CreateUdpDnsPool() {
+        var slots = new UdpDnsSlot[DnsPoolSize];
+        for (int i = 0; i < slots.Length; i++) slots[i] = new UdpDnsSlot();
+        return slots;
+    }
+
+    private static UdpDnsSlot NextUdpDnsSlot() {
+        int cursor = Interlocked.Increment(ref UdpDnsCursor) & int.MaxValue;
+        return UdpDnsPool[cursor % UdpDnsPool.Length];
+    }
+
+    private static void CloseUdpDnsSlot(UdpDnsSlot slot) {
+        try { if (slot.Client != null) slot.Client.Close(); } catch {}
+        slot.Client = null;
+        slot.Server = null;
+        slot.Port = 0;
+    }
+
+    private static void EnsureUdpDnsSlot(UdpDnsSlot slot, string server, int port, int timeoutMs) {
+        if (slot.Client != null &&
+            string.Equals(slot.Server, server, StringComparison.OrdinalIgnoreCase) && slot.Port == port) return;
+        CloseUdpDnsSlot(slot);
+        var udp = new UdpClient();
+        udp.Connect(server, port);
+        udp.Client.SendTimeout = timeoutMs;
+        udp.Client.ReceiveTimeout = timeoutMs;
+        slot.Client = udp;
         slot.Server = server;
         slot.Port = port;
     }
@@ -612,13 +653,17 @@ public static class Gdns2TcpDownload {
 
     private static string QueryOnceUdp(string name, string server, int port, int timeoutMs, ushort id) {
         byte[] q = BuildQuery(name, id);
-        using (var udp = new UdpClient()) {
-            udp.Connect(server, port);
-            udp.Client.SendTimeout = timeoutMs;
-            udp.Client.ReceiveTimeout = timeoutMs;
-            udp.Send(q, q.Length);
-            var ep = new IPEndPoint(IPAddress.Any, 0);
-            return ParseTxt(udp.Receive(ref ep), id);
+        UdpDnsSlot slot = NextUdpDnsSlot();
+        lock (slot.Gate) {
+            try {
+                EnsureUdpDnsSlot(slot, server, port, timeoutMs);
+                slot.Client.Send(q, q.Length);
+                var ep = new IPEndPoint(IPAddress.Any, 0);
+                return ParseTxt(slot.Client.Receive(ref ep), id);
+            } catch {
+                CloseUdpDnsSlot(slot);
+                throw;
+            }
         }
     }
 
@@ -818,6 +863,115 @@ public static class Gdns2TcpDownload {
         return Task.Run(() => DownloadChunksToSpool(
             secret, domain, sid, count, encodedSize, spoolPath, server, port,
             timeoutMs, retries, retryDelayMs, concurrency, tcp, batchSize));
+    }
+
+    public static int CompletedUploadChunks;
+
+    private static string BuildUploadName(string secret, string domain, string sid, int index, string chunkData, string encoding) {
+        string safe = chunkData.Replace("+", "_").Replace("/", "-").Replace("=", "");
+        if (string.Equals(encoding, "base32", StringComparison.OrdinalIgnoreCase))
+            safe = safe.ToLowerInvariant();
+        var chunkLabels = new List<string>();
+        for (int i = 0; i < safe.Length; i += 63)
+            chunkLabels.Add(safe.Substring(i, Math.Min(63, safe.Length - i)));
+        string ts = CurrentMinute();
+        var args = new List<string>();
+        args.Add(sid);
+        args.Add(index.ToString());
+        args.AddRange(chunkLabels);
+        string token = BuildAuthToken(secret, domain, "u", ts, args.ToArray());
+        var parts = new List<string>();
+        parts.AddRange(args);
+        parts.Add(ts);
+        parts.Add(token);
+        parts.Add("u");
+        parts.Add(domain.TrimEnd('.'));
+        return string.Join(".", parts);
+    }
+
+    public static void UploadChunksFromSpool(
+        string secret, string domain, string sid, int chunkCount, int chunkSize,
+        long encodedSize, string encoding, string spoolPath,
+        string server, int port, int timeoutMs, int retries, int retryDelayMs,
+        int concurrency, bool tcp)
+    {
+        int workerCount = Math.Min(Math.Max(1, concurrency), chunkCount);
+        var tasks = new Task[workerCount];
+        var readLock = new object();
+        var errorLock = new object();
+        int nextChunk = -1;
+        int doneFlag = 0;
+        Exception failure = null;
+        using (var spool = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+            for (int worker = 0; worker < workerCount; worker++) {
+                tasks[worker] = Task.Run(() => {
+                    while (true) {
+                        lock (errorLock) { if (failure != null) return; }
+                        if (doneFlag != 0) return;
+                        int idx = Interlocked.Increment(ref nextChunk);
+                        if (idx >= chunkCount) return;
+                        long offset = (long)idx * chunkSize;
+                        int want = (int)Math.Min(chunkSize, encodedSize - offset);
+                        string name;
+                        try {
+                            byte[] buffer = new byte[want];
+                            lock (readLock) {
+                                spool.Position = offset;
+                                int read = 0;
+                                while (read < want) {
+                                    int n = spool.Read(buffer, read, want - read);
+                                    if (n <= 0) throw new Exception("Unexpected end of upload spool at chunk " + idx);
+                                    read += n;
+                                }
+                            }
+                            name = BuildUploadName(secret, domain, sid, idx,
+                                Encoding.ASCII.GetString(buffer), encoding);
+                        } catch (Exception ex) {
+                            lock (errorLock) { if (failure == null) failure = ex; }
+                            return;
+                        }
+                        ushort qid = (ushort)((idx % 65534) + 1);
+                        Exception last = null;
+                        for (int att = 0; att < retries; att++) {
+                            try {
+                                string response = tcp
+                                    ? QueryOnceTcp(name, server, port, timeoutMs, qid)
+                                    : QueryOnceUdp(name, server, port, timeoutMs, qid);
+                                int respVal;
+                                if (!int.TryParse(response, out respVal))
+                                    throw new Exception("Server returned upload error: " + response);
+                                if (respVal == -1) Interlocked.Exchange(ref doneFlag, 1);
+                                Interlocked.Increment(ref CompletedUploadChunks);
+                                last = null;
+                                break;
+                            } catch (Exception ex) {
+                                last = ex;
+                                if (att < retries - 1) Thread.Sleep(retryDelayMs);
+                            }
+                        }
+                        if (last != null) {
+                            lock (errorLock) { if (failure == null) failure = last; }
+                            return;
+                        }
+                    }
+                });
+            }
+            Task.WaitAll(tasks);
+            if (failure != null)
+                throw new Exception("parallel chunk upload: " + failure.Message, failure);
+        }
+    }
+
+    public static Task BeginUploadChunksFromSpool(
+        string secret, string domain, string sid, int chunkCount, int chunkSize,
+        long encodedSize, string encoding, string spoolPath,
+        string server, int port, int timeoutMs, int retries, int retryDelayMs,
+        int concurrency, bool tcp)
+    {
+        CompletedUploadChunks = 0;
+        return Task.Run(() => UploadChunksFromSpool(
+            secret, domain, sid, chunkCount, chunkSize, encodedSize, encoding,
+            spoolPath, server, port, timeoutMs, retries, retryDelayMs, concurrency, tcp));
     }
 
     private static byte[] Pbkdf2Sha256(byte[] password, byte[] salt, int iterations, int length) {
@@ -1582,38 +1736,63 @@ function Invoke-Upload {
         $initResponse = Invoke-TxtQueryOne -Name $initName
         if ($initResponse -ne 'Ready to file uploading') { throw "Upload initialization failed: $initResponse" }
 
-        $spool = [System.IO.File]::OpenRead($spoolPath)
         $uploadStart = Get-Date
-        [int]$chunkIndex = 0
-        while ($true) {
-            if ($chunkIndex -eq -1) { break }
-            if ($chunkIndex -lt 0) { throw "Server signaled upload failure with code $chunkIndex." }
-            if ($chunkIndex -ge $chunkCount) { throw "Server requested chunk $chunkIndex outside prepared range." }
-            [int64]$offset = [int64]$chunkIndex * $effectiveChunkSize
-            [int]$want = [int][Math]::Min($effectiveChunkSize, $encodedSize - $offset)
-            [byte[]]$buffer = New-Object byte[] $want
-            $spool.Position = $offset
-            [int]$read = 0
-            while ($read -lt $want) {
-                $n = $spool.Read($buffer, $read, $want - $read)
-                if ($n -le 0) { throw "Unexpected end of upload spool at chunk $chunkIndex." }
-                $read += $n
+        $parallelDone = $false
+
+        if (-not [string]::IsNullOrWhiteSpace($DnsServer)) {
+            try {
+                $proto = if ($Tcp) { 'TCP' } else { 'UDP' }
+                Write-Log -Level 'INFO' -Message "Uploading from disk spool over $proto (up to $Parallelism concurrent)."
+                $task = [Gdns2TcpDownload]::BeginUploadChunksFromSpool(
+                    $Pass, $script:DomainName, $sid, $chunkCount, $effectiveChunkSize,
+                    $encodedSize, $encoding, $spoolPath,
+                    $DnsServer, $DnsPort, 5000, $Retries, ($RetryDelaySeconds * 1000), $Parallelism, $Tcp.IsPresent
+                )
+                while (-not $task.IsCompleted) {
+                    $done = [Gdns2TcpDownload]::CompletedUploadChunks
+                    $elapsed = ((Get-Date) - $uploadStart).TotalSeconds
+                    $percent = [Math]::Min(100, [Math]::Round(($done / $chunkCount) * 100, 1))
+                    $status = "$done of $chunkCount chunks"
+                    if ($elapsed -gt 0.5 -and $done -gt 0) { $status += '  ' + (Format-TransferRate -BytesPerSecond ($done * $effectiveChunkSize / $elapsed)) }
+                    Write-Progress -Activity 'Uploading file' -Status $status -PercentComplete $percent
+                    Start-Sleep -Milliseconds 250
+                }
+                $task.GetAwaiter().GetResult()
+                Write-Progress -Activity 'Uploading file' -Completed
+                $parallelDone = $true
             }
-            $safeChunk = ConvertTo-DnsSafeChunk -Chunk ([System.Text.Encoding]::ASCII.GetString($buffer)) -Encoding $encoding
-            $labels = @(Split-StringFixed -Value $safeChunk -Size 63)
-            $request = New-AuthenticatedName -Command 'u' -Args (@($sid, [string]($chunkIndex)) + $labels)
-            if ($request.Length -gt 253) { throw "DNS query name for chunk $chunkIndex is $($request.Length) characters (limit 253). Reduce -ChunkSize or use a shorter domain." }
-            $response = Invoke-TxtQueryOne -Name $request
-            [int]$nextIndex = 0
-            if (-not [int]::TryParse($response, [ref]$nextIndex)) { throw "Server returned an upload error: $response" }
-            $chunkIndex = $nextIndex
-            $completed = if ($chunkIndex -lt 0) { $chunkCount } else { $chunkIndex }
-            $elapsed = ((Get-Date) - $uploadStart).TotalSeconds
-            $status = "$completed of $chunkCount chunks"
-            if ($elapsed -gt 0.5 -and $completed -gt 0) { $status += '  ' + (Format-TransferRate -BytesPerSecond ($completed * $effectiveChunkSize / $elapsed)) }
-            Write-Progress -Activity 'Uploading file' -Status $status -PercentComplete ([Math]::Min(100, [Math]::Round(($completed / $chunkCount) * 100, 1)))
+            catch { Write-Log -Level 'WARN' -Message "Parallel upload failed, retrying sequentially: $_" }
         }
-        Write-Progress -Activity 'Uploading file' -Completed
+
+        if (-not $parallelDone) {
+            $spool = [System.IO.File]::OpenRead($spoolPath)
+            for ([int]$chunkIndex = 0; $chunkIndex -lt $chunkCount; $chunkIndex++) {
+                [int64]$offset = [int64]$chunkIndex * $effectiveChunkSize
+                [int]$want = [int][Math]::Min($effectiveChunkSize, $encodedSize - $offset)
+                [byte[]]$buffer = New-Object byte[] $want
+                $spool.Position = $offset
+                [int]$read = 0
+                while ($read -lt $want) {
+                    $n = $spool.Read($buffer, $read, $want - $read)
+                    if ($n -le 0) { throw "Unexpected end of upload spool at chunk $chunkIndex." }
+                    $read += $n
+                }
+                $safeChunk = ConvertTo-DnsSafeChunk -Chunk ([System.Text.Encoding]::ASCII.GetString($buffer)) -Encoding $encoding
+                $labels = @(Split-StringFixed -Value $safeChunk -Size 63)
+                $request = New-AuthenticatedName -Command 'u' -Args (@($sid, [string]($chunkIndex)) + $labels)
+                if ($request.Length -gt 253) { throw "DNS query name for chunk $chunkIndex is $($request.Length) characters (limit 253). Reduce -ChunkSize or use a shorter domain." }
+                $response = Invoke-TxtQueryOne -Name $request
+                [int]$ack = 0
+                if (-not [int]::TryParse($response, [ref]$ack)) { throw "Server returned an upload error: $response" }
+                if ($ack -eq -1) { break }
+                $completed = $chunkIndex + 1
+                $elapsed = ((Get-Date) - $uploadStart).TotalSeconds
+                $status = "$completed of $chunkCount chunks"
+                if ($elapsed -gt 0.5 -and $completed -gt 0) { $status += '  ' + (Format-TransferRate -BytesPerSecond ($completed * $effectiveChunkSize / $elapsed)) }
+                Write-Progress -Activity 'Uploading file' -Status $status -PercentComplete ([Math]::Min(100, [Math]::Round(($completed / $chunkCount) * 100, 1)))
+            }
+            Write-Progress -Activity 'Uploading file' -Completed
+        }
         Write-Log -Level 'INFO' -Message 'Upload completed.'
     }
     finally {

@@ -441,8 +441,14 @@ func (s *Server) handleTXTOnDomain(name, matchedDomain, client string) []string 
 		return s.clientManifest("win", client)
 	case "cl":
 		return s.clientChunk("win", args, client)
+	case "boot":
+		return s.clientBootstrap("", client)
+	case "boot-proxy":
+		return s.clientBootstrap("proxy", client)
+	case "boot-ps1":
+		return s.clientBootstrap("ps1", client)
 	case "lazy", "base64":
-		return []string{"Automatic remote PowerShell execution is disabled. Download clients manually through client-win/client-linux-amd64/client-linux-arm64/client-darwin-amd64/client-darwin-arm64 endpoints."}
+		return []string{"Automatic remote PowerShell execution is disabled. Download clients manually through client-win/client-linux-amd64/client-linux-arm64/client-darwin-amd64/client-darwin-arm64/client-windows-amd64/client-windows-arm64 endpoints."}
 	default:
 		if strings.HasPrefix(command, "client-") {
 			return s.clientManifest(strings.TrimPrefix(command, "client-"), client)
@@ -1242,6 +1248,61 @@ func (s *Server) clientBatch(alias string, args []string, client string) []strin
 	out = append(out, "s:"+hex.EncodeToString(sum[:]))
 	out = append(out, chunks...)
 	return out
+}
+
+// clientBootstrapTemplate is a compact bash script that fetches and verifies
+// a client artifact over DNS.  Placeholders:
+//   - {{DOMAIN}}  — canonical domain without trailing dot
+//   - {{ALIAS}}   — alias-setup line(s)
+//   - {{FINISH}}  — chmod+echo or just echo
+//
+// The script honours $S (DNS server IP, optional) from the environment.
+var clientBootstrapTemplate = strings.Join([]string{
+	`set -e;D='{{DOMAIN}}'`,
+	`{{ALIAS}}`,
+	`B=14;P=16;NL=$(printf '\n')`,
+	`q(){ for i in 1 2 3;do o=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT|tr -d "\"$NL ");[ -n "$o" ]&&{ printf %s "$o";return;};sleep .5;done;return 1;}`,
+	`qb(){ for i in 1 2 3;do r=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT|tr -d \"|tr "$NL" ' ');d=$(printf %s "$r"|awk '{for(i=2;i<=NF;i++)printf"%s",$i}');[ -n "$d" ]&&{ printf %s "$d";return;};sleep .5;done;return 1;}`,
+	`m=$(q "client-$A.$D")||exit 1;NAME=${m%%|*};r=${m#*|};N=${r%%|*};SHA=${r#*|}`,
+	`T=$(mktemp -d);i=0;k=0`,
+	`while [ $i -lt $N ];do c=$B;[ $((i+c)) -gt $N ]&&c=$((N-i));(qb "$i.$c.clb-$A.$D">"$T/$k"||touch "$T/.e")&;i=$((i+c));k=$((k+1));[ $((k%P)) -eq 0 ]&&wait;done;wait`,
+	`[ -f "$T/.e" ]&&{ rm -rf "$T";echo fetch failed>&2;exit 1;}`,
+	`F=$(mktemp);j=0;while [ $j -lt $k ];do cat "$T/$j">>"$F";j=$((j+1));done;rm -rf "$T"`,
+	`base64 -d<"$F">"$NAME" 2>/dev/null||base64 -D<"$F">"$NAME";rm "$F"`,
+	`printf "%s  %s\n" "$SHA" "$NAME"|shasum -a 256 -c -||{ rm -f "$NAME";exit 1;}`,
+	`{{FINISH}}`,
+}, "\n")
+
+// clientBootstrap returns a base64-encoded bash bootstrap script as TXT
+// character-strings. The caller decodes and runs it with:
+//
+//	dig +short +tcp TXT boot.DOMAIN | tr -d '" ' | base64 -d | sh
+//
+// kind selects the artifact type: "" = file client (auto-detect OS/arch),
+// "proxy" = proxy agent, "ps1" = PowerShell client.
+func (s *Server) clientBootstrap(kind, client string) []string {
+	var aliasSetup, finishLine string
+	switch kind {
+	case "proxy":
+		aliasSetup = `os=$(uname -s|tr A-Z a-z);a=$(uname -m);case "$a" in x86_64|amd64)a=amd64;;aarch64|arm64)a=arm64;;*)echo "unsupported arch: $a">&2;exit 1;;esac;A="client-proxy-$os-$a"`
+		finishLine = `chmod +x "$NAME";echo "saved ./$NAME"`
+	case "ps1":
+		aliasSetup = `A=win`
+		finishLine = `echo "saved ./$NAME"`
+	default:
+		kind = "client"
+		aliasSetup = `os=$(uname -s|tr A-Z a-z);a=$(uname -m);case "$a" in x86_64|amd64)a=amd64;;aarch64|arm64)a=arm64;;*)echo "unsupported arch: $a">&2;exit 1;;esac;A="$os-$a"`
+		finishLine = `chmod +x "$NAME";echo "saved ./$NAME"`
+	}
+	domain := strings.TrimSuffix(s.domain, ".")
+	script := strings.NewReplacer(
+		"{{DOMAIN}}", domain,
+		"{{ALIAS}}", aliasSetup,
+		"{{FINISH}}", finishLine,
+	).Replace(clientBootstrapTemplate)
+	s.logger.Printf("client %s requested bootstrap (kind=%s)", client, kind)
+	encoded := base64.StdEncoding.EncodeToString([]byte(script))
+	return codec.ChunkString(encoded, clientChunkSize)
 }
 
 func (s *Server) logClientArtifactProgress(client, alias string, artifact clientArtifact, index int) {
