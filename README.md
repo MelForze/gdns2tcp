@@ -55,7 +55,7 @@ transfer is SHA256-verified.
 
 ```sh
 make clients servers     # cross-compile all binaries → ./clients + ./servers
-make build               # current platform only → ./gdns2tcp, ./gdns2tcp-client, ./gdns2tcp-client-proxy
+make build               # current platform only → ./servers/gdns2tcp, ./gdns2tcp-client, ./gdns2tcp-client-proxy
 ```
 
 ### 2. Delegate the DNS zone
@@ -84,7 +84,7 @@ every client instead.
 ### 3. Run the server
 
 ```sh
-sudo ./gdns2tcp -domain files.example.com -p "change-me"
+sudo ./servers/gdns2tcp -domain files.example.com -p "change-me"
 ```
 
 Listens on UDP+TCP :53 and serves client binaries from `./clients`.
@@ -146,7 +146,7 @@ Tunnel encryption: AES-256-GCM keyed by `(secret, cid)`.
 
 ```sh
 # Server — enable proxy and expose SOCKS5
-sudo ./gdns2tcp -domain files.example.com -p "change-me" \
+sudo ./servers/gdns2tcp -domain files.example.com -p "change-me" \
   -allow-proxy -socks-listen 0.0.0.0:9050 -socks-no-auth
 ```
 

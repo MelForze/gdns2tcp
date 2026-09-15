@@ -15,10 +15,10 @@ PROXY_PKG  := ./cmd/gdns2tcp-client-proxy
 
 all: build
 
-build:
-	go build -o ./gdns2tcp ./cmd/gdns2tcp
-	go build -o ./gdns2tcp-client ./cmd/gdns2tcp-client
-	go build -o ./gdns2tcp-client-proxy ./cmd/gdns2tcp-client-proxy
+build: | .clients-dir .servers-dir
+	go build -o $(SERVER_DIR)/gdns2tcp $(SERVER_PKG)
+	go build -o $(BUILD_DIR)/gdns2tcp-client $(CLIENT_PKG)
+	go build -o $(BUILD_DIR)/gdns2tcp-client-proxy $(PROXY_PKG)
 
 .clients-dir:
 	mkdir -p $(BUILD_DIR)
