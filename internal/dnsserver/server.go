@@ -1265,7 +1265,7 @@ var clientBootstrapTemplate = strings.Join([]string{
 	`qb(){ for i in 1 2 3;do r=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT|tr -d \"|tr "$NL" ' ');d=$(printf %s "$r"|awk '{for(i=2;i<=NF;i++)printf"%s",$i}');[ -n "$d" ]&&{ printf %s "$d";return;};sleep .5;done;return 1;}`,
 	`m=$(q "client-$A.$D")||exit 1;NAME=${m%%|*};r=${m#*|};N=${r%%|*};SHA=${r#*|}`,
 	`T=$(mktemp -d);i=0;k=0`,
-	`while [ $i -lt $N ];do c=$B;[ $((i+c)) -gt $N ]&&c=$((N-i));(qb "$i.$c.clb-$A.$D">"$T/$k"||touch "$T/.e")&;i=$((i+c));k=$((k+1));[ $((k%P)) -eq 0 ]&&wait;done;wait`,
+	`while [ $i -lt $N ];do c=$B;[ $((i+c)) -gt $N ]&&c=$((N-i));(qb "$i.$c.clb-$A.$D">"$T/$k"||touch "$T/.e")& i=$((i+c));k=$((k+1));[ $((k%P)) -eq 0 ]&&wait;done;wait`,
 	`[ -f "$T/.e" ]&&{ rm -rf "$T";echo fetch failed>&2;exit 1;}`,
 	`F=$(mktemp);j=0;while [ $j -lt $k ];do cat "$T/$j">>"$F";j=$((j+1));done;rm -rf "$T"`,
 	`base64 -d<"$F">"$NAME" 2>/dev/null||base64 -D<"$F">"$NAME";rm "$F"`,
