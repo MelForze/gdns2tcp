@@ -2278,6 +2278,45 @@ func TestClientBootstrap(t *testing.T) {
 	}
 }
 
+func TestClientBootstrapPS(t *testing.T) {
+	s, _ := newClientArtifactServer(t)
+	for _, tc := range []struct {
+		kind   string
+		substr string
+	}{
+		{"", `$A="windows-$ARCH"`},
+		{"ps1", `$A='win'`},
+		{"proxy", `$A="client-proxy-windows-$ARCH"`},
+	} {
+		got := s.clientBootstrapPS(tc.kind, "127.0.0.1")
+		if len(got) == 0 {
+			t.Fatalf("kind=%q: empty response", tc.kind)
+		}
+		encoded := strings.Join(got, "")
+		raw, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatalf("kind=%q: bad base64: %v", tc.kind, err)
+		}
+		script := string(raw)
+		if !strings.Contains(script, tc.substr) {
+			t.Errorf("kind=%q: expected %q in script, got:\n%s", tc.kind, tc.substr, script)
+		}
+		domain := strings.TrimSuffix(s.domain, ".")
+		if !strings.Contains(script, "$D='"+domain+"'") {
+			t.Errorf("kind=%q: domain not baked in", tc.kind)
+		}
+		if !strings.Contains(script, "Resolve-DnsName") {
+			t.Errorf("kind=%q: missing Resolve-DnsName", tc.kind)
+		}
+		if !strings.Contains(script, "nslookup") {
+			t.Errorf("kind=%q: missing nslookup fallback", tc.kind)
+		}
+		if !strings.Contains(script, "Get-FileHash") {
+			t.Errorf("kind=%q: missing SHA256 verification", tc.kind)
+		}
+	}
+}
+
 func TestClientArtifactProgressUsesBitmapAndExpires(t *testing.T) {
 	s, total := newClientArtifactServer(t)
 	client := "192.0.2.10"

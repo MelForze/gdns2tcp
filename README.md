@@ -105,10 +105,32 @@ dig +short +tcp TXT boot-proxy.files.example.com | tr -d '" ' | base64 -d | sh
 dig +short +tcp TXT boot-ps1.files.example.com | tr -d '" ' | base64 -d | sh
 ```
 
+**Windows PowerShell** (no `dig` needed — uses `Resolve-DnsName` or
+`nslookup`):
+
+```powershell
+# Go file client (.exe) — auto-detects arch
+$t=(Resolve-DnsName pboot.files.example.com -Type TXT -TcpOnly).Strings -join ""
+iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t)))
+
+# PowerShell client (.ps1)
+$t=(Resolve-DnsName pboot-ps1.files.example.com -Type TXT -TcpOnly).Strings -join ""
+iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t)))
+
+# Proxy agent (.exe)
+$t=(Resolve-DnsName pboot-proxy.files.example.com -Type TXT -TcpOnly).Strings -join ""
+iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t)))
+```
+
 To query the server directly (before delegation is live):
 
 ```sh
 dig +short +tcp @<server-ip> TXT boot.files.example.com | tr -d '" ' | base64 -d | S=<server-ip> sh
+```
+
+```powershell
+$t=(Resolve-DnsName pboot.files.example.com -Type TXT -TcpOnly -Server <server-ip>).Strings -join ""
+$S="<server-ip>"; iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t)))
 ```
 
 ### 5. Transfer files
@@ -151,13 +173,15 @@ sudo ./servers/gdns2tcp -domain files.example.com -p "change-me" \
 ```
 
 ```sh
-# Agent — fetch and run
+# Agent (Linux / macOS) — fetch and run
 dig +short +tcp TXT boot-proxy.files.example.com | tr -d '" ' | base64 -d | sh
 ./gdns2tcp-client-proxy -d files.example.com -p "change-me"
 ```
 
 ```powershell
-# Agent (Windows)
+# Agent (Windows) — fetch and run
+$t=(Resolve-DnsName pboot-proxy.files.example.com -Type TXT -TcpOnly).Strings -join ""
+iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t)))
 .\gdns2tcp-client-proxy-windows-amd64.exe -d files.example.com -p "change-me"
 ```
 

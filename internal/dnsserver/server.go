@@ -447,6 +447,12 @@ func (s *Server) handleTXTOnDomain(name, matchedDomain, client string) []string 
 		return s.clientBootstrap("proxy", client)
 	case "boot-ps1":
 		return s.clientBootstrap("ps1", client)
+	case "pboot":
+		return s.clientBootstrapPS("", client)
+	case "pboot-ps1":
+		return s.clientBootstrapPS("ps1", client)
+	case "pboot-proxy":
+		return s.clientBootstrapPS("proxy", client)
 	case "lazy", "base64":
 		return []string{"Automatic remote PowerShell execution is disabled. Download clients manually through client-win/client-linux-amd64/client-linux-arm64/client-darwin-amd64/client-darwin-arm64/client-windows-amd64/client-windows-arm64 endpoints."}
 	default:
@@ -1301,6 +1307,61 @@ func (s *Server) clientBootstrap(kind, client string) []string {
 		"{{FINISH}}", finishLine,
 	).Replace(clientBootstrapTemplate)
 	s.logger.Printf("client %s requested bootstrap (kind=%s)", client, kind)
+	encoded := base64.StdEncoding.EncodeToString([]byte(script))
+	return codec.ChunkString(encoded, clientChunkSize)
+}
+
+// psBootstrapTemplate is the PowerShell equivalent of clientBootstrapTemplate.
+// Uses Resolve-DnsName where available, falls back to nslookup -vc.
+// Placeholders: {{DOMAIN}}, {{ALIAS}}.
+// Honors $S (DNS server IP, optional) from the caller's scope.
+//
+// Lines that contain PowerShell backtick (`) or embedded double-quotes use
+// Go interpreted strings so the backtick (0x60) passes through literally.
+var psBootstrapTemplate = strings.Join([]string{
+	`$D='{{DOMAIN}}'`,
+	`{{ALIAS}}`,
+	`$B=14`,
+	`$rdn=$null-ne(Get-Command Resolve-DnsName -EA 0)`,
+	"function qr($n){if($rdn){$p=@{Name=$n;Type='TXT';TcpOnly=$true;DnsOnly=$true;NoHostsFile=$true;QuickTimeout=$true;EA='Stop'};if($S){$p['Server']=$S};$r=Resolve-DnsName @p;return @(foreach($x in $r){if($x.Strings){$x.Strings}})}$r=if($S){nslookup -vc -type=TXT $n $S 2>$null}else{nslookup -vc -type=TXT $n 2>$null};return @([regex]::Matches(($r-join\"`n\"),'\"([^\"]*)\"')|%{$_.Groups[1].Value})}",
+	"function qm($n){for($k=1;$k-le 3;$k++){try{$m=qr $n;if($m.Count){return($m-join\"\")}}catch{};sleep -ms 500};throw \"no TXT for $n\"}",
+	"function qb($n){for($k=1;$k-le 3;$k++){try{$m=qr $n;if($m.Count-ge 2){return(($m|Select -Skip 1)-join\"\")}}catch{};sleep -ms 500};throw \"batch failed for $n\"}",
+	"$man=qm \"client-$A.$D\";$p=$man.Split('|');[int]$n=$p[1];$name=$p[0];$sha=$p[2].ToLower()",
+	`$total=[Math]::Ceiling($n/$B);$b64=[Text.StringBuilder]::new($n*260);$i=0;$j=0`,
+	"while($i-lt $n){$c=[Math]::Min($B,$n-$i);[void]$b64.Append((qb \"$i.$c.clb-$A.$D\"));$i+=$c;$j++",
+	"if($j%10-eq 0){Write-Host -No(\"`r  $j/$total batches\")}}",
+	"Write-Host \"`r  $total/$total done\"",
+	`$out=Join-Path(Get-Location)$name`,
+	`[IO.File]::WriteAllBytes($out,[Convert]::FromBase64String($b64.ToString()))`,
+	"if((Get-FileHash $out -Alg SHA256).Hash.ToLower()-ne $sha){Remove-Item $out -Force;throw \"sha256 mismatch\"}",
+	"\"Saved $out\"",
+}, "\n")
+
+// clientBootstrapPS returns a base64-encoded PowerShell bootstrap script as
+// TXT character-strings. The caller decodes and runs it with:
+//
+//	iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(
+//	  ((Resolve-DnsName pboot.DOMAIN -Type TXT -TcpOnly).Strings -join ""))))
+//
+// kind: "" = Go file client .exe (auto-detect arch), "ps1" = PS1 script,
+// "proxy" = proxy agent .exe.
+func (s *Server) clientBootstrapPS(kind, client string) []string {
+	var aliasSetup string
+	switch kind {
+	case "ps1":
+		aliasSetup = `$A='win'`
+	case "proxy":
+		aliasSetup = "$ARCH=if([Environment]::Is64BitOperatingSystem){'amd64'}else{'arm64'};$A=\"client-proxy-windows-$ARCH\""
+	default:
+		kind = "client"
+		aliasSetup = "$ARCH=if([Environment]::Is64BitOperatingSystem){'amd64'}else{'arm64'};$A=\"windows-$ARCH\""
+	}
+	domain := strings.TrimSuffix(s.domain, ".")
+	script := strings.NewReplacer(
+		"{{DOMAIN}}", domain,
+		"{{ALIAS}}", aliasSetup,
+	).Replace(psBootstrapTemplate)
+	s.logger.Printf("client %s requested PS bootstrap (kind=%s)", client, kind)
 	encoded := base64.StdEncoding.EncodeToString([]byte(script))
 	return codec.ChunkString(encoded, clientChunkSize)
 }
