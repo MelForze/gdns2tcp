@@ -57,8 +57,15 @@ transfer is SHA256-verified.
 make clients servers     # cross-compile all binaries → ./clients + ./servers
 make build               # current platform only → ./servers/gdns2tcp, ./gdns2tcp-client, ./gdns2tcp-client-proxy
 ```
+### 2. Run the server
 
-### 2. Delegate the DNS zone
+```sh
+sudo ./servers/gdns2tcp -domain files.example.com -p "change-me"
+```
+
+Listens on UDP+TCP :53 and serves client binaries from `./clients`.
+
+### 3. Delegate the DNS zone
 
 Add NS + A records in the **parent** zone so that recursive resolvers
 forward queries for `files.example.com` to your server:
@@ -80,14 +87,6 @@ gdns2tcp through the delegation. gdns2tcp only answers TXT queries;
 
 For local/private testing without delegation, pass `-ds <server-ip>` to
 every client instead.
-
-### 3. Run the server
-
-```sh
-sudo ./servers/gdns2tcp -domain files.example.com -p "change-me"
-```
-
-Listens on UDP+TCP :53 and serves client binaries from `./clients`.
 
 ### 4. Fetch a client over DNS
 
