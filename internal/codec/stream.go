@@ -160,8 +160,11 @@ func DecompressFileLimit(src, dst string, maxBytes int64) (int64, error) {
 			_ = os.Remove(dst)
 		}
 	}()
-	lw := &limitWriter{w: out, remain: maxBytes}
-	n, err := io.CopyBuffer(lw, zr, make([]byte, 64*1024))
+	var w io.Writer = out
+	if maxBytes > 0 {
+		w = &limitWriter{w: out, remain: maxBytes}
+	}
+	n, err := io.CopyBuffer(w, zr, make([]byte, 64*1024))
 	if err != nil {
 		return 0, err
 	}
@@ -259,7 +262,7 @@ type limitWriter struct {
 }
 
 func (w *limitWriter) Write(p []byte) (int, error) {
-	if w.remain >= 0 && int64(len(p)) > w.remain {
+	if w.remain < int64(len(p)) {
 		return 0, fmt.Errorf("decompressed data exceeds configured byte limit")
 	}
 	n, err := w.w.Write(p)

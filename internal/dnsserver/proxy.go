@@ -269,8 +269,7 @@ func (rc *reverseConn) commitOperatorWrite(batch net.Buffers) error {
 
 // drainBatchSize caps how many chunks a single writev can carry. The cap
 // keeps any one drain from monopolising rc.mu and lets other axchg calls
-// progress between batches. 32 is a multiple of the awriteWindow=64 so an
-// already-buffered burst clears in two batches.
+// progress between batches.
 const drainBatchSize = 32
 
 // awaitReadData parks the caller for up to window while waiting for new
@@ -903,10 +902,29 @@ func (s *Server) reversePumpOperator(cid string, rc *reverseConn) {
 			rc.mu.Unlock()
 		}
 		if err != nil {
-			s.reverseCloseConn(cid, rc, "operator EOF/error: "+err.Error())
+			if errors.Is(err, io.EOF) {
+				s.reverseHalfCloseOp(cid, rc)
+			} else {
+				s.reverseCloseConn(cid, rc, "operator error: "+err.Error())
+			}
 			return
 		}
 	}
+}
+
+// reverseHalfCloseOp marks the operator's write direction as finished
+// (opClosed) without tearing down the full tunnel. The agent can still
+// send response data via awrite; it will learn about operator EOF when
+// aread drains the remaining buffer and returns CLOSED.
+func (s *Server) reverseHalfCloseOp(cid string, rc *reverseConn) {
+	rc.mu.Lock()
+	if !rc.opClosed {
+		rc.opClosed = true
+		rc.opCond.Broadcast()
+		rc.signalReadersForBufferLocked()
+	}
+	rc.mu.Unlock()
+	s.logger.Printf("reverse half-close op cid=%s", cid)
 }
 
 // reverseCloseConn marks the tunnel as closed from one side and removes it
@@ -1333,7 +1351,7 @@ func (s *Server) proxyAgentWrite(args []string, now time.Time) []string {
 	}
 
 	rc.mu.Lock()
-	if rc.opClosed || rc.agentClosed {
+	if rc.agentClosed {
 		rc.mu.Unlock()
 		return []string{"ERR closed"}
 	}
@@ -1592,7 +1610,7 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 // ("ACK <seq>", "ERR ...") to put on the first response line.
 func (s *Server) applyAxchgWrite(rc *reverseConn, seq uint64, dataLabels []string, now time.Time) string {
 	rc.mu.Lock()
-	if rc.opClosed || rc.agentClosed {
+	if rc.agentClosed {
 		rc.mu.Unlock()
 		return "ERR closed"
 	}

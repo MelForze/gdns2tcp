@@ -2,6 +2,7 @@ package dnsserver
 
 import (
 	"bytes"
+	"container/list"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
@@ -516,7 +517,6 @@ func TestExpiredUploadCleanupRemovesPartialFile(t *testing.T) {
 		t.Fatalf("partial spool missing before cleanup: %v", err)
 	}
 	state.expires = time.Now().Add(-time.Minute)
-	s.uploads["expireme"] = state
 	s.cleanupExpiredLocked(time.Now())
 	_, exists := s.uploads["expireme"]
 	s.mu.Unlock()
@@ -1101,7 +1101,8 @@ func TestDownloadCacheReadAndEvictionErrorBranches(t *testing.T) {
 		spoolPath: filepath.Join(t.TempDir(), "missing"), encodedSize: 1,
 		chunkCount: 1, lastAccess: now, expires: now.Add(time.Hour),
 	}
-	s.downloadCacheOrder = []string{"missing-spool"}
+	s.downloadCacheOrder = list.New()
+	s.downloadCacheIndex = map[string]*list.Element{"missing-spool": s.downloadCacheOrder.PushBack("missing-spool")}
 	if _, err := s.readCacheChunks("missing-spool", 0, 1, now); err == nil {
 		t.Fatal("missing spool read succeeded")
 	}
@@ -1130,7 +1131,11 @@ func TestDownloadCacheReadAndEvictionErrorBranches(t *testing.T) {
 		"active":   {spoolPath: activePath, encodedSize: 10, active: 1, expires: now.Add(time.Hour)},
 		"inactive": {spoolPath: inactivePath, encodedSize: 10, expires: now.Add(time.Hour)},
 	}
-	s.downloadCacheOrder = []string{"stale-order-key", "active", "inactive"}
+	s.downloadCacheOrder = list.New()
+	s.downloadCacheIndex = make(map[string]*list.Element)
+	for _, k := range []string{"stale-order-key", "active", "inactive"} {
+		s.downloadCacheIndex[k] = s.downloadCacheOrder.PushBack(k)
+	}
 	s.downloadCacheBytes = 20
 	s.cacheMaxBytes = 1
 	s.evictDownloadCacheLocked(now)
@@ -1634,7 +1639,6 @@ func TestFinishUploadWriteError(t *testing.T) {
 	s.mu.Lock()
 	state := s.uploads[sid]
 	state.spool.Close()
-	s.uploads[sid] = state
 	s.mu.Unlock()
 
 	// Send the final chunk; writeAll on the closed spool will fail.
@@ -1979,7 +1983,11 @@ func TestEvictDownloadCacheSkipsStaleOrderAndStopsWhenAllActive(t *testing.T) {
 		"active": {encodedSize: 10, active: 1, expires: now.Add(time.Hour)},
 	}
 	s.downloadCacheBytes = 10
-	s.downloadCacheOrder = []string{"missing", "active"}
+	s.downloadCacheOrder = list.New()
+	s.downloadCacheIndex = make(map[string]*list.Element)
+	for _, k := range []string{"missing", "active"} {
+		s.downloadCacheIndex[k] = s.downloadCacheOrder.PushBack(k)
+	}
 	s.evictDownloadCacheLocked(now)
 	_, retained := s.downloadCache["active"]
 	s.mu.Unlock()
@@ -2313,6 +2321,24 @@ func TestClientBootstrapPS(t *testing.T) {
 		}
 		if !strings.Contains(script, "Get-FileHash") {
 			t.Errorf("kind=%q: missing SHA256 verification", tc.kind)
+		}
+	}
+}
+
+func TestClientBootstrapPSArchDetection(t *testing.T) {
+	s, _ := newClientArtifactServer(t)
+	for _, kind := range []string{"", "proxy"} {
+		got := s.clientBootstrapPS(kind, "127.0.0.1")
+		raw, err := base64.StdEncoding.DecodeString(strings.Join(got, ""))
+		if err != nil {
+			t.Fatalf("kind=%q: bad base64: %v", kind, err)
+		}
+		script := string(raw)
+		if strings.Contains(script, "Is64BitOperatingSystem") {
+			t.Errorf("kind=%q: uses Is64BitOperatingSystem which misdetects ARM64 as amd64", kind)
+		}
+		if !strings.Contains(script, "PROCESSOR_ARCHITECTURE") {
+			t.Errorf("kind=%q: should use PROCESSOR_ARCHITECTURE for arch detection", kind)
 		}
 	}
 }
@@ -4031,6 +4057,81 @@ func TestProxyAgentExchangeWriteAndRead(t *testing.T) {
 
 	if got := <-gotCh; got != "agent-bytes" {
 		t.Fatalf("operator got %q want %q", got, "agent-bytes")
+	}
+}
+
+func TestReverseHalfCloseAllowsAgentWrite(t *testing.T) {
+	s := proxyTestServer(t)
+	op, opRemote := net.Pipe()
+	t.Cleanup(func() { _ = op.Close(); _ = opRemote.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	// Seed op→agent buffer and then half-close the operator side.
+	rc.mu.Lock()
+	rc.opToAgent.Write([]byte("request"))
+	rc.mu.Unlock()
+	s.reverseHalfCloseOp(cid, rc)
+
+	// opClosed should be true, agentClosed false.
+	rc.mu.Lock()
+	if !rc.opClosed {
+		t.Fatal("opClosed should be true after half-close")
+	}
+	if rc.agentClosed {
+		t.Fatal("agentClosed should be false after half-close")
+	}
+	rc.mu.Unlock()
+
+	// Agent should still be able to write after operator half-close.
+	seal := func(seq uint64, data []byte) string {
+		ct := gproxy.SealChunk(rc.aead, gproxy.DirClientToServer, seq, rc.compressor.Encode(data))
+		return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(ct))
+	}
+	enc1 := seal(1, []byte("response"))
+
+	gotCh := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_ = opRemote.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _ := opRemote.Read(buf)
+		gotCh <- string(buf[:n])
+	}()
+
+	smac := protocol.SessionMAC(rc.sessionKey, "awrite", 1)
+	args := []string{cid, "1", enc1, smac}
+	resp := s.proxyAgentWrite(args, time.Now().UTC())
+	if len(resp) < 1 || resp[0] != "OK" {
+		t.Fatalf("awrite after half-close should succeed, got %v", resp)
+	}
+
+	if got := <-gotCh; got != "response" {
+		t.Fatalf("operator got %q want %q", got, "response")
+	}
+
+	// aread should return CLOSED since opToAgent was drained by now... actually
+	// let's read the buffered "request" first.
+	nonce := uint64(1)
+	readSmac := protocol.SessionMAC(rc.sessionKey, "aread", nonce)
+	readArgs := sessionAreadArgs(cid, rc.sessionKey, nonce, false)
+	readResp := s.proxyAgentRead(readArgs, time.Now().UTC())
+	_ = readSmac
+	if len(readResp) < 1 || !strings.HasPrefix(readResp[0], "DATA ") {
+		t.Fatalf("aread should return buffered data, got %v", readResp)
+	}
+
+	// Second aread after buffer drained should return CLOSED (operator is done).
+	nonce2 := uint64(2)
+	readResp2 := s.proxyAgentRead(sessionAreadArgs(cid, rc.sessionKey, nonce2, false), time.Now().UTC())
+	if len(readResp2) < 1 || readResp2[0] != "CLOSED" {
+		t.Fatalf("aread after draining buffer with opClosed should return CLOSED, got %v", readResp2)
 	}
 }
 

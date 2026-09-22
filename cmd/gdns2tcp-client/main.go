@@ -323,23 +323,6 @@ func runClient(cfg config) error {
 	return nil
 }
 
-// systemResolverAddress extracts the first configured recursive resolver so
-// -tcp can actually use DNS-over-TCP rather than silently falling back to
-// net.DefaultResolver's UDP path.  Platforms without resolv.conf receive a
-// clear actionable error asking for -dns-server.
-func systemResolverAddress() (string, error) {
-	raw, err := os.ReadFile("/etc/resolv.conf")
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == "nameserver" && net.ParseIP(fields[1]) != nil {
-			return fields[1], nil
-		}
-	}
-	return "", errors.New("no nameserver entry in /etc/resolv.conf")
-}
 
 func parseFlags() config {
 	cfg := config{}
@@ -613,14 +596,26 @@ func testConnectionSharded(resolver *txtResolver, cfg config) (string, error) {
 	return encoding, nil
 }
 
+func isCatalogError(response string) bool {
+	switch response {
+	case "Authentication failed.", "Listing disabled.",
+		"Directory listing error.", "Incorrect page number.":
+		return true
+	}
+	return false
+}
+
 func listFiles(resolver *txtResolver, cfg config) error {
 	first, err := resolver.queryNames(authenticatedNames(cfg, "c", nil))
 	if err != nil {
 		return err
 	}
+	if isCatalogError(first) {
+		return fmt.Errorf("server: %s", first)
+	}
 	fmt.Println(first)
 
-	matches := regexp.MustCompile(`Catalog contains (\d+) pages`).FindStringSubmatch(first)
+	matches := regexp.MustCompile(`^Catalog contains (\d+) pages\.$`).FindStringSubmatch(first)
 	if len(matches) != 2 {
 		return nil
 	}
@@ -767,6 +762,12 @@ func uploadFile(resolver *txtResolver, cfg config) error {
 				}
 				if respIdx == -1 {
 					done.Store(true)
+				} else if respIdx != index {
+					firstErr.Do(func() {
+						uploadErr = fmt.Errorf("upload chunk %d: server acknowledged chunk %d instead", index, respIdx)
+					})
+					done.Store(true)
+					return
 				}
 				n := int(completed.Add(1))
 				pb.render(n)

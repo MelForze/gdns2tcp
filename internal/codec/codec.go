@@ -91,7 +91,7 @@ func DecompressLimit(data []byte, maxBytes int64) ([]byte, error) {
 
 func positiveMod(d, m int) int {
 	res := d % m
-	if (res < 0 && m > 0) || (res > 0 && m < 0) {
+	if res != 0 && (res < 0) != (m < 0) {
 		return res + m
 	}
 	return res

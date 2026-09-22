@@ -1,6 +1,7 @@
 package dnsserver
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -147,7 +148,8 @@ func (s *Server) reserveCacheBuildLocked(bytes int64, now time.Time) bool {
 	s.evictDownloadCacheLocked(now)
 	for s.downloadCacheBytes+s.downloadCacheReserved+bytes > s.cacheMaxBytes {
 		removed := false
-		for _, key := range append([]string(nil), s.downloadCacheOrder...) {
+		for elem := s.downloadCacheOrder.Front(); elem != nil; elem = elem.Next() {
+			key := elem.Value.(string)
 			entry, ok := s.downloadCache[key]
 			if !ok || entry.active > 0 {
 				continue
@@ -489,17 +491,17 @@ func (s *Server) releaseCacheLocked(key string) {
 }
 
 func (s *Server) touchCacheLocked(key string) {
-	for i, existing := range s.downloadCacheOrder {
-		if existing == key {
-			s.downloadCacheOrder = append(s.downloadCacheOrder[:i], s.downloadCacheOrder[i+1:]...)
-			break
-		}
+	if elem, ok := s.downloadCacheIndex[key]; ok {
+		s.downloadCacheOrder.MoveToBack(elem)
+		return
 	}
-	s.downloadCacheOrder = append(s.downloadCacheOrder, key)
+	elem := s.downloadCacheOrder.PushBack(key)
+	s.downloadCacheIndex[key] = elem
 }
 
 func (s *Server) rebuildCacheOrderLocked() {
-	s.downloadCacheOrder = s.downloadCacheOrder[:0]
+	s.downloadCacheOrder.Init()
+	s.downloadCacheIndex = make(map[string]*list.Element, len(s.downloadCache))
 	keys := make([]string, 0, len(s.downloadCache))
 	for key := range s.downloadCache {
 		keys = append(keys, key)
@@ -507,7 +509,10 @@ func (s *Server) rebuildCacheOrderLocked() {
 	sort.Slice(keys, func(i, j int) bool {
 		return s.downloadCache[keys[i]].lastAccess.Before(s.downloadCache[keys[j]].lastAccess)
 	})
-	s.downloadCacheOrder = append(s.downloadCacheOrder, keys...)
+	for _, key := range keys {
+		elem := s.downloadCacheOrder.PushBack(key)
+		s.downloadCacheIndex[key] = elem
+	}
 }
 
 func (s *Server) evictDownloadCacheLocked(now time.Time) {
@@ -516,17 +521,17 @@ func (s *Server) evictDownloadCacheLocked(now time.Time) {
 			s.removeCacheLocked(key, entry)
 		}
 	}
-	for s.downloadCacheBytes > s.cacheMaxBytes && len(s.downloadCacheOrder) > 0 {
-		key := s.downloadCacheOrder[0]
+	for s.downloadCacheBytes > s.cacheMaxBytes && s.downloadCacheOrder.Len() > 0 {
+		front := s.downloadCacheOrder.Front()
+		key := front.Value.(string)
 		entry, ok := s.downloadCache[key]
 		if !ok {
-			s.downloadCacheOrder = s.downloadCacheOrder[1:]
+			s.downloadCacheOrder.Remove(front)
+			delete(s.downloadCacheIndex, key)
 			continue
 		}
 		if entry.active > 0 {
-			// All older entries may be active. Move this one to the end and
-			// continue looking for an evictable LRU entry.
-			s.downloadCacheOrder = append(s.downloadCacheOrder[1:], key)
+			s.downloadCacheOrder.MoveToBack(front)
 			allActive := true
 			for _, candidate := range s.downloadCache {
 				if candidate.active == 0 {
@@ -546,11 +551,9 @@ func (s *Server) evictDownloadCacheLocked(now time.Time) {
 func (s *Server) removeCacheLocked(key string, entry downloadCacheEntry) {
 	delete(s.downloadCache, key)
 	s.downloadCacheBytes -= entry.encodedSize
-	for i, candidate := range s.downloadCacheOrder {
-		if candidate == key {
-			s.downloadCacheOrder = append(s.downloadCacheOrder[:i], s.downloadCacheOrder[i+1:]...)
-			break
-		}
+	if elem, ok := s.downloadCacheIndex[key]; ok {
+		s.downloadCacheOrder.Remove(elem)
+		delete(s.downloadCacheIndex, key)
 	}
 	_ = os.Remove(entry.spoolPath)
 	_ = os.Remove(entry.metaPath)

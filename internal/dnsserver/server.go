@@ -1,6 +1,7 @@
 package dnsserver
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -102,11 +103,12 @@ type Server struct {
 
 	mu                sync.Mutex
 	downloads         map[string]downloadState
-	uploads           map[string]uploadState
+	uploads           map[string]*uploadState
 	uploadCompletions map[string]*uploadCompletion
 
 	downloadCache         map[string]downloadCacheEntry
-	downloadCacheOrder    []string // LRU, oldest first
+	downloadCacheOrder    *list.List
+	downloadCacheIndex    map[string]*list.Element
 	downloadCacheBytes    int64
 	downloadCacheReserved int64
 	downloadCacheBuilds   map[string]*downloadCacheBuild
@@ -168,6 +170,8 @@ type downloadCacheBuild struct {
 }
 
 type uploadState struct {
+	mu          sync.Mutex
+	closed      bool
 	spool       *os.File
 	filename    string
 	path        string
@@ -176,7 +180,7 @@ type uploadState struct {
 	total       int
 	chunkSize   int
 	encoding    string
-	nextIndex   int       // sequential write cursor — flushed up to (but not including) this index
+	nextIndex   int            // sequential write cursor — flushed up to (but not including) this index
 	received    map[int][]byte // out-of-order chunks buffered until their predecessors arrive
 	expires     time.Time
 }
@@ -260,9 +264,11 @@ func New(cfg Config) (*Server, error) {
 		socksNoAuth:            cfg.SocksNoAuth,
 		logger:                 logger,
 		downloads:              make(map[string]downloadState),
-		uploads:                make(map[string]uploadState),
+		uploads:                make(map[string]*uploadState),
 		uploadCompletions:      make(map[string]*uploadCompletion),
 		downloadCache:          make(map[string]downloadCacheEntry),
+		downloadCacheOrder:     list.New(),
+		downloadCacheIndex:     make(map[string]*list.Element),
 		downloadCacheBuilds:    make(map[string]*downloadCacheBuild),
 		clientArtifacts:        make(map[string]clientArtifact),
 		clientTransfers:        make(map[string]clientTransfer),
@@ -776,12 +782,14 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 		return []string{s.uploadCompletionResult(sid)}
 	}
 	if existing, exists := s.uploads[sid]; exists {
+		existing.mu.Lock()
 		if existing.fingerprint == fingerprint {
 			existing.expires = now.Add(transferTTL)
-			s.uploads[sid] = existing
+			existing.mu.Unlock()
 			s.mu.Unlock()
 			return []string{"Ready to file uploading"}
 		}
+		existing.mu.Unlock()
 		s.mu.Unlock()
 		return []string{"Transfer already exists."}
 	}
@@ -798,7 +806,7 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 		return []string{"Cannot create file."}
 	}
 
-	state := uploadState{
+	state := &uploadState{
 		spool: spool, filename: filename, path: path, spoolPath: spool.Name(),
 		fingerprint: fingerprint, total: total, chunkSize: chunkSize, encoding: encoding,
 		nextIndex: 0, received: make(map[int][]byte), expires: now.Add(transferTTL),
@@ -857,20 +865,26 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 		s.mu.Unlock()
 		return []string{"Upload is not initialized."}
 	}
+	s.mu.Unlock()
+
+	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return []string{"Upload is not initialized."}
+	}
 	if index < 0 || index >= state.total {
-		s.mu.Unlock()
+		state.mu.Unlock()
 		return []string{"Wrong chunk number."}
 	}
 	if len(wireChunk) > state.chunkSize {
-		s.mu.Unlock()
+		state.mu.Unlock()
 		return []string{"Incorrect chunk length format."}
 	}
 
 	// Duplicate: already flushed to spool or already buffered — ack silently.
 	if index < state.nextIndex || state.received[index] != nil {
 		state.expires = now.Add(transferTTL)
-		s.uploads[sid] = state
-		s.mu.Unlock()
+		state.mu.Unlock()
 		return []string{strconv.Itoa(index)}
 	}
 
@@ -878,10 +892,14 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 	// otherwise buffer it for later flush.
 	if index == state.nextIndex {
 		if err := writeAll(state.spool, []byte(wireChunk)); err != nil {
+			state.closed = true
+			spool, spoolPath := state.spool, state.spoolPath
+			state.mu.Unlock()
+			s.mu.Lock()
 			delete(s.uploads, sid)
 			s.mu.Unlock()
-			_ = state.spool.Close()
-			_ = os.Remove(state.spoolPath)
+			_ = spool.Close()
+			_ = os.Remove(spoolPath)
 			return []string{"Cannot write file."}
 		}
 		state.nextIndex++
@@ -892,10 +910,14 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 				break
 			}
 			if err := writeAll(state.spool, buf); err != nil {
+				state.closed = true
+				spool, spoolPath := state.spool, state.spoolPath
+				state.mu.Unlock()
+				s.mu.Lock()
 				delete(s.uploads, sid)
 				s.mu.Unlock()
-				_ = state.spool.Close()
-				_ = os.Remove(state.spoolPath)
+				_ = spool.Close()
+				_ = os.Remove(spoolPath)
 				return []string{"Cannot write file."}
 			}
 			delete(state.received, state.nextIndex)
@@ -907,11 +929,17 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 
 	// All chunks flushed — finalize.
 	if state.nextIndex == state.total {
+		state.mu.Unlock()
 		completion := &uploadCompletion{
 			done:        make(chan struct{}),
 			fingerprint: state.fingerprint,
 			finalIndex:  state.total - 1,
 			expires:     now.Add(transferTTL),
+		}
+		s.mu.Lock()
+		if _, still := s.uploads[sid]; !still {
+			s.mu.Unlock()
+			return []string{"Upload is not initialized."}
 		}
 		delete(s.uploads, sid)
 		s.uploadCompletions[sid] = completion
@@ -929,15 +957,14 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 	}
 
 	state.expires = now.Add(transferTTL)
-	s.uploads[sid] = state
-	s.mu.Unlock()
+	state.mu.Unlock()
 	return []string{strconv.Itoa(index)}
 }
 
-func (s *Server) finishUpload(sid string, state uploadState) string {
-	failed := false
+func (s *Server) finishUpload(sid string, state *uploadState) string {
+	failed := true
 	defer func() {
-		if state.spool != nil {
+		if failed && state.spool != nil {
 			_ = state.spool.Close()
 		}
 		_ = os.Remove(state.spoolPath)
@@ -947,8 +974,10 @@ func (s *Server) finishUpload(sid string, state uploadState) string {
 		return "Upload decode error."
 	}
 	if err := state.spool.Close(); err != nil {
+		failed = false
 		return "Cannot write file."
 	}
+	failed = false
 	protected, err := os.CreateTemp(s.dataDir, ".gdns2tcp-upload-protected-*")
 	if err != nil {
 		return "Cannot create file."
@@ -1351,10 +1380,10 @@ func (s *Server) clientBootstrapPS(kind, client string) []string {
 	case "ps1":
 		aliasSetup = `$A='win'`
 	case "proxy":
-		aliasSetup = "$ARCH=if([Environment]::Is64BitOperatingSystem){'amd64'}else{'arm64'};$A=\"client-proxy-windows-$ARCH\""
+		aliasSetup = "$ARCH=switch($env:PROCESSOR_ARCHITECTURE){'ARM64'{'arm64'}default{'amd64'}};$A=\"client-proxy-windows-$ARCH\""
 	default:
 		kind = "client"
-		aliasSetup = "$ARCH=if([Environment]::Is64BitOperatingSystem){'amd64'}else{'arm64'};$A=\"windows-$ARCH\""
+		aliasSetup = "$ARCH=switch($env:PROCESSOR_ARCHITECTURE){'ARM64'{'arm64'}default{'amd64'}};$A=\"windows-$ARCH\""
 	}
 	domain := strings.TrimSuffix(s.domain, ".")
 	script := strings.NewReplacer(
@@ -1415,17 +1444,24 @@ func (s *Server) cleanupExpiredLocked(now time.Time) {
 		}
 	}
 	for sid, state := range s.uploads {
-		if now.Before(state.expires) {
+		if !state.mu.TryLock() {
 			continue
 		}
-		if state.spool != nil {
-			_ = state.spool.Close()
+		if now.Before(state.expires) {
+			state.mu.Unlock()
+			continue
 		}
-		if err := os.Remove(state.spoolPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			s.logger.Printf("remove expired upload spool %q: %v", state.filename, err)
+		state.closed = true
+		spool, spoolPath, filename := state.spool, state.spoolPath, state.filename
+		state.mu.Unlock()
+		if spool != nil {
+			_ = spool.Close()
+		}
+		if err := os.Remove(spoolPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.logger.Printf("remove expired upload spool %q: %v", filename, err)
 		}
 		delete(s.uploads, sid)
-		s.logger.Printf("expired upload %q (%s)", state.filename, sid)
+		s.logger.Printf("expired upload %q (%s)", filename, sid)
 	}
 	for sid, state := range s.downloads {
 		if now.Before(state.expires) {

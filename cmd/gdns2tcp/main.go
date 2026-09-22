@@ -198,7 +198,10 @@ func run() error {
 	server.Shutdown()
 	_ = udpSrv.Shutdown()
 	_ = tcpSrv.Shutdown()
-	return fmt.Errorf("dns server stopped: %w", firstErr)
+	if firstErr != nil {
+		return fmt.Errorf("dns server stopped: %w", firstErr)
+	}
+	return nil
 }
 
 func newDNSServers(addr string, handler dns.Handler) (*dns.Server, *dns.Server) {

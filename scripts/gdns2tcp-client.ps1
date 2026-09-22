@@ -80,8 +80,8 @@ Transfer options:
   -Parallelism, --parallelism <n>     Concurrent bulk DNS queries, 1..64. Default: 32.
   -BatchSize, --batch <n>             Download chunks per query, 1..32.
                                       Default: 14 (same as the Go client).
-  -Retries, --retries <n>             Attempts for the SAME failed DNS query, 1..10.
-                                      Default: 3. No transport/batch fallback.
+  -Retries, --retries <n>             Attempts for the SAME failed DNS query, 1..100.
+                                      Default: 10. No transport/batch fallback.
   -RetryDelayMs, --retry-delay-ms <n> Base retry backoff in milliseconds.
                                       Default: 250; retries wait 250ms, 500ms, ... like Go.
   -LogPath <path>                     Optional log file.
@@ -162,7 +162,7 @@ $cfg = [ordered]@{
     MaxDownloadBytes      = [int64]268435456
     Parallelism           = 32
     BatchSize             = 14
-    Retries               = 3
+    Retries               = 10
     RetryDelayMs          = 250
     LogPath               = ''
     Help                  = $false
@@ -266,8 +266,8 @@ try {
             '--batch-size'       { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.BatchSize = [int](ConvertTo-IntegerOption $name $raw 1 32); continue }
             '-batch'             { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.BatchSize = [int](ConvertTo-IntegerOption $name $raw 1 32); continue }
             '--batch'            { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.BatchSize = [int](ConvertTo-IntegerOption $name $raw 1 32); continue }
-            '-retries'           { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.Retries = [int](ConvertTo-IntegerOption $name $raw 1 10); continue }
-            '--retries'          { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.Retries = [int](ConvertTo-IntegerOption $name $raw 1 10); continue }
+            '-retries'           { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.Retries = [int](ConvertTo-IntegerOption $name $raw 1 100); continue }
+            '--retries'          { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.Retries = [int](ConvertTo-IntegerOption $name $raw 1 100); continue }
             '-retrydelayms'       { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.RetryDelayMs = [int](ConvertTo-IntegerOption $name $raw 1 60000); continue }
             '--retry-delay-ms'      { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.RetryDelayMs = [int](ConvertTo-IntegerOption $name $raw 1 60000); continue }
             '-retrydelayseconds'    { $raw = Get-OptionValue $name ([ref]$i) $args $hasInlineValue $inlineValue; $cfg.RetryDelayMs = 1000 * [int](ConvertTo-IntegerOption $name $raw 1 60); continue }
@@ -1739,8 +1739,10 @@ function Test-Gdns2Tcp {
 
 function Invoke-List {
     $firstPage = Invoke-TxtQueryOne -Name (New-AuthenticatedName -Command 'c' -Args @())
+    $catalogErrors = @('Authentication failed.', 'Listing disabled.', 'Directory listing error.', 'Incorrect page number.')
+    if ($catalogErrors -contains $firstPage) { throw "Server: $firstPage" }
     Write-Output $firstPage
-    if ($firstPage -match 'Catalog contains (\d+) pages') {
+    if ($firstPage -match '^Catalog contains (\d+) pages\.$') {
         $pages = [int]$Matches[1]
         for ($page = 0; $page -lt $pages; $page++) {
             Write-Output (Invoke-TxtQueryOne -Name (New-AuthenticatedName -Command 'c' -Args @([string]$page)))

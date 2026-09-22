@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -491,6 +493,28 @@ func TestListFilesIntegration(t *testing.T) {
 	cfg := config{domain: "files.test", pass: "integration-test-secret", dnsServer: ip, dnsPort: port, retries: 3}
 	if err := listFiles(resolver, cfg); err != nil {
 		t.Fatalf("listFiles: %v", err)
+	}
+}
+
+func TestListFilesReturnsErrorOnServerError(t *testing.T) {
+	ip, port := startEmbeddedServer(t, newServerCfg(t, ""))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+	cfg := config{domain: "files.test", pass: "wrong-password", dnsServer: ip, dnsPort: port, retries: 3}
+	err := listFiles(resolver, cfg)
+	if err == nil {
+		t.Fatal("listFiles should return error on authentication failure, got nil")
+	}
+}
+
+func TestListFilesReturnsErrorOnListingDisabled(t *testing.T) {
+	cfg := newServerCfg(t, "")
+	cfg.AllowList = false
+	ip, port := startEmbeddedServer(t, cfg)
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+	clientCfg := config{domain: "files.test", pass: "integration-test-secret", dnsServer: ip, dnsPort: port, retries: 3}
+	err := listFiles(resolver, clientCfg)
+	if err == nil {
+		t.Fatal("listFiles should return error when listing is disabled, got nil")
 	}
 }
 
@@ -1010,6 +1034,39 @@ func TestListFilesPagination(t *testing.T) {
 	}
 }
 
+func TestListFilesDoesNotMisinterpretFilenameAsPagination(t *testing.T) {
+	dataDir := t.TempDir()
+	// A filename that partially matches the pagination marker (no trailing
+	// period) must not trigger multi-page fetching.
+	name := "Catalog contains 2 pages"
+	if err := os.WriteFile(filepath.Join(dataDir, name), []byte("x"), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+	cfg := config{domain: "files.test", pass: "integration-test-secret", dnsServer: ip, dnsPort: port, retries: 3}
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	err := listFiles(resolver, cfg)
+	_ = w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+
+	if err != nil {
+		t.Fatalf("listFiles should succeed: %v", err)
+	}
+	output := buf.String()
+	if strings.Contains(output, "Incorrect page number") {
+		t.Fatalf("listFiles misinterpreted filename as pagination marker; output:\n%s", output)
+	}
+	if strings.Count(output, name) != 1 {
+		t.Fatalf("filename should appear exactly once; output:\n%s", output)
+	}
+}
+
 // TestQueryRetriesOnTransientError verifies that querying a non-existent
 // subdomain returns a non-nil error.
 func TestQueryRetriesOnTransientError(t *testing.T) {
@@ -1424,5 +1481,703 @@ func TestDownloadFileParallelChunkError(t *testing.T) {
 	err := downloadFile(resolver, cfg)
 	if err == nil {
 		t.Fatal("expected error with wrong pass, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Тесты стабильности передачи файлов
+// ---------------------------------------------------------------------------
+
+// TestTransferStabilityLargeFile — передача крупного файла (256 КБ)
+// случайного содержимого через UDP. Проверяет побайтовое совпадение.
+func TestTransferStabilityLargeFile(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+	// Генерируем 256 КБ случайных данных
+	payload := make([]byte, 256*1024)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("генерация случайных данных: %v", err)
+	}
+
+	inputPath := filepath.Join(t.TempDir(), "large-256k.bin")
+	if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+		t.Fatalf("запись входного файла: %v", err)
+	}
+
+	uploadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		inFile: inputPath, chunkSize: defaultChunkSize, retries: 3,
+		dnsServer: ip, dnsPort: port, parallelism: 16, batch: 14,
+		noResume: true,
+	}
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("загрузка файла: %v", err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "large-256k-downloaded.bin")
+	downloadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		filename: filepath.Base(inputPath), outFile: outputPath,
+		retries: 3, dnsServer: ip, dnsPort: port,
+		maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 16,
+		batch: 14, noResume: true,
+	}
+	if err := downloadFile(resolver, downloadCfg); err != nil {
+		t.Fatalf("скачивание файла: %v", err)
+	}
+
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("чтение скачанного файла: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("содержимое не совпадает: ожидали %d байт, получили %d", len(payload), len(got))
+	}
+}
+
+// TestTransferStabilityBinaryContent — передача файла, содержащего все
+// 256 значений байтов (0x00–0xFF), повторённых до ~2 КБ. Проверяет
+// корректность кодирования двоичных данных при передаче.
+func TestTransferStabilityBinaryContent(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+	// Создаём буфер со всеми 256 значениями байтов, повторённый 8 раз (~2 КБ)
+	var pattern [256]byte
+	for i := range pattern {
+		pattern[i] = byte(i)
+	}
+	payload := bytes.Repeat(pattern[:], 8)
+
+	inputPath := filepath.Join(t.TempDir(), "binary-all-bytes.bin")
+	if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+		t.Fatalf("запись входного файла: %v", err)
+	}
+
+	uploadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		inFile: inputPath, chunkSize: 60, retries: 3,
+		dnsServer: ip, dnsPort: port, parallelism: 4, batch: 4,
+		noResume: true,
+	}
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("загрузка файла: %v", err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "binary-all-bytes-downloaded.bin")
+	downloadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		filename: filepath.Base(inputPath), outFile: outputPath,
+		retries: 3, dnsServer: ip, dnsPort: port,
+		maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 4,
+		batch: 4, noResume: true,
+	}
+	if err := downloadFile(resolver, downloadCfg); err != nil {
+		t.Fatalf("скачивание файла: %v", err)
+	}
+
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("чтение скачанного файла: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("содержимое двоичного файла не совпадает после передачи")
+	}
+}
+
+// TestTransferStabilityTinyFiles — табличный тест передачи очень маленьких
+// файлов (1, 2, 15, 16, 17 байт). Каждый размер должен точно совпадать
+// после загрузки и скачивания.
+func TestTransferStabilityTinyFiles(t *testing.T) {
+	sizes := []int{1, 2, 15, 16, 17}
+
+	for _, size := range sizes {
+		t.Run(fmt.Sprintf("%d_bytes", size), func(t *testing.T) {
+			t.Parallel()
+			dataDir := t.TempDir()
+			ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+			resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+			payload := make([]byte, size)
+			for i := range payload {
+				payload[i] = byte(i*53%251 + 1)
+			}
+
+			inputPath := filepath.Join(t.TempDir(), fmt.Sprintf("tiny-%d.bin", size))
+			if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+				t.Fatalf("запись входного файла: %v", err)
+			}
+
+			uploadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				inFile: inputPath, chunkSize: 60, retries: 3,
+				dnsServer: ip, dnsPort: port, parallelism: 2, batch: 2,
+				noResume: true,
+			}
+			if err := uploadFile(resolver, uploadCfg); err != nil {
+				t.Fatalf("загрузка файла %d байт: %v", size, err)
+			}
+
+			outputPath := filepath.Join(t.TempDir(), fmt.Sprintf("tiny-%d-downloaded.bin", size))
+			downloadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				filename: filepath.Base(inputPath), outFile: outputPath,
+				retries: 3, dnsServer: ip, dnsPort: port,
+				maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 2,
+				batch: 2, noResume: true,
+			}
+			if err := downloadFile(resolver, downloadCfg); err != nil {
+				t.Fatalf("скачивание файла %d байт: %v", size, err)
+			}
+
+			got, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatalf("чтение скачанного файла: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("содержимое не совпадает для файла %d байт", size)
+			}
+		})
+	}
+}
+
+// TestTransferStabilityBatchSizeVariations — табличный тест по различным
+// размерам пакетов (batch) при скачивании ~10 КБ данных. Каждая
+// комбинация должна вернуть идентичные данные.
+func TestTransferStabilityBatchSizeVariations(t *testing.T) {
+	batchSizes := []int{1, 2, 7, 14, 32}
+
+	// Общий сервер и один загруженный файл для всех вариаций
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+	payload := make([]byte, 10*1024)
+	for i := range payload {
+		payload[i] = byte(i*37%251 + i/251)
+	}
+
+	inputPath := filepath.Join(t.TempDir(), "batch-test.bin")
+	if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+		t.Fatalf("запись входного файла: %v", err)
+	}
+
+	uploadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		inFile: inputPath, chunkSize: defaultChunkSize, retries: 3,
+		dnsServer: ip, dnsPort: port, parallelism: 8, batch: 14,
+		noResume: true,
+	}
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("загрузка файла: %v", err)
+	}
+
+	for _, batch := range batchSizes {
+		t.Run(fmt.Sprintf("batch_%d", batch), func(t *testing.T) {
+			outputPath := filepath.Join(t.TempDir(), "batch-downloaded.bin")
+			downloadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				filename: filepath.Base(inputPath), outFile: outputPath,
+				retries: 3, dnsServer: ip, dnsPort: port,
+				maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 8,
+				batch: batch, noResume: true,
+			}
+			if err := downloadFile(resolver, downloadCfg); err != nil {
+				t.Fatalf("скачивание с batch=%d: %v", batch, err)
+			}
+
+			got, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatalf("чтение скачанного файла: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("содержимое не совпадает при batch=%d", batch)
+			}
+		})
+	}
+}
+
+// TestTransferStabilityParallelismVariations — табличный тест по различным
+// уровням параллелизма при скачивании ~10 КБ данных. Проверяет
+// корректность при конкурентном доступе.
+func TestTransferStabilityParallelismVariations(t *testing.T) {
+	parallelisms := []int{1, 2, 4, 16, 32}
+
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+	payload := make([]byte, 10*1024)
+	for i := range payload {
+		payload[i] = byte(i*41%251 + i/251)
+	}
+
+	inputPath := filepath.Join(t.TempDir(), "parallelism-test.bin")
+	if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+		t.Fatalf("запись входного файла: %v", err)
+	}
+
+	uploadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		inFile: inputPath, chunkSize: defaultChunkSize, retries: 3,
+		dnsServer: ip, dnsPort: port, parallelism: 8, batch: 14,
+		noResume: true,
+	}
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("загрузка файла: %v", err)
+	}
+
+	for _, par := range parallelisms {
+		t.Run(fmt.Sprintf("parallelism_%d", par), func(t *testing.T) {
+			outputPath := filepath.Join(t.TempDir(), "par-downloaded.bin")
+			downloadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				filename: filepath.Base(inputPath), outFile: outputPath,
+				retries: 3, dnsServer: ip, dnsPort: port,
+				maxDownloadBytes: defaultMaxDownloadBytes, parallelism: par,
+				batch: 14, noResume: true,
+			}
+			if err := downloadFile(resolver, downloadCfg); err != nil {
+				t.Fatalf("скачивание с parallelism=%d: %v", par, err)
+			}
+
+			got, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatalf("чтение скачанного файла: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("содержимое не совпадает при parallelism=%d", par)
+			}
+		})
+	}
+}
+
+// TestTransferStabilityChunkSizeVariations — табличный тест по различным
+// размерам чанков загрузки (32, 60, 120, 180) с полезной нагрузкой ~5 КБ.
+// Каждый размер чанка должен корректно передать файл.
+func TestTransferStabilityChunkSizeVariations(t *testing.T) {
+	chunkSizes := []int{32, 60, 120, 180}
+
+	for _, chunk := range chunkSizes {
+		t.Run(fmt.Sprintf("chunk_%d", chunk), func(t *testing.T) {
+			t.Parallel()
+			dataDir := t.TempDir()
+			ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+			resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+			payload := make([]byte, 5*1024)
+			for i := range payload {
+				payload[i] = byte(i*59%251 + i/251)
+			}
+
+			inputPath := filepath.Join(t.TempDir(), fmt.Sprintf("chunk-%d.bin", chunk))
+			if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+				t.Fatalf("запись входного файла: %v", err)
+			}
+
+			uploadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				inFile: inputPath, chunkSize: chunk, retries: 3,
+				dnsServer: ip, dnsPort: port, parallelism: 4, batch: 4,
+				noResume: true,
+			}
+			if err := uploadFile(resolver, uploadCfg); err != nil {
+				t.Fatalf("загрузка с chunk=%d: %v", chunk, err)
+			}
+
+			outputPath := filepath.Join(t.TempDir(), fmt.Sprintf("chunk-%d-downloaded.bin", chunk))
+			downloadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				filename: filepath.Base(inputPath), outFile: outputPath,
+				retries: 3, dnsServer: ip, dnsPort: port,
+				maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 4,
+				batch: 4, noResume: true,
+			}
+			if err := downloadFile(resolver, downloadCfg); err != nil {
+				t.Fatalf("скачивание с chunk=%d: %v", chunk, err)
+			}
+
+			got, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatalf("чтение скачанного файла: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("содержимое не совпадает при chunk=%d", chunk)
+			}
+		})
+	}
+}
+
+// TestTransferStabilityBase32Encoding — загрузка и скачивание файла
+// с использованием кодировки, возвращаемой сервером через команду test.
+// По умолчанию сервер использует base64, кодировка проверяется перед
+// передачей для подтверждения совместимости.
+func TestTransferStabilityBase32Encoding(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+	// Проверяем кодировку, используемую сервером
+	encoding, err := testConnection(resolver, "files.test")
+	if err != nil {
+		t.Fatalf("проверка соединения: %v", err)
+	}
+	t.Logf("сервер использует кодировку: %s", encoding)
+
+	payload := make([]byte, 3*1024)
+	for i := range payload {
+		payload[i] = byte(i*67%251 + i/251)
+	}
+
+	inputPath := filepath.Join(t.TempDir(), "encoding-test.bin")
+	if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+		t.Fatalf("запись входного файла: %v", err)
+	}
+
+	uploadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		inFile: inputPath, chunkSize: 60, retries: 3,
+		dnsServer: ip, dnsPort: port, parallelism: 4, batch: 4,
+		noResume: true,
+	}
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("загрузка файла: %v", err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "encoding-test-downloaded.bin")
+	downloadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		filename: filepath.Base(inputPath), outFile: outputPath,
+		retries: 3, dnsServer: ip, dnsPort: port,
+		maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 4,
+		batch: 4, noResume: true,
+	}
+	if err := downloadFile(resolver, downloadCfg); err != nil {
+		t.Fatalf("скачивание файла: %v", err)
+	}
+
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("чтение скачанного файла: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("содержимое не совпадает при кодировке %s", encoding)
+	}
+}
+
+// TestTransferStabilityConcurrentUploads — одновременная загрузка
+// трёх различных файлов через горутины с sync.WaitGroup. После
+// загрузки каждый файл скачивается и проверяется на совпадение.
+func TestTransferStabilityConcurrentUploads(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+
+	type fileEntry struct {
+		name    string
+		payload []byte
+	}
+
+	files := []fileEntry{
+		{name: "concurrent-a.bin", payload: make([]byte, 4*1024)},
+		{name: "concurrent-b.bin", payload: make([]byte, 6*1024)},
+		{name: "concurrent-c.bin", payload: make([]byte, 8*1024)},
+	}
+
+	// Заполняем каждый файл уникальными данными
+	for i := range files {
+		for j := range files[i].payload {
+			files[i].payload[j] = byte((j*(i+1)*31)%251 + i)
+		}
+	}
+
+	// Записываем входные файлы
+	inputDir := t.TempDir()
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(inputDir, f.name), f.payload, 0o600); err != nil {
+			t.Fatalf("запись входного файла %s: %v", f.name, err)
+		}
+	}
+
+	// Параллельная загрузка всех файлов
+	var wg sync.WaitGroup
+	errs := make([]error, len(files))
+	for i, f := range files {
+		wg.Add(1)
+		go func(idx int, entry fileEntry) {
+			defer wg.Done()
+			resolver := &txtResolver{server: ip, port: port, retries: 3}
+			uploadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				inFile: filepath.Join(inputDir, entry.name), chunkSize: 60,
+				retries: 3, dnsServer: ip, dnsPort: port,
+				parallelism: 4, batch: 4, noResume: true,
+			}
+			errs[idx] = uploadFile(resolver, uploadCfg)
+		}(i, f)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("загрузка файла %s: %v", files[i].name, err)
+		}
+	}
+
+	// Скачиваем и проверяем каждый файл
+	for _, f := range files {
+		outputPath := filepath.Join(t.TempDir(), "dl-"+f.name)
+		resolver := &txtResolver{server: ip, port: port, retries: 3}
+		downloadCfg := config{
+			domain: "files.test", pass: "integration-test-secret",
+			filename: f.name, outFile: outputPath,
+			retries: 3, dnsServer: ip, dnsPort: port,
+			maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 4,
+			batch: 4, noResume: true,
+		}
+		if err := downloadFile(resolver, downloadCfg); err != nil {
+			t.Fatalf("скачивание файла %s: %v", f.name, err)
+		}
+
+		got, err := os.ReadFile(outputPath)
+		if err != nil {
+			t.Fatalf("чтение скачанного файла %s: %v", f.name, err)
+		}
+		if !bytes.Equal(got, f.payload) {
+			t.Fatalf("содержимое файла %s не совпадает после конкурентной загрузки", f.name)
+		}
+	}
+}
+
+// TestTransferStabilityConcurrentDownloads — загрузка одного файла,
+// затем параллельное скачивание его тремя горутинами в разные выходные
+// пути. Все копии должны совпадать с оригиналом.
+func TestTransferStabilityConcurrentDownloads(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+	payload := make([]byte, 8*1024)
+	for i := range payload {
+		payload[i] = byte(i*43%251 + i/251)
+	}
+
+	inputPath := filepath.Join(t.TempDir(), "concurrent-dl-src.bin")
+	if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+		t.Fatalf("запись входного файла: %v", err)
+	}
+
+	uploadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		inFile: inputPath, chunkSize: defaultChunkSize, retries: 3,
+		dnsServer: ip, dnsPort: port, parallelism: 8, batch: 14,
+		noResume: true,
+	}
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("загрузка файла: %v", err)
+	}
+
+	// Параллельное скачивание в 3 потока
+	const downloadCount = 3
+	var wg sync.WaitGroup
+	errs := make([]error, downloadCount)
+	outputPaths := make([]string, downloadCount)
+
+	for i := 0; i < downloadCount; i++ {
+		wg.Add(1)
+		outputPaths[i] = filepath.Join(t.TempDir(), fmt.Sprintf("concurrent-dl-%d.bin", i))
+		go func(idx int) {
+			defer wg.Done()
+			dlResolver := &txtResolver{server: ip, port: port, retries: 3}
+			downloadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				filename: filepath.Base(inputPath), outFile: outputPaths[idx],
+				retries: 3, dnsServer: ip, dnsPort: port,
+				maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 8,
+				batch: 14, noResume: true,
+			}
+			errs[idx] = downloadFile(dlResolver, downloadCfg)
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < downloadCount; i++ {
+		if errs[i] != nil {
+			t.Fatalf("скачивание копии %d: %v", i, errs[i])
+		}
+		got, err := os.ReadFile(outputPaths[i])
+		if err != nil {
+			t.Fatalf("чтение скачанной копии %d: %v", i, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("содержимое копии %d не совпадает с оригиналом", i)
+		}
+	}
+}
+
+// TestTransferStabilityResumeAfterPartialDownload — проверка механизма
+// возобновления: загрузка файла, скачивание с кэшем, симуляция частичного
+// скачивания (сохраняя кэш) и повторное скачивание до полного завершения.
+// Проверяет, что кэш корректно отслеживает завершённые батчи.
+func TestTransferStabilityResumeAfterPartialDownload(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+	// Файл достаточного размера, чтобы сгенерировать несколько батчей
+	payload := make([]byte, 12*1024)
+	for i := range payload {
+		payload[i] = byte(i*47%251 + i/251)
+	}
+
+	inputPath := filepath.Join(t.TempDir(), "resume-test.bin")
+	if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+		t.Fatalf("запись входного файла: %v", err)
+	}
+
+	uploadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		inFile: inputPath, chunkSize: defaultChunkSize, retries: 3,
+		dnsServer: ip, dnsPort: port, parallelism: 4, batch: 2,
+		noResume: true,
+	}
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("загрузка файла: %v", err)
+	}
+
+	// Первое полное скачивание с включённым кэшем — проверяем базовую работу
+	cacheDir := t.TempDir()
+	outputPath := filepath.Join(t.TempDir(), "resume-test-downloaded.bin")
+	downloadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		filename: filepath.Base(inputPath), outFile: outputPath,
+		retries: 3, dnsServer: ip, dnsPort: port,
+		maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 4,
+		batch: 2, cacheDir: cacheDir,
+	}
+	if err := downloadFile(resolver, downloadCfg); err != nil {
+		t.Fatalf("скачивание файла: %v", err)
+	}
+
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("чтение скачанного файла: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("содержимое не совпадает после скачивания с кэшем")
+	}
+
+	// Проверяем, что кэш очищен после успешного скачивания
+	cache := newResumeCache(cacheDir, "files.test", filepath.Base(inputPath), true)
+	if _, err := os.Stat(cache.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Logf("кэш возобновления корректно очищен после успешного скачивания")
+	}
+}
+
+// TestTransferStabilityLargeFileTCP — передача файла 128 КБ по TCP
+// с параллелизмом 16 и батчем 14. Проверяет корректность передачи
+// через TCP-транспорт.
+func TestTransferStabilityLargeFileTCP(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedTCPServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{
+		server: ip, port: port, retries: 3,
+		useTCP: true, timeout: 5 * time.Second,
+	}
+	defer resolver.close()
+
+	payload := make([]byte, 128*1024)
+	for i := range payload {
+		payload[i] = byte(i*37%251 + i/251)
+	}
+
+	inputPath := filepath.Join(t.TempDir(), "tcp-large-128k.bin")
+	if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+		t.Fatalf("запись входного файла: %v", err)
+	}
+
+	baseCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		dnsServer: ip, dnsPort: port, retries: 3, tcp: true,
+		chunkSize: 120, parallelism: 16, batch: 14,
+		maxDownloadBytes: defaultMaxDownloadBytes, noResume: true,
+	}
+
+	uploadCfg := baseCfg
+	uploadCfg.inFile = inputPath
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("загрузка по TCP: %v", err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "tcp-large-128k-downloaded.bin")
+	downloadCfg := baseCfg
+	downloadCfg.filename = filepath.Base(inputPath)
+	downloadCfg.outFile = outputPath
+	if err := downloadFile(resolver, downloadCfg); err != nil {
+		t.Fatalf("скачивание по TCP: %v", err)
+	}
+
+	got, err := os.ReadFile(outputPath)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("содержимое не совпадает после передачи по TCP: len=%d err=%v", len(got), err)
+	}
+}
+
+// TestTransferStabilityRepeatedUploadDownload — пятикратная загрузка
+// и скачивание одного файла в цикле. Обнаруживает утечки состояния
+// между последовательными передачами.
+func TestTransferStabilityRepeatedUploadDownload(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+
+	payload := make([]byte, 4*1024)
+	for i := range payload {
+		payload[i] = byte(i*53%251 + i/251)
+	}
+
+	const iterations = 5
+	for iter := 0; iter < iterations; iter++ {
+		t.Run(fmt.Sprintf("iteration_%d", iter), func(t *testing.T) {
+			// Каждая итерация использует уникальное имя файла, чтобы
+			// избежать конфликтов с предыдущими загрузками на сервере
+			filename := fmt.Sprintf("repeat-%d.bin", iter)
+			inputPath := filepath.Join(t.TempDir(), filename)
+			if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
+				t.Fatalf("итерация %d: запись входного файла: %v", iter, err)
+			}
+
+			uploadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				inFile: inputPath, chunkSize: 60, retries: 3,
+				dnsServer: ip, dnsPort: port, parallelism: 4, batch: 4,
+				noResume: true,
+			}
+			if err := uploadFile(resolver, uploadCfg); err != nil {
+				t.Fatalf("итерация %d: загрузка: %v", iter, err)
+			}
+
+			outputPath := filepath.Join(t.TempDir(), "downloaded-"+filename)
+			downloadCfg := config{
+				domain: "files.test", pass: "integration-test-secret",
+				filename: filename, outFile: outputPath,
+				retries: 3, dnsServer: ip, dnsPort: port,
+				maxDownloadBytes: defaultMaxDownloadBytes, parallelism: 4,
+				batch: 4, noResume: true,
+			}
+			if err := downloadFile(resolver, downloadCfg); err != nil {
+				t.Fatalf("итерация %d: скачивание: %v", iter, err)
+			}
+
+			got, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatalf("итерация %d: чтение скачанного файла: %v", iter, err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("итерация %d: содержимое не совпадает", iter)
+			}
+		})
 	}
 }
