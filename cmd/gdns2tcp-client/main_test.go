@@ -577,6 +577,40 @@ func TestUploadDownloadFileIntegration(t *testing.T) {
 	}
 }
 
+func TestUploadDownloadEmptyFileIntegration(t *testing.T) {
+	dataDir := t.TempDir()
+	ip, port := startEmbeddedServer(t, newServerCfg(t, dataDir))
+	resolver := &txtResolver{server: ip, port: port, retries: 3}
+	inputPath := filepath.Join(t.TempDir(), "empty.bin")
+	if err := os.WriteFile(inputPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uploadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		inFile: inputPath, chunkSize: 60, retries: 3,
+		dnsServer: ip, dnsPort: port,
+	}
+	if err := uploadFile(resolver, uploadCfg); err != nil {
+		t.Fatalf("uploadFile empty: %v", err)
+	}
+	outputPath := filepath.Join(t.TempDir(), "downloaded-empty.bin")
+	downloadCfg := config{
+		domain: "files.test", pass: "integration-test-secret",
+		filename: "empty.bin", outFile: outputPath, retries: 3,
+		dnsServer: ip, dnsPort: port, maxDownloadBytes: defaultMaxDownloadBytes,
+	}
+	if err := downloadFile(resolver, downloadCfg); err != nil {
+		t.Fatalf("downloadFile empty: %v", err)
+	}
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read downloaded empty file: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty file, got %d bytes", len(got))
+	}
+}
+
 func TestUploadDownloadFileIntegrationOverTCP(t *testing.T) {
 	dataDir := t.TempDir()
 	ip, port := startEmbeddedTCPServer(t, newServerCfg(t, dataDir))
@@ -785,7 +819,7 @@ func TestValidateDownloadShapeAndSpoolReadErrors(t *testing.T) {
 		encoded, limit int64
 	}{
 		{0, 1, 1, 1}, {1, 0, 1, 1}, {1, 1, 0, 1}, {1, 1, 1, 0},
-		{1, 1, 100, 1}, {2, 1, 10, 100},
+		{1, 1, 145, 1}, {2, 1, 10, 100},
 	} {
 		if err := validateDownloadShape(tc.chunks, tc.batch, tc.encoded, tc.limit); err == nil {
 			t.Fatalf("invalid shape accepted: %+v", tc)

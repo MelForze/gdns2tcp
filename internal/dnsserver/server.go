@@ -753,7 +753,7 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 	if encoding != "base32" && encoding != "base64" {
 		return []string{"Incorrect upload encoding."}
 	}
-	maxWireLength := safeDouble(s.maxUploadBytes)
+	maxWireLength := codec.MaxEncodedSizeForSource(s.maxUploadBytes)
 	if int64(total) > (maxWireLength+int64(chunkSize)-1)/int64(chunkSize) {
 		return []string{"Upload is too large for this server policy."}
 	}
@@ -1297,7 +1297,7 @@ var clientBootstrapTemplate = strings.Join([]string{
 	`{{ALIAS}}`,
 	`B=14;P=16;NL=$(printf '\n')`,
 	`q(){ for i in 1 2 3;do o=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT|tr -d "\"$NL ");[ -n "$o" ]&&{ printf %s "$o";return;};sleep .5;done;return 1;}`,
-	`qb(){ for i in 1 2 3;do r=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT|tr -d \"|tr "$NL" ' ');d=$(printf %s "$r"|awk '{for(i=2;i<=NF;i++)printf"%s",$i}');[ -n "$d" ]&&{ printf %s "$d";return;};sleep .5;done;return 1;}`,
+	`qb(){ for i in 1 2 3;do r=$(dig +short +time=5 +tries=1 +tcp ${S:+@$S} "$1" TXT|tr -d \"|tr "$NL" ' ');d=$(printf %s "$r"|awk '{for(i=2;i<=NF;i++)printf"%s",$i}');[ -n "$d" ]||{ sleep .5;continue;};h=$(printf %s "$r"|awk '{print substr($1,3)}');a=$(printf %s "$d"|shasum -a 256|cut -d" " -f1);[ "$h" = "$a" ]&&{ printf %s "$d";return;};sleep .5;done;return 1;}`,
 	`m=$(q "client-$A.$D")||exit 1;NAME=${m%%|*};r=${m#*|};N=${r%%|*};SHA=${r#*|}`,
 	`T=$(mktemp -d);i=0;k=0`,
 	`while [ $i -lt $N ];do c=$B;[ $((i+c)) -gt $N ]&&c=$((N-i));(qb "$i.$c.clb-$A.$D">"$T/$k"||touch "$T/.e")& i=$((i+c));k=$((k+1));[ $((k%P)) -eq 0 ]&&wait;done;wait`,
@@ -1354,7 +1354,7 @@ var psBootstrapTemplate = strings.Join([]string{
 	`$rdn=$null-ne(Get-Command Resolve-DnsName -EA 0)`,
 	"function qr($n){if($rdn){$p=@{Name=$n;Type='TXT';TcpOnly=$true;DnsOnly=$true;NoHostsFile=$true;QuickTimeout=$true;EA='Stop'};if($S){$p['Server']=$S};$r=Resolve-DnsName @p;return @(foreach($x in $r){if($x.Strings){$x.Strings}})}$r=if($S){nslookup -vc -type=TXT $n $S 2>$null}else{nslookup -vc -type=TXT $n 2>$null};return @([regex]::Matches(($r-join\"`n\"),'\"([^\"]*)\"')|%{$_.Groups[1].Value})}",
 	"function qm($n){for($k=1;$k-le 3;$k++){try{$m=qr $n;if($m.Count){return($m-join\"\")}}catch{};sleep -ms 500};throw \"no TXT for $n\"}",
-	"function qb($n){for($k=1;$k-le 3;$k++){try{$m=qr $n;if($m.Count-ge 2){return(($m|Select -Skip 1)-join\"\")}}catch{};sleep -ms 500};throw \"batch failed for $n\"}",
+	"function qb($n){for($k=1;$k-le 3;$k++){try{$m=qr $n;if($m.Count-ge 2){$d=($m|Select -Skip 1)-join\"\";$h=$m[0].Substring(2);$a=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($d))).Replace('-','').ToLower();if($h-eq $a){return $d}}}catch{};sleep -ms 500};throw \"batch failed for $n\"}",
 	"$man=qm \"client-$A.$D\";$p=$man.Split('|');[int]$n=$p[1];$name=$p[0];$sha=$p[2].ToLower()",
 	`$total=[Math]::Ceiling($n/$B);$b64=[Text.StringBuilder]::new($n*260);$i=0;$j=0`,
 	"while($i-lt $n){$c=[Math]::Min($B,$n-$i);[void]$b64.Append((qb \"$i.$c.clb-$A.$D\"));$i+=$c;$j++",

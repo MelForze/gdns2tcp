@@ -132,7 +132,7 @@ func downloadCacheKey(path, sourceSHA string) string {
 
 func cacheBuildReservation(sourceSize int64) int64 {
 	const overhead = int64(1 << 20)
-	if sourceSize <= 0 || sourceSize > (int64(^uint64(0)>>1)-overhead)/3 {
+	if sourceSize < 0 || sourceSize > (int64(^uint64(0)>>1)-overhead)/3 {
 		return int64(^uint64(0) >> 1)
 	}
 	// At phase boundaries buildDownloadCache removes the previous temporary

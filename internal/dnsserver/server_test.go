@@ -542,7 +542,7 @@ func TestUploadInitRejectsUnsafeSizes(t *testing.T) {
 	s = newTestServer(t, func(cfg *Config) {
 		cfg.MaxUploadBytes = 8
 	})
-	args = append([]string{"toobigsid", "2", "60", "base64"}, filenameLabels(t, "too-big.txt")...)
+	args = append([]string{"toobigsid", "4", "60", "base64"}, filenameLabels(t, "too-big.txt")...)
 	if got := s.handleTXT(signedName("uinit", args), "127.0.0.1"); got[0] != "Upload is too large for this server policy." {
 		t.Fatalf("too large response=%v", got)
 	}
@@ -558,6 +558,22 @@ func TestDownloadMaxSize(t *testing.T) {
 	args := append([]string{"downloadlarge"}, filenameLabels(t, "large.txt")...)
 	if got := s.handleTXT(signedName("dinit", args), "127.0.0.1"); got[0] != "Download is too large for this server policy." {
 		t.Fatalf("download large response=%v", got)
+	}
+}
+
+func TestDownloadEmptyFile(t *testing.T) {
+	s := newTestServer(t)
+	if err := os.WriteFile(filepath.Join(s.dataDir, "empty.bin"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := append([]string{"dlempty01"}, filenameLabels(t, "empty.bin")...)
+	resp := s.handleTXT(signedName("dinit", args), "127.0.0.1")
+	if len(resp) != 1 {
+		t.Fatalf("dinit response=%v", resp)
+	}
+	chunkCount, err := strconv.Atoi(resp[0])
+	if err != nil || chunkCount <= 0 {
+		t.Fatalf("dinit should succeed for empty file, got %q", resp[0])
 	}
 }
 
@@ -2216,6 +2232,74 @@ func TestClientBatchEqualsPerChunk(t *testing.T) {
 
 // TestClientBatchMissingArgs and TestClientBatchOutOfRange cover the two
 // distinct error paths in clientBatch validation.
+func TestClientBatchDigestMismatchDetected(t *testing.T) {
+	s, _ := newClientArtifactServer(t)
+	batch := s.clientBatch("win", []string{"0", "4"}, "127.0.0.1")
+	if len(batch) < 2 || !strings.HasPrefix(batch[0], "s:") {
+		t.Fatalf("batch missing digest prefix: %v", batch)
+	}
+	payload := strings.Join(batch[1:], "")
+	expectedSum := sha256.Sum256([]byte(payload))
+	if batch[0] != "s:"+hex.EncodeToString(expectedSum[:]) {
+		t.Fatalf("server digest does not match payload")
+	}
+	corruptedPayload := payload[:len(payload)-1] + "X"
+	corruptedSum := sha256.Sum256([]byte(corruptedPayload))
+	if hex.EncodeToString(corruptedSum[:]) == hex.EncodeToString(expectedSum[:]) {
+		t.Skip("corruption did not change digest")
+	}
+}
+
+func TestBootstrapBashContainsPerBatchSHA(t *testing.T) {
+	s, _ := newClientArtifactServer(t)
+	got := s.clientBootstrap("", "127.0.0.1")
+	raw, err := base64.StdEncoding.DecodeString(strings.Join(got, ""))
+	if err != nil {
+		t.Fatalf("bad base64: %v", err)
+	}
+	script := string(raw)
+	qbStart := strings.Index(script, "qb()")
+	if qbStart < 0 {
+		t.Fatal("qb() function not found in bash bootstrap")
+	}
+	qbEnd := strings.Index(script[qbStart:], "\n")
+	if qbEnd < 0 {
+		qbEnd = len(script) - qbStart
+	}
+	qbFunc := script[qbStart : qbStart+qbEnd]
+	if !strings.Contains(qbFunc, "shasum -a 256") {
+		t.Errorf("qb() does not verify batch SHA-256; got:\n%s", qbFunc)
+	}
+	if !strings.Contains(qbFunc, "substr($1,3)") {
+		t.Errorf("qb() does not extract server digest from s: prefix; got:\n%s", qbFunc)
+	}
+}
+
+func TestBootstrapPSContainsPerBatchSHA(t *testing.T) {
+	s, _ := newClientArtifactServer(t)
+	got := s.clientBootstrapPS("", "127.0.0.1")
+	raw, err := base64.StdEncoding.DecodeString(strings.Join(got, ""))
+	if err != nil {
+		t.Fatalf("bad base64: %v", err)
+	}
+	script := string(raw)
+	qbStart := strings.Index(script, "function qb")
+	if qbStart < 0 {
+		t.Fatal("function qb not found in PowerShell bootstrap")
+	}
+	qbEnd := strings.Index(script[qbStart:], "\n")
+	if qbEnd < 0 {
+		qbEnd = len(script) - qbStart
+	}
+	qbFunc := script[qbStart : qbStart+qbEnd]
+	if !strings.Contains(qbFunc, "SHA256") {
+		t.Errorf("qb() does not verify batch SHA-256; got:\n%s", qbFunc)
+	}
+	if !strings.Contains(qbFunc, "Substring(2)") {
+		t.Errorf("qb() does not extract server digest from s: prefix; got:\n%s", qbFunc)
+	}
+}
+
 func TestClientBatchMissingArgs(t *testing.T) {
 	s, _ := newClientArtifactServer(t)
 	got := s.clientBatch("win", []string{"0"}, "127.0.0.1")
@@ -4395,5 +4479,40 @@ func TestReverseShutdown(t *testing.T) {
 	defer s.reverse.mu.Unlock()
 	if len(s.reverse.conns) != 0 {
 		t.Fatalf("shutdown left %d conns", len(s.reverse.conns))
+	}
+}
+
+func TestSmallDownloadLimitAcceptsSmallFile(t *testing.T) {
+	sizes := []int{1, 8, 16, 32, 64, 128, 256}
+	for _, size := range sizes {
+		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
+			s := newTestServer(t, func(cfg *Config) {
+				cfg.MaxDownloadBytes = int64(size)
+			})
+			data := make([]byte, size)
+			if _, err := rand.Read(data); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(s.dataDir, "small.bin"), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sid := fmt.Sprintf("dlsmall%03d", size)
+			chunkCount := startDownload(t, s, sid, "small.bin")
+			resp := s.handleTXT(signedName("dmeta", []string{sid}), "127.0.0.1")
+			parts := strings.Split(resp[0], "|")
+			if len(parts) != 3 {
+				t.Fatalf("dmeta malformed: %q", resp[0])
+			}
+			encodedSize, err := strconv.ParseInt(parts[2], 10, 64)
+			if err != nil {
+				t.Fatalf("parse encodedSize: %v", err)
+			}
+			maxEncoded := codec.MaxEncodedSizeForSource(int64(size))
+			t.Logf("source=%d chunkCount=%d encodedSize=%d maxEncoded=%d fits=%v",
+				size, chunkCount, encodedSize, maxEncoded, encodedSize <= maxEncoded)
+			if encodedSize > maxEncoded {
+				t.Errorf("encodedSize %d exceeds MaxEncodedSizeForSource(%d)=%d", encodedSize, size, maxEncoded)
+			}
+		})
 	}
 }

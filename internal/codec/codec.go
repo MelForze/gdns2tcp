@@ -89,6 +89,43 @@ func DecompressLimit(data []byte, maxBytes int64) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// MaxEncodedSizeForSource returns a conservative upper bound on the
+// base64-encoded output of the pipeline source → gzip → GDT2 AES-CBC
+// container → base64 for an incompressible source of the given byte
+// length. Use it instead of a fixed 2× multiplier when bounding encoded
+// wire size from a source/decompressed size limit.
+func MaxEncodedSizeForSource(sourceSize int64) int64 {
+	if sourceSize < 0 {
+		return 0
+	}
+	// Worst-case gzip for incompressible data: stored deflate blocks.
+	//   header(10) + one block header(5) + raw data(N) + trailer(8) = N+23
+	//   Each additional 65535-byte block adds a 5-byte header.
+	gzipOverhead := int64(23)
+	if sourceSize > 65535 {
+		gzipOverhead += (sourceSize / 65535) * 5
+	}
+	compressed := sourceSize + gzipOverhead
+	if compressed < sourceSize {
+		return 1<<63 - 1
+	}
+
+	// GDT2 container: magic(4) + salt(16) + iv(16) + mac(32) = 68-byte
+	// header, then PKCS7 padding adds 1–16 bytes.
+	const cryptoOverhead = 84 // 68 header + 16 max padding
+	encrypted := compressed + cryptoOverhead
+	if encrypted < compressed {
+		return 1<<63 - 1
+	}
+
+	// Standard base64: ceil(n/3)*4
+	encoded := ((encrypted + 2) / 3) * 4
+	if encoded < encrypted {
+		return 1<<63 - 1
+	}
+	return encoded
+}
+
 func positiveMod(d, m int) int {
 	res := d % m
 	if res != 0 && (res < 0) != (m < 0) {

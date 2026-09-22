@@ -996,12 +996,7 @@ func validateDownloadShape(chunkCount, batchSize int, encodedSize, maxDownloadBy
 	if chunkCount <= 0 || batchSize <= 0 || encodedSize <= 0 || maxDownloadBytes <= 0 {
 		return errors.New("invalid authenticated download metadata")
 	}
-	maxEncoded := maxDownloadBytes
-	if maxEncoded <= (int64(^uint64(0)>>1))/2 {
-		maxEncoded *= 2
-	} else {
-		maxEncoded = int64(^uint64(0) >> 1)
-	}
+	maxEncoded := codec.MaxEncodedSizeForSource(maxDownloadBytes)
 	if encodedSize > maxEncoded {
 		return fmt.Errorf("encoded download exceeds configured byte limit")
 	}

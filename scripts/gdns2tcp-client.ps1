@@ -1890,7 +1890,8 @@ function Invoke-Download {
     if (-not [int]::TryParse($meta[0], [ref]$metaChunks) -or $metaChunks -ne $chunkCount) { throw 'Download metadata chunk count mismatch.' }
     if ($meta[1] -notmatch '^[a-fA-F0-9]{64}$') { throw 'Download metadata digest is malformed.' }
     if (-not [int64]::TryParse($meta[2], [ref]$encodedSize) -or $encodedSize -le 0) { throw 'Download metadata encoded size is malformed.' }
-    [int64]$maxEncoded = if ($MaxDownloadBytes -gt ([int64]::MaxValue / 2)) { [int64]::MaxValue } else { $MaxDownloadBytes * 2 }
+    [int64]$gzOH = 23; if ($MaxDownloadBytes -gt 65535) { $gzOH += [int64][Math]::Floor($MaxDownloadBytes / 65535) * 5 }
+    [int64]$maxEncoded = [int64]([Math]::Ceiling(($MaxDownloadBytes + $gzOH + 84 + 2) / 3.0)) * 4
     if ($encodedSize -gt $maxEncoded) { throw "Encoded download exceeds the configured $MaxDownloadBytes-byte limit." }
     [int64]$expectedChunks = [int64][Math]::Ceiling($encodedSize / 254.0)
     if ($expectedChunks -ne $chunkCount) { throw 'Download metadata size does not match chunk count.' }

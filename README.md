@@ -218,7 +218,7 @@ sudo ./gdns2tcp -domain files.example.com,files1.example.com,files2.example.com 
 ```
 
 The first domain is canonical (HMAC signatures are computed under it).
-Clients accept the same CSV form in their `-domain` flag.
+The Go client accepts the same CSV form in its `-domain` flag; the PowerShell client currently supports a single domain only.
 
 ### Transfer limits
 
