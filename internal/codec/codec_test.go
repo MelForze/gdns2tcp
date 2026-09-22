@@ -302,3 +302,21 @@ func TestStreamingCodecRejectsDirectoryDestinations(t *testing.T) {
 		t.Fatal("decompression to a directory succeeded")
 	}
 }
+
+func TestMaxEncodedSizeForSource(t *testing.T) {
+	if MaxEncodedSizeForSource(-1) != 0 {
+		t.Fatal("negative size should return 0")
+	}
+	if MaxEncodedSizeForSource(0) <= 0 {
+		t.Fatal("zero source should produce positive bound")
+	}
+	for _, size := range []int64{1, 8, 64, 256, 1024, 65535, 65536, 1 << 20} {
+		bound := MaxEncodedSizeForSource(size)
+		if bound <= size {
+			t.Fatalf("bound %d must exceed source size %d", bound, size)
+		}
+	}
+	if MaxEncodedSizeForSource(1<<63-1) != 1<<63-1 {
+		t.Fatal("huge input should return MaxInt64 sentinel")
+	}
+}
