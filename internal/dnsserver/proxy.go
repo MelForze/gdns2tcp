@@ -340,6 +340,9 @@ func (rc *reverseConn) acceptNonce(n uint64) bool {
 	if rc.nonceSeen == nil {
 		rc.nonceSeen = make(map[uint64]struct{}, nonceReplayWindow)
 	}
+	if rc.nonceFloor > nonceReplayWindow && n+nonceReplayWindow < rc.nonceFloor {
+		return false
+	}
 	if n > rc.nonceFloor {
 		rc.nonceFloor = n
 	}

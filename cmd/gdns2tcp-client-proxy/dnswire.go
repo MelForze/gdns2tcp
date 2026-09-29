@@ -545,9 +545,6 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 	e.conn = nil
 	e.closed = true
 	e.generation++
-	// Drain only requests owned by the broken generation before creating a
-	// new one.  Closing old first forces its readLoop to exit; its deferred
-	// cleanup is generation-gated and therefore cannot touch new pending IDs.
 	if old != nil {
 		_ = old.Close()
 	}
@@ -555,19 +552,24 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 		close(ch)
 		delete(e.pending, id)
 	}
+	e.parent.mu.Unlock()
+
 	conn, err := e.parent.dial(e.parent.addr, timeout)
 	if err != nil {
 		e.connectErr = err
-		e.parent.mu.Unlock()
 		return err
 	}
-	// Шаг G: tune the long-lived DNS-over-TCP socket. NoDelay matters most
-	// for axchg's tiny query/response pairs where Nagle would batch them
-	// against the previous reply and add a full RTT.
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	e.parent.mu.Lock()
+	if e.parent.closed {
+		e.parent.mu.Unlock()
+		_ = conn.Close()
+		return errors.New("tcp pool closed")
 	}
 	e.conn = conn
 	e.closed = false

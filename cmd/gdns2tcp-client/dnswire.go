@@ -268,10 +268,6 @@ func dialTCPConn(addr string, timeout time.Duration) (net.Conn, error) {
 // previous read/write error. Caller must hold e.mu. The pending map is
 // drained before dial so the new conn starts with a clean slate.
 //
-// Known limitation: this runs DialTimeout while holding e.mu, so other
-// workers round-robined to this entry stall up to `timeout` on dial.
-// Mitigated by tcpPoolMaxRetries in pool.exchange — if a conn is busy
-// dialing, the worker picks another entry on the next attempt.
 func (e *tcpConnEntry) ensureLocked(timeout time.Duration) error {
 	e.parent.mu.Lock()
 	if e.parent.closed {
@@ -290,11 +286,19 @@ func (e *tcpConnEntry) ensureLocked(timeout time.Duration) error {
 		_ = e.conn.Close()
 		e.conn = nil
 	}
+	e.parent.mu.Unlock()
+
 	conn, err := dialTCPConn(e.parent.addr, timeout)
 	if err != nil {
 		e.closed = true
-		e.parent.mu.Unlock()
 		return err
+	}
+
+	e.parent.mu.Lock()
+	if e.parent.closed {
+		e.parent.mu.Unlock()
+		_ = conn.Close()
+		return errResolverClosed
 	}
 	e.conn = conn
 	e.closed = false

@@ -5093,7 +5093,6 @@ func TestClientIDNil(t *testing.T) {
 }
 
 func TestClientIDNoPort(t *testing.T) {
-	type fakeAddr struct{}
 	got := clientID(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 0})
 	if got != "192.168.1.1" {
 		t.Fatalf("expected 192.168.1.1, got %q", got)

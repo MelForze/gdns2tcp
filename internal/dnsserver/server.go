@@ -955,7 +955,15 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 		if s.finishUploadHook != nil {
 			s.finishUploadHook()
 		}
-		result := s.finishUpload(sid, state)
+		result := func() (r string) {
+			defer func() {
+				if p := recover(); p != nil {
+					r = "Server internal error."
+					s.logger.Printf("panic in finishUpload %s: %v", sid, p)
+				}
+			}()
+			return s.finishUpload(sid, state)
+		}()
 		s.mu.Lock()
 		completion.result = result
 		completion.expires = time.Now().UTC().Add(transferTTL)
