@@ -3,6 +3,7 @@ package dnsserver
 import (
 	"bytes"
 	"crypto/cipher"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -308,7 +309,10 @@ func (rc *reverseConn) awaitReadData(window time.Duration) bool {
 		rc.mu.Lock()
 		for i, w := range rc.readWaiters {
 			if w == ch {
-				rc.readWaiters = append(rc.readWaiters[:i], rc.readWaiters[i+1:]...)
+				last := len(rc.readWaiters) - 1
+				rc.readWaiters[i] = rc.readWaiters[last]
+				rc.readWaiters[last] = nil
+				rc.readWaiters = rc.readWaiters[:last]
 				break
 			}
 		}
@@ -347,11 +351,13 @@ func (rc *reverseConn) acceptNonce(n uint64) bool {
 	if rc.noncePruneCounter >= noncePruneBatch && len(rc.nonceSeen) > nonceReplayWindow {
 		rc.noncePruneCounter = 0
 		cutoff := rc.nonceFloor - nonceReplayWindow
+		fresh := make(map[uint64]struct{}, len(rc.nonceSeen))
 		for seen := range rc.nonceSeen {
-			if seen < cutoff {
-				delete(rc.nonceSeen, seen)
+			if seen >= cutoff {
+				fresh[seen] = struct{}{}
 			}
 		}
+		rc.nonceSeen = fresh
 	}
 	return true
 }
@@ -488,16 +494,20 @@ func (rc *reverseConn) applyReadAck(ack uint64) {
 		return
 	}
 	rc.readAck = ack
+	freed := false
 	for seq, retained := range rc.outbound {
 		if seq <= ack {
 			rc.outboundPlainBytes -= retained.plainBytes
 			delete(rc.outbound, seq)
+			freed = true
 		}
 	}
 	if rc.outboundPlainBytes < 0 {
 		rc.outboundPlainBytes = 0
 	}
-	rc.opCond.Broadcast()
+	if freed {
+		rc.opCond.Broadcast()
+	}
 }
 
 func (rc *reverseConn) signalOpen(status byte) {
@@ -709,8 +719,10 @@ func (s *Server) runFirstAcceptWatchdog(addr string, accepts *atomic.Int64) {
 			return
 		}
 	}
+	timer := time.NewTimer(s.reverse.watchdogWindow)
+	defer timer.Stop()
 	select {
-	case <-time.After(s.reverse.watchdogWindow):
+	case <-timer.C:
 	case <-s.reverse.shutdownCh:
 		return
 	}
@@ -884,6 +896,12 @@ func (s *Server) reverseEnqueueOpen(target string, op net.Conn) (string, *revers
 // reversePumpOperator copies the operator's TCP bytes into opToAgent. Pauses
 // when the buffer is at cap; resumes after the agent's aread drains it.
 func (s *Server) reversePumpOperator(cid string, rc *reverseConn) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.reverse.logger.Printf("reversePumpOperator panic cid=%s: %v", cid, r)
+			s.reverseCloseConn(cid, rc, fmt.Sprintf("pump panic: %v", r))
+		}
+	}()
 	readSize := 32768
 	if s.reverse.maxBufCap < readSize {
 		readSize = s.reverse.maxBufCap
@@ -978,18 +996,22 @@ func (r *reverseState) removeConnLocked(cid string, rc *reverseConn) string {
 			cid = known
 		}
 	}
+	cidFound := false
 	if cid != "" && cid != "?" {
 		if r.conns[cid] == rc {
 			delete(r.conns, cid)
+			cidFound = true
 		}
 	}
-	for known, c := range r.conns {
-		if c == rc {
-			delete(r.conns, known)
-			if cid == "" || cid == "?" {
-				cid = known
+	if !cidFound {
+		for known, c := range r.conns {
+			if c == rc {
+				delete(r.conns, known)
+				if cid == "" || cid == "?" {
+					cid = known
+				}
+				break
 			}
-			break
 		}
 	}
 	if known, ok := r.pendCids[rc]; ok {
@@ -1000,7 +1022,10 @@ func (r *reverseState) removeConnLocked(cid string, rc *reverseConn) string {
 	}
 	for i, pending := range r.pending {
 		if pending == rc {
-			r.pending = append(r.pending[:i], r.pending[i+1:]...)
+			last := len(r.pending) - 1
+			r.pending[i] = r.pending[last]
+			r.pending[last] = nil
+			r.pending = r.pending[:last]
 			break
 		}
 	}
@@ -1178,7 +1203,10 @@ func (s *Server) proxyAgentOpen(args []string, now time.Time) []string {
 		// eligible for any other agent's poll.
 		for i, pending := range s.reverse.pending {
 			if pending == rc {
-				s.reverse.pending = append(s.reverse.pending[:i], s.reverse.pending[i+1:]...)
+				last := len(s.reverse.pending) - 1
+				s.reverse.pending[i] = s.reverse.pending[last]
+				s.reverse.pending[last] = nil
+				s.reverse.pending = s.reverse.pending[:last]
 				break
 			}
 		}
@@ -1770,6 +1798,16 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	rc.expires = now.Add(reverseTTL)
 	rc.mu.Unlock()
 
+	committed := false
+	defer func() {
+		if !committed {
+			rc.mu.Lock()
+			rc.outboundInFlight--
+			rc.outboundReservedBytes -= take
+			rc.mu.Unlock()
+		}
+	}()
+
 	plaintext := rc.compressor.Encode(*rawBuf)
 	// Same pool-friendly seal pattern as collectAgentRead.
 	ctBufPtr2 := gproxy.GetBuf(len(plaintext) + 16)
@@ -1779,6 +1817,7 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	out := []string{"DATA " + strconv.FormatUint(seq, 16)}
 	out = append(out, codec.ChunkString(b64, codec.TXTChunkSize)...)
 	rc.mu.Lock()
+	committed = true
 	if rc.outbound == nil {
 		rc.outbound = make(map[uint64]outboundProxyResponse)
 	}
@@ -2028,7 +2067,7 @@ func socks5Authenticate(conn net.Conn, secret string) error {
 	if _, err := io.ReadFull(conn, passwd); err != nil {
 		return err
 	}
-	if string(uname) != "gdns2tcp" || string(passwd) != secret {
+	if subtle.ConstantTimeCompare(uname, []byte("gdns2tcp")) != 1 || subtle.ConstantTimeCompare(passwd, []byte(secret)) != 1 {
 		_, _ = conn.Write([]byte{0x01, 0x01}) // status≠0 = failure
 		return errors.New("invalid credentials")
 	}
@@ -2057,6 +2096,9 @@ func socks5ReadConnect(conn net.Conn) (string, error) {
 		l := make([]byte, 1)
 		if _, err := io.ReadFull(conn, l); err != nil {
 			return "", err
+		}
+		if l[0] == 0 {
+			return "", errors.New("empty SOCKS5 domain name")
 		}
 		buf := make([]byte, int(l[0]))
 		if _, err := io.ReadFull(conn, buf); err != nil {

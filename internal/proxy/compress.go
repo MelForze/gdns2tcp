@@ -76,15 +76,18 @@ var encodeScratchPool = sync.Pool{
 // buffer). The internal zstd scratch buffer is pooled.
 func (c *Compressor) Encode(src []byte) []byte {
 	sp := encodeScratchPool.Get().(*[]byte)
-	*sp = (*sp)[:0]
+	// Reserve byte 0 for the flag; encode into [1:].
+	*sp = append((*sp)[:0], 0)
 	encoded := c.enc.EncodeAll(src, *sp)
-	*sp = encoded
-	defer encodeScratchPool.Put(sp)
+	defer func() {
+		*sp = encoded
+		encodeScratchPool.Put(sp)
+	}()
 
-	if len(encoded) < len(src) {
-		out := make([]byte, 1+len(encoded))
-		out[0] = 0x01
-		copy(out[1:], encoded)
+	if len(encoded)-1 < len(src) {
+		encoded[0] = 0x01
+		out := make([]byte, len(encoded))
+		copy(out, encoded)
 		return out
 	}
 	out := make([]byte, 1+len(src))

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,8 +10,10 @@ import (
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"gdns2tcp/internal/clihelp"
@@ -187,6 +190,9 @@ func run() error {
 			}
 		}
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	udpSrv, tcpSrv := newDNSServers(addr, server)
 	errCh := make(chan error, 3)
 	go func() { errCh <- udpSrv.ListenAndServe() }()
@@ -194,7 +200,12 @@ func run() error {
 	if allowProxy {
 		go func() { errCh <- server.ServeSOCKS5(socksListen) }()
 	}
-	firstErr := <-errCh
+	var firstErr error
+	select {
+	case firstErr = <-errCh:
+	case <-ctx.Done():
+		log.Printf("received shutdown signal, stopping gracefully…")
+	}
 	server.Shutdown()
 	_ = udpSrv.Shutdown()
 	_ = tcpSrv.Shutdown()

@@ -32,10 +32,14 @@ func acquireResumeFileLock(path string, nonBlocking bool) (*resumeFileLock, erro
 			return nil, err
 		}
 		// If the lock file is older than lockStaleAge, the holder likely
-		// crashed without cleaning up. Remove the stale file and retry.
+		// crashed without cleaning up. Rename atomically so that a concurrent
+		// acquirer cannot lose a valid lock between our Stat and Remove.
 		if info, statErr := os.Stat(lockPath); statErr == nil {
 			if time.Since(info.ModTime()) > lockStaleAge {
-				_ = os.Remove(lockPath)
+				stale := lockPath + ".stale"
+				if os.Rename(lockPath, stale) == nil {
+					_ = os.Remove(stale)
+				}
 				continue
 			}
 		}

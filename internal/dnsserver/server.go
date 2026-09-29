@@ -41,9 +41,10 @@ const (
 	// gzip/GDT2/base64, or about 1.41 million 254-byte TXT chunks.  Keep the
 	// guard above that real worst case; transfer state is now disk-backed, so
 	// this no longer implies a multi-million-element in-memory payload.
-	maxTransferChunks  = 2_000_000
-	maxDownloadBatch   = 32
-	transferTTL        = 10 * time.Minute
+	maxTransferChunks      = 2_000_000
+	maxDownloadBatch       = 32
+	maxConcurrentUploads   = 128
+	transferTTL            = 10 * time.Minute
 	clientTransferTTL  = 10 * time.Minute
 	authFailedResponse = "Authentication failed."
 )
@@ -827,6 +828,12 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 		_ = os.Remove(spool.Name())
 		return []string{"Transfer already exists."}
 	}
+	if len(s.uploads) >= maxConcurrentUploads {
+		s.mu.Unlock()
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
+		return []string{"Too many concurrent uploads."}
+	}
 	s.uploads[sid] = state
 	s.mu.Unlock()
 
@@ -978,6 +985,7 @@ func (s *Server) finishUpload(sid string, state *uploadState) string {
 		failed = false
 		return "Cannot write file."
 	}
+	state.spool = nil
 	failed = false
 	protected, err := os.CreateTemp(s.dataDir, ".gdns2tcp-upload-protected-*")
 	if err != nil {

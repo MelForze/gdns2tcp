@@ -100,6 +100,15 @@ func ValidateDomain(domain string) error {
 		if label == "" || len(label) > 63 {
 			return fmt.Errorf("invalid domain label %q", label)
 		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+				return fmt.Errorf("invalid character %q in domain label %q", string(rune(c)), label)
+			}
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("domain label %q must not start or end with a hyphen", label)
+		}
 	}
 	return nil
 }
