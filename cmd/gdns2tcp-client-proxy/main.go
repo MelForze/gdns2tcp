@@ -82,6 +82,10 @@ type config struct {
 	// conservative profile to avoid rate limits and transient SERVFAILs.
 	dnsPathKnown     bool
 	dnsAuthoritative bool
+
+	// querySem limits total concurrent DNS queries across all tunnels.
+	// Nil in tests — workers then run without global throttling.
+	querySem chan struct{}
 }
 
 // longestBudgetDomain returns the domain the QNAME-length budget must
@@ -219,6 +223,7 @@ func runAgentWithContext(ctx context.Context, cfg config) error {
 			fmt.Fprintf(os.Stderr, "warning: authoritative DNS probe failed: %v\n", probeErr)
 		}
 	}
+	cfg.querySem = make(chan struct{}, tuningForCfg(cfg).workers)
 	fmt.Printf("polling %s for tunnel requests (max %d concurrent)\n", cfg.domain, cfg.maxConn)
 
 	var live atomic.Int64
@@ -556,12 +561,12 @@ var (
 	udpTuning = tunnelTuning{
 		workers:         96,
 		reorderCap:      96 * 4,
-		backpressureCap: 5 * time.Minute,
+		backpressureCap: 30 * time.Second,
 	}
 	tcpTuning = tunnelTuning{
 		workers:         32,
 		reorderCap:      32 * 4,
-		backpressureCap: 5 * time.Minute,
+		backpressureCap: 30 * time.Second,
 	}
 	// Recursive resolvers frequently rate-limit the 32/96-worker direct
 	// profile. Keep enough parallelism for interactive and LDAP traffic while
@@ -569,12 +574,12 @@ var (
 	recursiveUDPTuning = tunnelTuning{
 		workers:         12,
 		reorderCap:      12 * 4,
-		backpressureCap: 5 * time.Minute,
+		backpressureCap: 30 * time.Second,
 	}
 	recursiveTCPTuning = tunnelTuning{
 		workers:         8,
 		reorderCap:      8 * 4,
-		backpressureCap: 5 * time.Minute,
+		backpressureCap: 30 * time.Second,
 	}
 )
 
@@ -641,6 +646,56 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 		lifecycleWG.Wait()
 	}()
 
+	var activeLimit atomic.Int32
+	activeLimit.Store(int32(tuning.workers))
+	var axchgSuccesses, axchgErrors atomic.Int64
+
+	lifecycleWG.Add(1)
+	go func() {
+		defer lifecycleWG.Done()
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		minW := int32(tuning.workers / 8)
+		if minW < 2 {
+			minW = 2
+		}
+		maxW := int32(tuning.workers)
+		step := int32(tuning.workers / 8)
+		if step < 1 {
+			step = 1
+		}
+		for {
+			select {
+			case <-done:
+				return
+			case <-internalStop:
+				return
+			case <-ticker.C:
+				succ := axchgSuccesses.Swap(0)
+				errs := axchgErrors.Swap(0)
+				total := succ + errs
+				if total < 4 {
+					continue
+				}
+				cur := activeLimit.Load()
+				errRate := float64(errs) / float64(total)
+				if errRate > 0.3 && cur > minW {
+					n := cur - step
+					if n < minW {
+						n = minW
+					}
+					activeLimit.Store(n)
+				} else if errRate < 0.05 && cur < maxW {
+					n := cur + step
+					if n > maxW {
+						n = maxW
+					}
+					activeLimit.Store(n)
+				}
+			}
+		}
+	}()
+
 	var workerWG sync.WaitGroup
 	for i := 0; i < tuning.workers; i++ {
 		workerWG.Add(1)
@@ -664,6 +719,18 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 				return d
 			}
 			for {
+				for int32(workerIdx) >= activeLimit.Load() {
+					t := time.NewTimer(500 * time.Millisecond)
+					select {
+					case <-done:
+						t.Stop()
+						return
+					case <-internalStop:
+						t.Stop()
+						return
+					case <-t.C:
+					}
+				}
 				var job awriteJob
 				haveJob := false
 				select {
@@ -707,11 +774,29 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 					backpressureStart time.Time
 				)
 				for {
+					if cfg.querySem != nil {
+						select {
+						case cfg.querySem <- struct{}{}:
+						case <-done:
+							if haveJob {
+								gproxy.PutBuf(job.bufPtr)
+							}
+							return
+						case <-internalStop:
+							if haveJob {
+								gproxy.PutBuf(job.bufPtr)
+							}
+							return
+						}
+					}
 					shardAuth := pickShard()
 					if haveJob {
-						res, err = agentExchange(cfg, resolver, ts, cid, job.seq, job.data, shardAuth)
+						res, err = agentExchange(cfg, resolver, ts, cid, job.seq, job.data, shardAuth, internalStop)
 					} else {
-						res, err = agentExchange(cfg, resolver, ts, cid, 0, nil, shardAuth)
+						res, err = agentExchange(cfg, resolver, ts, cid, 0, nil, shardAuth, internalStop)
+					}
+					if cfg.querySem != nil {
+						<-cfg.querySem
 					}
 					if err == nil {
 						break
@@ -721,20 +806,12 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 							backpressureStart = time.Now()
 						}
 						if time.Since(backpressureStart) <= tuning.backpressureCap {
-							// First few hits use a short sleep so a transient
-							// window-full (server's about to drain) recovers
-							// in ~1 ms instead of ~15 ms. Persistent
-							// backpressure escalates to the wider 5-24 ms
-							// jitter that spaces 32 workers apart.
 							var jitter time.Duration
 							if elapsedMs := time.Since(backpressureStart).Milliseconds(); elapsedMs < 20 {
 								jitter = time.Duration(1+rand.IntN(3)) * time.Millisecond
 							} else {
 								jitter = time.Duration(5+rand.IntN(20)) * time.Millisecond
 							}
-							// NewTimer+Stop instead of time.After so we don't
-							// leak timer goroutines when canceled via done/
-							// internalStop.
 							timer := time.NewTimer(jitter)
 							select {
 							case <-done:
@@ -750,19 +827,18 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 							continue
 						}
 					}
-					// agentExchange already retried the exact same QNAME for every
-					// transport failure.  Creating a new nonce now would abandon a
-					// possibly consumed server response, so fail closed instead.
 					break
 				}
 				if haveJob {
 					gproxy.PutBuf(job.bufPtr)
 				}
 				if err != nil {
+					axchgErrors.Add(1)
 					fmt.Fprintf(os.Stderr, "axchg cid=%s (%d attempts): %v\n", cid, cfg.retries, err)
 					stopAll()
 					return
 				}
+				axchgSuccesses.Add(1)
 				select {
 				case readResults <- res:
 				case <-done:
@@ -770,7 +846,7 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 				case <-internalStop:
 					return
 				}
-				if res.readClosed {
+				if res.readClosed && (res.ackedWriteSeq == 0 || !haveJob) {
 					return
 				}
 				if res.readEmpty && !haveJob {
@@ -889,13 +965,13 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 	}()
 
 	// Read reorder + writer: in-order delivery to upstream.
+	// Don't kill the tunnel on the first CLOSED — drain remaining results
+	// so in-flight DATA chunks are not discarded.
 	nextSeq := uint64(1)
 	pending := make(map[uint64][]byte, tuning.reorderCap)
 	for r := range readResults {
 		if r.readClosed {
-			stopAll()
-			drainExchange(readResults)
-			return
+			continue
 		}
 		if r.readEmpty || len(r.readData) == 0 {
 			continue
@@ -919,6 +995,7 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 	// readResults closed → all workers exited (clean teardown path).
 	// Queue any final contiguous reads, then warn if a gap left data stranded:
 	// the operator will see EOF mid-stream rather than silent truncation.
+	// Flush BEFORE stopAll so enqueueContiguous can still write to orderedReads.
 	_ = enqueueContiguous(pending, &nextSeq, orderedReads, done, internalStop)
 	deadline := cfg.targetTimeout
 	if deadline <= 0 {
@@ -1148,7 +1225,7 @@ type exchangeResult struct {
 // shardAuthDomain picks which configured shard suffix ends the QNAME.
 // HMAC/session MAC don't touch shardAuthDomain — they use ts.sessionKey
 // derived from canonical (cfg.domain), so any shard is auth-equivalent.
-func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, writeSeq uint64, writeData []byte, shardAuthDomain string) (exchangeResult, error) {
+func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid string, writeSeq uint64, writeData []byte, shardAuthDomain string, cancel <-chan struct{}) (exchangeResult, error) {
 	readNonce := ts.nextNonce()
 	args := make([]string, 0, 8)
 	args = append(args, cid, strconv.FormatUint(writeSeq, 16))
@@ -1197,7 +1274,17 @@ func agentExchange(cfg config, resolver *txtResolver, ts *tunnelSession, cid str
 			break
 		}
 		if attempt+1 < retries {
-			time.Sleep(time.Duration(attempt+1) * retryBackoff)
+			retryTimer := time.NewTimer(time.Duration(attempt+1) * retryBackoff)
+			if cancel != nil {
+				select {
+				case <-cancel:
+					retryTimer.Stop()
+					return exchangeResult{}, err
+				case <-retryTimer.C:
+				}
+			} else {
+				<-retryTimer.C
+			}
 		}
 	}
 	if err != nil {

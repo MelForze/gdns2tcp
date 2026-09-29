@@ -130,8 +130,9 @@ type reverseConn struct {
 	// bitmap was smaller but rejected valid replies with the UDP worker count
 	// (96) whenever scheduling reordered more than 64 requests.  Keep a
 	// bounded set instead; entries older than nonceReplayWindow are pruned.
-	nonceFloor uint64
-	nonceSeen  map[uint64]struct{}
+	nonceFloor        uint64
+	nonceSeen         map[uint64]struct{}
+	noncePruneCounter int
 
 	// readWaiters fans the "new operator bytes" signal out to every
 	// long-poll axchg/aread that's currently parked. reversePumpOperator
@@ -139,6 +140,10 @@ type reverseConn struct {
 	// wakes up immediately (Шаг C). Slice is drained on each signal —
 	// waiters re-register on their next call if they need to wait again.
 	readWaiters []chan struct{}
+
+	lastAxchgTime    time.Time
+	axchgHadData     bool
+	adaptivePollWind time.Duration
 }
 
 type cachedProxyResponse struct {
@@ -257,7 +262,9 @@ func (rc *reverseConn) commitOperatorWrite(batch net.Buffers) error {
 	for _, b := range batch {
 		want += int64(len(b))
 	}
+	rc.operator.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	n, err := batch.WriteTo(rc.operator)
+	rc.operator.SetWriteDeadline(time.Time{})
 	if err != nil {
 		return err
 	}
@@ -320,6 +327,8 @@ const longPollWindow = 150 * time.Millisecond
 // window. Caller must hold rc.mu.
 const nonceReplayWindow = 65536
 
+const noncePruneBatch = 512
+
 func (rc *reverseConn) acceptNonce(n uint64) bool {
 	if n == 0 {
 		return false
@@ -334,10 +343,12 @@ func (rc *reverseConn) acceptNonce(n uint64) bool {
 		return false
 	}
 	rc.nonceSeen[n] = struct{}{}
-	if len(rc.nonceSeen) > nonceReplayWindow {
-		floor := rc.nonceFloor
+	rc.noncePruneCounter++
+	if rc.noncePruneCounter >= noncePruneBatch && len(rc.nonceSeen) > nonceReplayWindow {
+		rc.noncePruneCounter = 0
+		cutoff := rc.nonceFloor - nonceReplayWindow
 		for seen := range rc.nonceSeen {
-			if seen < floor && floor-seen >= nonceReplayWindow {
+			if seen < cutoff {
 				delete(rc.nonceSeen, seen)
 			}
 		}
@@ -873,7 +884,7 @@ func (s *Server) reverseEnqueueOpen(target string, op net.Conn) (string, *revers
 // reversePumpOperator copies the operator's TCP bytes into opToAgent. Pauses
 // when the buffer is at cap; resumes after the agent's aread drains it.
 func (s *Server) reversePumpOperator(cid string, rc *reverseConn) {
-	readSize := 4096
+	readSize := 32768
 	if s.reverse.maxBufCap < readSize {
 		readSize = s.reverse.maxBufCap
 	}
@@ -1028,13 +1039,13 @@ func (s *Server) proxyAgentPoll(args []string, now time.Time, client string) []s
 	pollID := ""
 	protocolVersion := byte(1)
 	if len(payload) >= 1 {
-		pollID = strings.ToLower(payload[0])
+		pollID = toLowerFast(payload[0])
 		if !validPollID(pollID) {
 			return []string{"ERR bad poll"}
 		}
 	}
 	if len(payload) == 2 {
-		if strings.ToLower(payload[1]) != "v2" {
+		if toLowerFast(payload[1]) != "v2" {
 			return []string{"ERR malformed"}
 		}
 		protocolVersion = 2
@@ -1124,18 +1135,19 @@ func (s *Server) proxyAgentOpen(args []string, now time.Time) []string {
 	if len(payload) != 3 {
 		return []string{"ERR malformed"}
 	}
-	cid := strings.ToLower(payload[0])
-	pollID := strings.ToLower(payload[1])
+	cid := toLowerFast(payload[0])
+	pollID := toLowerFast(payload[1])
 	if !gproxy.ValidCID(cid) || !validPollID(pollID) {
 		return []string{"ERR malformed"}
 	}
+	statusStr := toLowerFast(payload[2])
 	status := map[string]byte{
 		"ok":          0x00,
 		"refused":     0x05,
 		"unreachable": 0x04,
 		"timeout":     0x06,
-	}[strings.ToLower(payload[2])]
-	if status == 0 && strings.ToLower(payload[2]) != "ok" {
+	}[statusStr]
+	if status == 0 && statusStr != "ok" {
 		return []string{"ERR malformed"}
 	}
 
@@ -1193,8 +1205,8 @@ func (s *Server) proxyAgentStatus(args []string, now time.Time) []string {
 	if !ok || !protocol.VerifyAuth(s.secret, s.authDomain, "astatus", payload, ts, mac, now) || len(payload) != 2 {
 		return []string{proxyAuthFailResponse}
 	}
-	cid := strings.ToLower(payload[0])
-	pollID := strings.ToLower(payload[1])
+	cid := toLowerFast(payload[0])
+	pollID := toLowerFast(payload[1])
 	if !gproxy.ValidCID(cid) || !validPollID(pollID) {
 		return []string{"CLOSED"}
 	}
@@ -1230,7 +1242,7 @@ func (s *Server) proxyAgentRead(args []string, now time.Time) []string {
 	if len(args) < 3 || len(args) > 4 {
 		return []string{"ERR malformed"}
 	}
-	cid := strings.ToLower(args[0])
+	cid := toLowerFast(args[0])
 	if !gproxy.ValidCID(cid) {
 		return []string{"ERR bad cid"}
 	}
@@ -1326,7 +1338,7 @@ func (s *Server) proxyAgentWrite(args []string, now time.Time) []string {
 	if len(args) < 4 {
 		return []string{"ERR malformed"}
 	}
-	cid := strings.ToLower(args[0])
+	cid := toLowerFast(args[0])
 	if !gproxy.ValidCID(cid) {
 		return []string{"ERR bad cid"}
 	}
@@ -1435,7 +1447,7 @@ func (s *Server) proxyAgentClose(args []string, now time.Time) []string {
 	if len(args) != 3 {
 		return []string{"ERR malformed"}
 	}
-	cid := strings.ToLower(args[0])
+	cid := toLowerFast(args[0])
 	if !gproxy.ValidCID(cid) {
 		return []string{"ERR bad cid"}
 	}
@@ -1490,7 +1502,7 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 	if len(args) < 4 {
 		return []string{"ERR malformed"}
 	}
-	cid := strings.ToLower(args[0])
+	cid := toLowerFast(args[0])
 	if !gproxy.ValidCID(cid) {
 		return []string{"ERR bad cid"}
 	}
@@ -1540,8 +1552,10 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 	}
 	if wait != nil {
 		rc.mu.Unlock()
+		timer := time.NewTimer(longPollWindow + time.Second)
 		select {
 		case <-wait:
+			timer.Stop()
 			rc.mu.Lock()
 			entry := rc.responseCache[readNonce]
 			if out := rc.materializeCachedResponseLocked(entry); out != nil {
@@ -1550,7 +1564,7 @@ func (s *Server) proxyAgentExchange(args []string, now time.Time) []string {
 			}
 			rc.mu.Unlock()
 			return []string{"ERR retry"}
-		case <-time.After(longPollWindow + time.Second):
+		case <-timer.C:
 			return []string{"ERR retry"}
 		}
 	}
@@ -1692,24 +1706,48 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	if allowLongPoll {
 		rc.mu.Lock()
 		bufEmpty := rc.opToAgent.Len() == 0
+		window := rc.adaptivePollWind
+		if window < 50*time.Millisecond || window > 500*time.Millisecond {
+			window = longPollWindow
+		}
+		if rc.axchgHadData && !rc.lastAxchgTime.IsZero() {
+			delta := now.Sub(rc.lastAxchgTime)
+			if delta > 0 && delta < 5*time.Second {
+				if rc.adaptivePollWind == 0 {
+					rc.adaptivePollWind = delta
+				} else {
+					rc.adaptivePollWind = (rc.adaptivePollWind*3 + delta) / 4
+				}
+				if rc.adaptivePollWind < 50*time.Millisecond {
+					rc.adaptivePollWind = 50 * time.Millisecond
+				}
+				if rc.adaptivePollWind > 500*time.Millisecond {
+					rc.adaptivePollWind = 500 * time.Millisecond
+				}
+			}
+		}
+		rc.lastAxchgTime = now
 		rc.mu.Unlock()
 		if bufEmpty {
-			rc.awaitReadData(longPollWindow)
+			rc.awaitReadData(window)
 		}
 	}
 
 	rc.mu.Lock()
 	if len(rc.outbound)+rc.outboundInFlight >= maxOutboundUnacked {
 		if data := rc.oldestOutboundLocked(); data != nil {
+			rc.axchgHadData = true
 			rc.expires = now.Add(reverseTTL)
 			rc.mu.Unlock()
 			return data
 		}
+		rc.axchgHadData = false
 		rc.mu.Unlock()
 		return []string{"EMPTY"}
 	}
 	if rc.opToAgent.Len() == 0 {
 		isClosed := rc.opClosed || rc.agentClosed
+		rc.axchgHadData = isClosed
 		rc.expires = now.Add(reverseTTL)
 		rc.mu.Unlock()
 		if isClosed {
@@ -1748,6 +1786,7 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 	rc.outboundReservedBytes -= take
 	rc.outbound[seq] = outboundProxyResponse{segments: cloneSegments(out), plainBytes: take}
 	rc.outboundPlainBytes += take
+	rc.axchgHadData = true
 	rc.mu.Unlock()
 	return out
 }
@@ -1765,7 +1804,7 @@ func (rc *reverseConn) oldestOutboundLocked() []string {
 			seq, data = candidate, retained.segments
 		}
 	}
-	return cloneSegments(data)
+	return data
 }
 
 func (s *Server) collectRetainedAxchgRead(rc *reverseConn, now time.Time) []string {

@@ -2047,6 +2047,13 @@ func TestDownloadChunkAndBatchReportMissingCacheSpool(t *testing.T) {
 	state := s.downloads[sid]
 	entry := s.downloadCache[state.cacheKey]
 	s.mu.Unlock()
+	if entry.spoolFile != nil {
+		_ = entry.spoolFile.Close()
+		s.mu.Lock()
+		entry.spoolFile = nil
+		s.downloadCache[state.cacheKey] = entry
+		s.mu.Unlock()
+	}
 	if err := os.Remove(entry.spoolPath); err != nil {
 		t.Fatal(err)
 	}
@@ -4514,5 +4521,1397 @@ func TestSmallDownloadLimitAcceptsSmallFile(t *testing.T) {
 				t.Errorf("encodedSize %d exceeds MaxEncodedSizeForSource(%d)=%d", encodedSize, size, maxEncoded)
 			}
 		})
+	}
+}
+
+// TestAcceptNonceBatchPruning exercises the nonce sliding window pruning path.
+// After inserting noncePruneBatch+nonceReplayWindow nonces, the map should be
+// pruned to only retain nonces within nonceReplayWindow of the highest seen.
+func TestAcceptNonceBatchPruning(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	total := nonceReplayWindow + noncePruneBatch + 1
+	for i := uint64(1); i <= uint64(total); i++ {
+		rc.acceptNonce(i)
+	}
+
+	cutoff := rc.nonceFloor - nonceReplayWindow
+	for n := range rc.nonceSeen {
+		if n < cutoff {
+			t.Fatalf("nonce %d should have been pruned (cutoff=%d)", n, cutoff)
+		}
+	}
+	if len(rc.nonceSeen) > nonceReplayWindow+noncePruneBatch {
+		t.Fatalf("nonceSeen too large after pruning: %d", len(rc.nonceSeen))
+	}
+}
+
+// TestAcceptNonceZeroRejected verifies nonce=0 is always rejected.
+func TestAcceptNonceZeroRejected(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.acceptNonce(0) {
+		t.Fatal("nonce 0 should be rejected")
+	}
+}
+
+// TestAcceptNonceDuplicateRejected verifies that a duplicate nonce is rejected.
+func TestAcceptNonceDuplicateRejected(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if !rc.acceptNonce(42) {
+		t.Fatal("first nonce 42 should be accepted")
+	}
+	if rc.acceptNonce(42) {
+		t.Fatal("duplicate nonce 42 should be rejected")
+	}
+}
+
+// TestRemoveConnLockedFallbackLookup exercises removeConnLocked when the
+// caller passes an empty cid — the connection must be found via the
+// pendCids reverse index.
+func TestRemoveConnLockedFallbackLookup(t *testing.T) {
+	s := proxyTestServer(t)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.reverse.mu.Lock()
+	got := s.reverse.removeConnLocked("", rc)
+	conns := len(s.reverse.conns)
+	pendCids := len(s.reverse.pendCids)
+	pending := len(s.reverse.pending)
+	s.reverse.mu.Unlock()
+
+	if got != cid {
+		t.Fatalf("expected %q, got %q", cid, got)
+	}
+	if conns != 0 || pendCids != 0 || pending != 0 {
+		t.Fatalf("indexes not cleaned: conns=%d pendCids=%d pending=%d", conns, pendCids, pending)
+	}
+}
+
+// TestRemoveConnLockedQuestionMarkCid exercises the "?" cid path.
+func TestRemoveConnLockedQuestionMarkCid(t *testing.T) {
+	s := proxyTestServer(t)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	cid, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.reverse.mu.Lock()
+	got := s.reverse.removeConnLocked("?", rc)
+	s.reverse.mu.Unlock()
+
+	if got != cid {
+		t.Fatalf("expected %q, got %q", cid, got)
+	}
+}
+
+// TestRemoveConnLockedUnknownReturnsQuestionMark: when the rc is not in any
+// index, removeConnLocked returns "?".
+func TestRemoveConnLockedUnknownReturnsQuestionMark(t *testing.T) {
+	s := proxyTestServer(t)
+	unknownRC := &reverseConn{}
+	unknownRC.opCond = sync.NewCond(&unknownRC.mu)
+
+	s.reverse.mu.Lock()
+	got := s.reverse.removeConnLocked("", unknownRC)
+	s.reverse.mu.Unlock()
+
+	if got != "?" {
+		t.Fatalf("expected ?, got %q", got)
+	}
+}
+
+// TestBeginResponseExpiredReadyCacheHit covers the path where a cached entry
+// exists, is ready, but has expired — the entry should be deleted and a new
+// owner slot created.
+func TestBeginResponseExpiredReadyCacheHit(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	past := time.Now().UTC().Add(-time.Hour)
+	now := time.Now().UTC()
+
+	rc.mu.Lock()
+	rc.responseCache = map[uint64]*cachedProxyResponse{
+		99: {ready: true, expires: past, writeStatus: "ACK 1"},
+	}
+	cached, wait, owner := rc.beginResponse(99, now)
+	rc.mu.Unlock()
+
+	if !owner {
+		t.Fatal("expired ready entry should yield ownership")
+	}
+	if cached != nil || wait != nil {
+		t.Fatal("should not return cached data or wait channel")
+	}
+}
+
+// TestBeginResponseEvictionSecondPass covers the second eviction pass:
+// when the cache is full of unexpired ready entries, one ready entry is evicted.
+func TestBeginResponseEvictionSecondPass(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	future := time.Now().UTC().Add(time.Hour)
+	now := time.Now().UTC()
+
+	rc.mu.Lock()
+	rc.responseCache = make(map[uint64]*cachedProxyResponse, maxProxyResponseCache)
+	for i := uint64(1); i <= uint64(maxProxyResponseCache); i++ {
+		rc.responseCache[i] = &cachedProxyResponse{ready: true, expires: future, writeStatus: "ACK 1"}
+	}
+	freshNonce := uint64(maxProxyResponseCache + 1)
+	cached, wait, owner := rc.beginResponse(freshNonce, now)
+	sz := len(rc.responseCache)
+	rc.mu.Unlock()
+
+	if !owner || cached != nil || wait != nil {
+		t.Fatalf("second-pass eviction should yield ownership: owner=%v", owner)
+	}
+	if sz > maxProxyResponseCache {
+		t.Fatalf("cache grew past cap: %d", sz)
+	}
+}
+
+// TestCollectAxchgReadAdaptivePollWindow exercises the EWMA adaptive poll
+// window calculation in collectAxchgRead. We pre-fill the buffer so the
+// long-poll path runs the EWMA update but doesn't block on awaitReadData.
+func TestCollectAxchgReadAdaptivePollWindow(t *testing.T) {
+	s := proxyTestServer(t)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	_, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	rc.mu.Lock()
+	rc.axchgHadData = true
+	rc.lastAxchgTime = time.Now().Add(-20 * time.Millisecond)
+	rc.adaptivePollWind = 0
+	rc.opToAgent.Write([]byte("data-for-read"))
+	rc.mu.Unlock()
+
+	now := time.Now()
+	resp := s.collectAxchgRead(rc, 1024, now, true)
+	if len(resp) < 1 {
+		t.Fatal("expected response")
+	}
+
+	rc.mu.Lock()
+	wind := rc.adaptivePollWind
+	rc.mu.Unlock()
+
+	if wind < 50*time.Millisecond {
+		t.Fatalf("adaptivePollWind should be ≥50ms, got %v", wind)
+	}
+}
+
+// TestMaterializeCachedResponseNilEntry covers the nil-entry path.
+func TestMaterializeCachedResponseNilEntry(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	got := rc.materializeCachedResponseLocked(nil)
+	rc.mu.Unlock()
+	if got != nil {
+		t.Fatalf("nil entry should return nil, got %v", got)
+	}
+}
+
+// TestMaterializeCachedResponseNotReady covers the not-ready entry path.
+func TestMaterializeCachedResponseNotReady(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	entry := &cachedProxyResponse{ready: false}
+	rc.mu.Lock()
+	got := rc.materializeCachedResponseLocked(entry)
+	rc.mu.Unlock()
+	if got != nil {
+		t.Fatalf("not-ready entry should return nil, got %v", got)
+	}
+}
+
+// TestMaterializeCachedResponseReadSeqAdvanced covers the path where
+// readSeq <= readAck (payload already released by a later ACK).
+func TestMaterializeCachedResponseReadSeqAdvanced(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	rc.readAck = 10
+	rc.outbound = make(map[uint64]outboundProxyResponse)
+	entry := &cachedProxyResponse{
+		ready:       true,
+		writeStatus: "ACK 1",
+		readSeq:     5,
+	}
+	got := rc.materializeCachedResponseLocked(entry)
+	rc.mu.Unlock()
+	if len(got) != 2 || got[0] != "ACK 1" || got[1] != "EMPTY" {
+		t.Fatalf("expected [ACK 1 EMPTY], got %v", got)
+	}
+}
+
+// TestMaterializeCachedResponseReadHeadOnly covers the path with readHead set
+// but no readSeq.
+func TestMaterializeCachedResponseReadHeadOnly(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	entry := &cachedProxyResponse{
+		ready:       true,
+		writeStatus: "ACK 1",
+		readHead:    "EMPTY",
+	}
+	rc.mu.Lock()
+	got := rc.materializeCachedResponseLocked(entry)
+	rc.mu.Unlock()
+	if len(got) != 2 || got[0] != "ACK 1" || got[1] != "EMPTY" {
+		t.Fatalf("expected [ACK 1 EMPTY], got %v", got)
+	}
+}
+
+// TestApplyReadAckReleasesChunks verifies applyReadAck deletes acked outbound
+// entries and decrements outboundPlainBytes.
+func TestApplyReadAckReleasesChunks(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+
+	rc.mu.Lock()
+	rc.outbound = map[uint64]outboundProxyResponse{
+		1: {segments: []string{"DATA 1", "payload1"}, plainBytes: 100},
+		2: {segments: []string{"DATA 2", "payload2"}, plainBytes: 200},
+		3: {segments: []string{"DATA 3", "payload3"}, plainBytes: 300},
+	}
+	rc.outboundPlainBytes = 600
+	rc.readAck = 0
+
+	rc.applyReadAck(2)
+
+	remaining := len(rc.outbound)
+	bytes := rc.outboundPlainBytes
+	ack := rc.readAck
+	rc.mu.Unlock()
+
+	if remaining != 1 {
+		t.Fatalf("expected 1 remaining entry, got %d", remaining)
+	}
+	if bytes != 300 {
+		t.Fatalf("expected 300 remaining bytes, got %d", bytes)
+	}
+	if ack != 2 {
+		t.Fatalf("expected readAck=2, got %d", ack)
+	}
+}
+
+// TestApplyReadAckIdempotent verifies that a duplicate or lower ACK is a no-op.
+func TestApplyReadAckIdempotent(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+
+	rc.mu.Lock()
+	rc.outbound = map[uint64]outboundProxyResponse{
+		5: {segments: []string{"DATA 5"}, plainBytes: 50},
+	}
+	rc.outboundPlainBytes = 50
+	rc.readAck = 3
+
+	rc.applyReadAck(2) // lower than current — no-op
+	remaining := len(rc.outbound)
+	rc.mu.Unlock()
+
+	if remaining != 1 {
+		t.Fatalf("lower ack should not remove entries: %d", remaining)
+	}
+}
+
+func TestApplyReadAckNegativeBytesCorrection(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+
+	rc.mu.Lock()
+	rc.outbound = map[uint64]outboundProxyResponse{
+		1: {segments: []string{"DATA 1"}, plainBytes: 200},
+	}
+	rc.outboundPlainBytes = 50
+	rc.readAck = 0
+	rc.applyReadAck(1)
+	got := rc.outboundPlainBytes
+	rc.mu.Unlock()
+
+	if got != 0 {
+		t.Fatalf("expected 0, got %d", got)
+	}
+}
+
+func TestSignalOneReaderLockedEmpty(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	rc.signalOneReaderLocked()
+	rc.mu.Unlock()
+}
+
+func TestSignalReadersForBufferLockedEmptyBuffer(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	rc.signalReadersForBufferLocked()
+	rc.mu.Unlock()
+}
+
+func TestDrainContiguousWritesLockedNilMap(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	got := rc.drainContiguousWritesLocked(10)
+	rc.mu.Unlock()
+	if got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+func TestDrainContiguousWritesLockedMaxBatch(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	rc.oooWrite = map[uint64][]byte{
+		1: []byte("a"),
+		2: []byte("b"),
+		3: []byte("c"),
+	}
+	rc.seqAgentIn = 0
+	got := rc.drainContiguousWritesLocked(2)
+	seq := rc.seqAgentIn
+	rc.mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(got))
+	}
+	if seq != 2 {
+		t.Fatalf("expected seqAgentIn=2, got %d", seq)
+	}
+}
+
+func TestOldestOutboundLockedEmpty(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	rc.outbound = map[uint64]outboundProxyResponse{}
+	got := rc.oldestOutboundLocked()
+	rc.mu.Unlock()
+	if got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+func TestOldestOutboundLockedAllAcked(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	rc.mu.Lock()
+	rc.readAck = 5
+	rc.outbound = map[uint64]outboundProxyResponse{
+		3: {segments: []string{"DATA 3"}},
+		5: {segments: []string{"DATA 5"}},
+	}
+	got := rc.oldestOutboundLocked()
+	rc.mu.Unlock()
+	if got != nil {
+		t.Fatalf("expected nil for all-acked, got %v", got)
+	}
+}
+
+func TestNormalizeDomainsEmptyEntries(t *testing.T) {
+	canonical, all, err := normalizeDomains("example.com,,test.com,")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical != "example.com." {
+		t.Fatalf("expected example.com., got %s", canonical)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 domains, got %d", len(all))
+	}
+}
+
+func TestNormalizeDomainsDuplicates(t *testing.T) {
+	canonical, all, err := normalizeDomains("example.com,EXAMPLE.COM")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical != "example.com." {
+		t.Fatalf("expected example.com., got %s", canonical)
+	}
+	if len(all) != 1 {
+		t.Fatalf("expected 1 domain after dedup, got %d", len(all))
+	}
+}
+
+func TestNormalizeDomainsEmpty(t *testing.T) {
+	_, _, err := normalizeDomains("")
+	if err == nil {
+		t.Fatal("expected error for empty domain")
+	}
+}
+
+func TestNormalizeDomainsInvalid(t *testing.T) {
+	_, _, err := normalizeDomains("a..b")
+	if err == nil {
+		t.Fatal("expected error for invalid domain with empty label")
+	}
+}
+
+func TestPublishNoOverwriteMissing(t *testing.T) {
+	dir := t.TempDir()
+	err := publishNoOverwrite(
+		filepath.Join(dir, "nonexistent.tmp"),
+		filepath.Join(dir, "final.bin"),
+	)
+	if err == nil {
+		t.Fatal("expected error for missing tmpPath")
+	}
+}
+
+func TestHashFileNotFound(t *testing.T) {
+	_, _, err := hashFile("/nonexistent/file")
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestHashFileRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.bin")
+	data := []byte("hash test content")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	size, digest, err := hashFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != int64(len(data)) {
+		t.Fatalf("expected size %d, got %d", len(data), size)
+	}
+	h := sha256.Sum256(data)
+	want := hex.EncodeToString(h[:])
+	if digest != want {
+		t.Fatalf("digest mismatch: got %s, want %s", digest, want)
+	}
+}
+
+func TestCacheBuildReservationOverflow(t *testing.T) {
+	got := cacheBuildReservation(-1)
+	maxInt64 := int64(^uint64(0) >> 1)
+	if got != maxInt64 {
+		t.Fatalf("expected MaxInt64, got %d", got)
+	}
+	got = cacheBuildReservation(maxInt64)
+	if got != maxInt64 {
+		t.Fatalf("expected MaxInt64 for huge input, got %d", got)
+	}
+}
+
+func TestCacheBuildReservationNormal(t *testing.T) {
+	got := cacheBuildReservation(1000)
+	want := int64(1000*3 + 1<<20)
+	if got != want {
+		t.Fatalf("expected %d, got %d", want, got)
+	}
+}
+
+func TestReleaseCacheBuildLockedNegativeCorrection(t *testing.T) {
+	s := newTestServer(t)
+	s.mu.Lock()
+	s.downloadCacheReserved = 10
+	s.releaseCacheBuildLocked(20)
+	got := s.downloadCacheReserved
+	s.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("expected 0, got %d", got)
+	}
+}
+
+func TestSafePathEscapesDataDir(t *testing.T) {
+	s := newTestServer(t)
+	_, _, err := s.safePathFromFilename("../../etc/passwd")
+	if err == nil {
+		t.Fatal("expected error for path traversal")
+	}
+}
+
+func TestResolveExistingPathWithinDataDirNonExistent(t *testing.T) {
+	s := newTestServer(t)
+	path := filepath.Join(s.dataDir, "does-not-exist.txt")
+	got, err := s.resolveExistingPathWithinDataDir(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != path {
+		t.Fatalf("expected %q, got %q", path, got)
+	}
+}
+
+func TestResolveExistingPathSymlinkEscape(t *testing.T) {
+	s := newTestServer(t)
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "escape.txt")
+	if err := os.WriteFile(outsideFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(s.dataDir, "escape-link")
+	if err := os.Symlink(outsideFile, symlink); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.resolveExistingPathWithinDataDir(symlink)
+	if err == nil {
+		t.Fatal("expected error for symlink escaping data dir")
+	}
+}
+
+func TestClientIDNil(t *testing.T) {
+	got := clientID(nil)
+	if got != "unknown" {
+		t.Fatalf("expected unknown, got %q", got)
+	}
+}
+
+func TestClientIDNoPort(t *testing.T) {
+	type fakeAddr struct{}
+	got := clientID(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 0})
+	if got != "192.168.1.1" {
+		t.Fatalf("expected 192.168.1.1, got %q", got)
+	}
+}
+
+func TestParseCommandNoMatch(t *testing.T) {
+	_, _, ok := parseCommand("other.domain.", "example.test.")
+	if ok {
+		t.Fatal("expected no match for wrong domain")
+	}
+}
+
+func TestParseCommandBareDomain(t *testing.T) {
+	args, cmd, ok := parseCommand("example.test.", "example.test.")
+	if !ok {
+		t.Fatal("expected match for bare domain")
+	}
+	if cmd != "" {
+		t.Fatalf("expected empty command, got %q", cmd)
+	}
+	if len(args) != 1 || args[0] != "" {
+		t.Fatalf("unexpected args: %v", args)
+	}
+}
+
+func TestParseCommandSingleLabel(t *testing.T) {
+	_, cmd, ok := parseCommand("test.example.test.", "example.test.")
+	if !ok {
+		t.Fatal("expected match")
+	}
+	if cmd != "test" {
+		t.Fatalf("expected command 'test', got %q", cmd)
+	}
+}
+
+func TestSplitAuthenticatedArgsShort(t *testing.T) {
+	_, _, _, ok := splitAuthenticatedArgs([]string{"single"})
+	if ok {
+		t.Fatal("expected false for single-element args")
+	}
+}
+
+func TestSplitAuthenticatedArgsEmptyTimestamp(t *testing.T) {
+	_, _, _, ok := splitAuthenticatedArgs([]string{"", "token"})
+	if ok {
+		t.Fatal("expected false for empty timestamp")
+	}
+}
+
+func TestSplitAuthenticatedArgsSinglePayload(t *testing.T) {
+	payload, ts, mac, ok := splitAuthenticatedArgs([]string{"", "ts", "mac"})
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	if payload != nil {
+		t.Fatalf("expected nil payload, got %v", payload)
+	}
+	if ts != "ts" || mac != "mac" {
+		t.Fatalf("unexpected ts=%q mac=%q", ts, mac)
+	}
+}
+
+func TestCidForReverseConnUnknown(t *testing.T) {
+	s := proxyTestServer(t)
+	unknown := &reverseConn{}
+	unknown.opCond = sync.NewCond(&unknown.mu)
+	got := s.cidForReverseConn(unknown)
+	if got != "?" {
+		t.Fatalf("expected ?, got %q", got)
+	}
+}
+
+func TestBeginResponseDeadOwner(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	past := time.Now().UTC().Add(-time.Hour)
+	now := time.Now().UTC()
+	done := make(chan struct{})
+
+	rc.mu.Lock()
+	rc.responseCache = map[uint64]*cachedProxyResponse{
+		50: {ready: false, expires: past, done: done},
+	}
+	_, _, owner := rc.beginResponse(50, now)
+	rc.mu.Unlock()
+
+	if !owner {
+		t.Fatal("dead owner path should yield ownership")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("done channel should have been closed")
+	}
+}
+
+func TestCommitOperatorWriteShort(t *testing.T) {
+	rc := &reverseConn{}
+	rc.opCond = sync.NewCond(&rc.mu)
+	r, w := net.Pipe()
+	rc.operator = w
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+	go func() {
+		buf := make([]byte, 1)
+		r.Read(buf)
+		r.Close()
+	}()
+	batch := net.Buffers{[]byte("hello world longer data")}
+	err := rc.commitOperatorWrite(batch)
+	if err == nil {
+		t.Fatal("expected error for short/failed write")
+	}
+}
+
+func TestHandleTXTOnDomainUnknownCommand(t *testing.T) {
+	s := newTestServer(t)
+	resp := s.handleTXTOnDomain("unknown-cmd."+testDomain+".", testDomain+".", "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Unknown gdns2tcp command." {
+		t.Fatalf("expected unknown command response, got %v", resp)
+	}
+}
+
+func TestHandleTXTOnDomainInvalidName(t *testing.T) {
+	s := newTestServer(t)
+	resp := s.handleTXTOnDomain("other.domain.", testDomain+".", "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Invalid gdns2tcp request." {
+		t.Fatalf("expected invalid request, got %v", resp)
+	}
+}
+
+func TestInterfaceNameForIPv4Invalid(t *testing.T) {
+	if got := interfaceNameForIPv4("not-an-ip"); got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+func TestInterfaceNameForIPv4IPv6(t *testing.T) {
+	if got := interfaceNameForIPv4("::1"); got != "" {
+		t.Fatalf("expected empty for IPv6, got %q", got)
+	}
+}
+
+func TestInterfaceNameForIPv4Loopback(t *testing.T) {
+	got := interfaceNameForIPv4("127.0.0.1")
+	if got == "" {
+		t.Skip("loopback interface not found")
+	}
+}
+
+func TestCollectRetainedAxchgReadClosed(t *testing.T) {
+	s := proxyTestServer(t)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	_, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	rc.mu.Lock()
+	rc.opClosed = true
+	rc.mu.Unlock()
+
+	now := time.Now()
+	resp := s.collectRetainedAxchgRead(rc, now)
+	if len(resp) != 1 || resp[0] != "CLOSED" {
+		t.Fatalf("expected [CLOSED], got %v", resp)
+	}
+}
+
+func TestCollectRetainedAxchgReadEmpty(t *testing.T) {
+	s := proxyTestServer(t)
+	op, _ := net.Pipe()
+	t.Cleanup(func() { _ = op.Close() })
+	_, rc, err := s.reverseEnqueueOpen("127.0.0.1:80", op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reverse.mu.Lock()
+	if len(s.reverse.pending) > 0 {
+		s.reverse.pending = s.reverse.pending[1:]
+	}
+	s.reverse.mu.Unlock()
+
+	now := time.Now()
+	resp := s.collectRetainedAxchgRead(rc, now)
+	if len(resp) != 1 || resp[0] != "EMPTY" {
+		t.Fatalf("expected [EMPTY], got %v", resp)
+	}
+}
+
+func TestDownloadCacheKey(t *testing.T) {
+	key1 := downloadCacheKey("/path/a", "sha1")
+	key2 := downloadCacheKey("/path/b", "sha2")
+	if key1 == key2 {
+		t.Fatal("different inputs should produce different keys")
+	}
+	if len(key1) != 64 {
+		t.Fatalf("expected 64-char hex, got %d chars", len(key1))
+	}
+}
+
+func TestReserveCacheBuildLockedZeroBytes(t *testing.T) {
+	s := newTestServer(t)
+	s.mu.Lock()
+	got := s.reserveCacheBuildLocked(0, time.Now())
+	s.mu.Unlock()
+	if got {
+		t.Fatal("expected false for zero bytes reservation")
+	}
+}
+
+func TestHasAnyDomainSuffix(t *testing.T) {
+	domains := []string{"example.test.", "alt.test."}
+	if d, ok := hasAnyDomainSuffix("sub.example.test.", domains); !ok || d != "example.test." {
+		t.Fatalf("expected match on example.test., got %q %v", d, ok)
+	}
+	if d, ok := hasAnyDomainSuffix("sub.alt.test.", domains); !ok || d != "alt.test." {
+		t.Fatalf("expected match on alt.test., got %q %v", d, ok)
+	}
+	if _, ok := hasAnyDomainSuffix("sub.other.test.", domains); ok {
+		t.Fatal("expected no match")
+	}
+}
+
+func TestHasUpperAndToLowerFast(t *testing.T) {
+	if hasUpper("alllower") {
+		t.Fatal("expected false for all lower")
+	}
+	if !hasUpper("hasUpper") {
+		t.Fatal("expected true for mixed case")
+	}
+	if toLowerFast("alllower") != "alllower" {
+		t.Fatal("toLowerFast should return same string for all lower")
+	}
+	if toLowerFast("MiXeD") != "mixed" {
+		t.Fatal("toLowerFast should lowercase mixed case")
+	}
+}
+
+func TestSocks5AuthenticateWrongVersion(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x04, 0x01, 0x02})
+		io.Copy(io.Discard, c)
+	}()
+	err := socks5Authenticate(s, "secret")
+	if err == nil || !strings.Contains(err.Error(), "version") {
+		t.Fatalf("expected version error, got %v", err)
+	}
+}
+
+func TestSocks5AuthenticateNoUserPassMethod(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x00})
+		io.Copy(io.Discard, c)
+	}()
+	err := socks5Authenticate(s, "secret")
+	if err == nil || !strings.Contains(err.Error(), "username/password") {
+		t.Fatalf("expected userpass error, got %v", err)
+	}
+}
+
+func TestSocks5AuthenticateWrongSubnegVersion(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x02})
+		buf := make([]byte, 16)
+		c.Read(buf)
+		c.Write([]byte{0x99, 0x08})
+		c.Write([]byte("gdns2tcp"))
+		c.Write([]byte{0x06})
+		c.Write([]byte("secret"))
+		io.Copy(io.Discard, c)
+	}()
+	err := socks5Authenticate(s, "secret")
+	if err == nil || !strings.Contains(err.Error(), "subneg") {
+		t.Fatalf("expected subneg error, got %v", err)
+	}
+}
+
+func TestSocks5AuthenticateInvalidCredentials(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x02})
+		buf := make([]byte, 16)
+		c.Read(buf)
+		c.Write([]byte{0x01, 0x08})
+		c.Write([]byte("gdns2tcp"))
+		c.Write([]byte{0x05})
+		c.Write([]byte("wrong"))
+		io.Copy(io.Discard, c)
+	}()
+	err := socks5Authenticate(s, "secret")
+	if err == nil || !strings.Contains(err.Error(), "credentials") {
+		t.Fatalf("expected credentials error, got %v", err)
+	}
+}
+
+func TestSocks5AuthenticateTruncatedMethods(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x03})
+		c.Close()
+	}()
+	err := socks5Authenticate(s, "secret")
+	if err == nil {
+		t.Fatal("expected error for truncated methods")
+	}
+}
+
+func TestSocks5AuthenticateTruncatedSubneg(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x02})
+		buf := make([]byte, 16)
+		c.Read(buf)
+		c.Close()
+	}()
+	err := socks5Authenticate(s, "secret")
+	if err == nil {
+		t.Fatal("expected error for truncated subneg")
+	}
+}
+
+func TestSocks5AuthenticateTruncatedUsername(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x02})
+		buf := make([]byte, 16)
+		c.Read(buf)
+		c.Write([]byte{0x01, 0x08})
+		c.Close()
+	}()
+	err := socks5Authenticate(s, "secret")
+	if err == nil {
+		t.Fatal("expected error for truncated username")
+	}
+}
+
+func TestSocks5AuthenticateTruncatedPlen(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x02})
+		buf := make([]byte, 16)
+		c.Read(buf)
+		c.Write([]byte{0x01, 0x08})
+		c.Write([]byte("gdns2tcp"))
+		c.Close()
+	}()
+	err := socks5Authenticate(s, "secret")
+	if err == nil {
+		t.Fatal("expected error for truncated plen")
+	}
+}
+
+func TestSocks5AuthenticateTruncatedPasswd(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x02})
+		buf := make([]byte, 16)
+		c.Read(buf)
+		c.Write([]byte{0x01, 0x08})
+		c.Write([]byte("gdns2tcp"))
+		c.Write([]byte{0x06})
+		c.Close()
+	}()
+	err := socks5Authenticate(s, "secret")
+	if err == nil {
+		t.Fatal("expected error for truncated passwd")
+	}
+}
+
+func TestSocks5AuthenticateSuccess(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x02})
+		buf := make([]byte, 16)
+		c.Read(buf)
+		c.Write([]byte{0x01, 0x08})
+		c.Write([]byte("gdns2tcp"))
+		c.Write([]byte{0x06})
+		c.Write([]byte("secret"))
+		io.Copy(io.Discard, c)
+	}()
+	if err := socks5Authenticate(s, "secret"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSocks5NoAuthSelectWrongVersion(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x04, 0x01, 0x00})
+		io.Copy(io.Discard, c)
+	}()
+	err := socks5NoAuthSelect(s)
+	if err == nil || !strings.Contains(err.Error(), "version") {
+		t.Fatalf("expected version error, got %v", err)
+	}
+}
+
+func TestSocks5NoAuthSelectTruncated(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x02})
+		c.Close()
+	}()
+	err := socks5NoAuthSelect(s)
+	if err == nil {
+		t.Fatal("expected error for truncated methods")
+	}
+}
+
+func TestSocks5ReadConnectUnsupportedATYP(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x00, 0x99})
+		io.Copy(io.Discard, c)
+	}()
+	_, err := socks5ReadConnect(s)
+	if err == nil || !strings.Contains(err.Error(), "ATYP") {
+		t.Fatalf("expected ATYP error, got %v", err)
+	}
+}
+
+func TestSocks5ReadConnectWrongCMD(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x02, 0x00, 0x01})
+		io.Copy(io.Discard, c)
+	}()
+	_, err := socks5ReadConnect(s)
+	if err == nil || !strings.Contains(err.Error(), "VER/CMD") {
+		t.Fatalf("expected VER/CMD error, got %v", err)
+	}
+}
+
+func TestSocks5ReadConnectIPv6(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x00, 0x04})
+		ip := net.ParseIP("::1")
+		c.Write(ip.To16())
+		c.Write([]byte{0x00, 0x50})
+		io.Copy(io.Discard, c)
+	}()
+	addr, err := socks5ReadConnect(s)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(addr, "80") {
+		t.Fatalf("expected port 80 in %q", addr)
+	}
+}
+
+func TestSocks5ReadConnectDomainName(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		domain := "example.com"
+		c.Write([]byte{0x05, 0x01, 0x00, 0x03, byte(len(domain))})
+		c.Write([]byte(domain))
+		c.Write([]byte{0x01, 0xBB})
+		io.Copy(io.Discard, c)
+	}()
+	addr, err := socks5ReadConnect(s)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if addr != "example.com:443" {
+		t.Fatalf("expected example.com:443, got %q", addr)
+	}
+}
+
+func TestSocks5ReadConnectTruncatedIPv4(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x00, 0x01, 127})
+		c.Close()
+	}()
+	_, err := socks5ReadConnect(s)
+	if err == nil {
+		t.Fatal("expected error for truncated IPv4")
+	}
+}
+
+func TestSocks5ReadConnectTruncatedHead(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05})
+		c.Close()
+	}()
+	_, err := socks5ReadConnect(s)
+	if err == nil {
+		t.Fatal("expected error for truncated head")
+	}
+}
+
+func TestSocks5ReadConnectTruncatedPort(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00})
+		c.Close()
+	}()
+	_, err := socks5ReadConnect(s)
+	if err == nil {
+		t.Fatal("expected error for truncated port")
+	}
+}
+
+func TestSocks5ReadConnectTruncatedDomainLen(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x00, 0x03})
+		c.Close()
+	}()
+	_, err := socks5ReadConnect(s)
+	if err == nil {
+		t.Fatal("expected error for truncated domain len")
+	}
+}
+
+func TestSocks5ReadConnectTruncatedDomain(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x00, 0x03, 0x0A, 'a', 'b'})
+		c.Close()
+	}()
+	_, err := socks5ReadConnect(s)
+	if err == nil {
+		t.Fatal("expected error for truncated domain")
+	}
+}
+
+func TestSocks5ReadConnectTruncatedIPv6(t *testing.T) {
+	c, s := net.Pipe()
+	t.Cleanup(func() { _ = c.Close(); _ = s.Close() })
+	go func() {
+		c.Write([]byte{0x05, 0x01, 0x00, 0x04, 0, 0, 0, 0})
+		c.Close()
+	}()
+	_, err := socks5ReadConnect(s)
+	if err == nil {
+		t.Fatal("expected error for truncated IPv6")
+	}
+}
+
+func TestHandleTXTOnDomainBootCommands(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	for _, cmd := range []string{"boot", "boot-proxy", "boot-ps1", "pboot", "pboot-ps1", "pboot-proxy"} {
+		resp := s.handleTXTOnDomain(cmd+"."+domain, domain, "127.0.0.1")
+		if len(resp) == 0 {
+			t.Fatalf("command %q returned empty response", cmd)
+		}
+	}
+}
+
+func TestHandleTXTOnDomainUinitNoAuth(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain("arg.uinit."+domain, domain, "127.0.0.1")
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(resp))
+	}
+}
+
+func TestHandleTXTOnDomainClientPrefixes(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain("arg.cl."+domain, domain, "127.0.0.1")
+	if len(resp) == 0 {
+		t.Fatal("cl returned empty response")
+	}
+	resp = s.handleTXTOnDomain("arg.cl-linux."+domain, domain, "127.0.0.1")
+	if len(resp) == 0 {
+		t.Fatal("cl-linux returned empty response")
+	}
+	resp = s.handleTXTOnDomain("arg.clb-linux."+domain, domain, "127.0.0.1")
+	if len(resp) == 0 {
+		t.Fatal("clb-linux returned empty response")
+	}
+}
+
+func TestHandleTXTOnDomainLazyCommand(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain("lazy."+domain, domain, "127.0.0.1")
+	if len(resp) != 1 || !strings.Contains(resp[0], "disabled") {
+		t.Fatalf("expected disabled message, got %v", resp)
+	}
+}
+
+func TestWriteAllDnsserverShortWrite(t *testing.T) {
+	err := writeAll(zeroWriter{}, []byte("hello"))
+	if err == nil {
+		t.Fatal("expected error for zero-write")
+	}
+}
+
+type zeroWriter struct{}
+
+func (zeroWriter) Write([]byte) (int, error) { return 0, nil }
+
+func TestSafePathFromFilenameLabelsInvalid(t *testing.T) {
+	s := newTestServer(t)
+	_, _, err := s.safePathFromFilenameLabels(nil)
+	if err == nil {
+		t.Fatal("expected error for nil labels")
+	}
+}
+
+func TestCatalogIncorrectPageMultipleArgs(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("c", []string{"0", "extra"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Incorrect page number." {
+		t.Fatalf("expected page error, got %v", resp)
+	}
+}
+
+func TestCatalogIncorrectPageNumber(t *testing.T) {
+	s := newTestServer(t)
+	if err := os.WriteFile(filepath.Join(s.dataDir, "dummy.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("c", []string{"999"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Incorrect page number." {
+		t.Fatalf("expected page error, got %v", resp)
+	}
+}
+
+func TestDownloadMetaNoAuthFail(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain("arg.dmeta."+domain, domain, "127.0.0.1")
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(resp))
+	}
+}
+
+func TestDownloadMetaWrongPayloadCount(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("dmeta", []string{"sid1", "extra"}), domain, "127.0.0.1")
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(resp))
+	}
+}
+
+func TestDownloadMetaInvalidSID(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("dmeta", []string{"!!bad!!"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Invalid transfer id." {
+		t.Fatalf("expected invalid SID, got %v", resp)
+	}
+}
+
+func TestDownloadMetaTransferNotFound(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("dmeta", []string{"abcd1234"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Transfer not found." {
+		t.Fatalf("expected transfer not found, got %v", resp)
+	}
+}
+
+func TestDownloadChunkNoAuth(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain("arg.d."+domain, domain, "127.0.0.1")
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(resp))
+	}
+}
+
+func TestDownloadChunkInvalidSIDFormat(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("d", []string{"!!bad!!", "0"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Wrong chunk number." {
+		t.Fatalf("expected wrong chunk, got %v", resp)
+	}
+}
+
+func TestDownloadBatchNoAuth(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain("arg.db."+domain, domain, "127.0.0.1")
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(resp))
+	}
+}
+
+func TestDownloadBatchInvalidArgs(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("db", []string{"!!!", "abc", "xyz"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Wrong chunk number." {
+		t.Fatalf("expected wrong chunk, got %v", resp)
+	}
+}
+
+func TestDownloadInitShortPayload(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("dinit", []string{"sid1"}), domain, "127.0.0.1")
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(resp))
+	}
+}
+
+func TestDownloadInitInvalidSIDFormat(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("dinit", []string{"!!!", "file", "name"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Invalid transfer id." {
+		t.Fatalf("expected invalid SID, got %v", resp)
+	}
+}
+
+func TestDownloadInitFileNotFound(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("dinit", []string{"abcd1234", "nonexistent", "txt"}), domain, "127.0.0.1")
+	if len(resp) == 0 {
+		t.Fatal("expected response")
+	}
+}
+
+func TestAxchgDispatch(t *testing.T) {
+	s := proxyTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("axchg", []string{"cid1"}), domain, "127.0.0.1")
+	if len(resp) == 0 {
+		t.Fatal("expected response from axchg dispatch")
+	}
+}
+
+func TestUploadInitInvalidSIDFormat(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("uinit", []string{"!!!", "10", "200", "base32", "file", "txt"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Invalid transfer id." {
+		t.Fatalf("expected invalid SID, got %v", resp)
+	}
+}
+
+func TestUploadInitBadChunkCount(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("uinit", []string{"abcd1234", "abc", "200", "base32", "file", "txt"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Incorrect file length format." {
+		t.Fatalf("expected file length error, got %v", resp)
+	}
+}
+
+func TestUploadInitBadChunkSize(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("uinit", []string{"abcd1234", "10", "abc", "base32", "file", "txt"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Incorrect chunk length format." {
+		t.Fatalf("expected chunk length error, got %v", resp)
+	}
+}
+
+func TestUploadInitBadEncoding(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("uinit", []string{"abcd1234", "10", "200", "hex", "file", "txt"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Incorrect upload encoding." {
+		t.Fatalf("expected encoding error, got %v", resp)
+	}
+}
+
+func TestUploadChunkNoAuth(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain("arg.u."+domain, domain, "127.0.0.1")
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(resp))
+	}
+}
+
+func TestUploadChunkNotInitialized(t *testing.T) {
+	s := newTestServer(t)
+	domain := testDomain + "."
+	resp := s.handleTXTOnDomain(signedName("u", []string{"abcd1234", "0", "data"}), domain, "127.0.0.1")
+	if len(resp) != 1 || resp[0] != "Upload is not initialized." {
+		t.Fatalf("expected not initialized, got %v", resp)
 	}
 }

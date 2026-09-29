@@ -97,8 +97,14 @@ func (s *Server) loadDownloadCache() error {
 			_ = os.Remove(spoolPath)
 			continue
 		}
+		sf, sfErr := os.Open(spoolPath)
+		if sfErr != nil {
+			_ = os.Remove(metaPath)
+			_ = os.Remove(spoolPath)
+			continue
+		}
 		entry := downloadCacheEntry{
-			spoolPath: spoolPath, metaPath: metaPath,
+			spoolPath: spoolPath, metaPath: metaPath, spoolFile: sf,
 			mtime: time.Unix(0, meta.MTimeUnixNs), size: meta.Size, sha256: meta.SHA256,
 			encodedSize: meta.EncodedSize, chunkCount: meta.ChunkCount,
 			lastAccess: time.Unix(0, meta.LastAccess), expires: time.Unix(0, meta.Expires), lastMetaSave: now,
@@ -386,8 +392,13 @@ func (s *Server) buildDownloadCache(path string, info os.FileInfo, sourceSize in
 		_ = os.Remove(spoolPath)
 		return downloadCacheEntry{}, fmt.Errorf("encoded download chunk count is out of range")
 	}
+	sf, sfErr := os.Open(spoolPath)
+	if sfErr != nil {
+		_ = os.Remove(spoolPath)
+		return downloadCacheEntry{}, sfErr
+	}
 	return downloadCacheEntry{
-		spoolPath: spoolPath, mtime: info.ModTime(), size: sourceSize, sha256: sourceSHA,
+		spoolPath: spoolPath, spoolFile: sf, mtime: info.ModTime(), size: sourceSize, sha256: sourceSHA,
 		encodedSize: encodedSize, chunkCount: chunkCount, lastAccess: now, expires: now.Add(s.cacheTTL),
 	}, nil
 }
@@ -454,11 +465,16 @@ func (s *Server) readCacheChunks(key string, from, end int, now time.Time) ([]st
 		_ = s.saveCacheMeta(entry, key)
 	}
 
-	f, err := os.Open(entry.spoolPath)
-	if err != nil {
-		return nil, err
+	f := entry.spoolFile
+	if f == nil {
+		var err error
+		f, err = os.Open(entry.spoolPath)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
 	}
-	defer f.Close()
+	buf := make([]byte, codec.TXTChunkSize)
 	out := make([]string, 0, end-from)
 	for index := from; index < end; index++ {
 		offset := int64(index * codec.TXTChunkSize)
@@ -466,15 +482,14 @@ func (s *Server) readCacheChunks(key string, from, end int, now time.Time) ([]st
 		if remaining := entry.encodedSize - offset; remaining < length {
 			length = remaining
 		}
-		buf := make([]byte, length)
-		n, readErr := f.ReadAt(buf, offset)
+		n, readErr := f.ReadAt(buf[:length], offset)
 		if readErr != nil && readErr != io.EOF {
 			return nil, readErr
 		}
-		if n != len(buf) {
+		if int64(n) != length {
 			return nil, io.ErrUnexpectedEOF
 		}
-		out = append(out, string(buf))
+		out = append(out, string(buf[:n]))
 	}
 	return out, nil
 }
@@ -554,6 +569,9 @@ func (s *Server) removeCacheLocked(key string, entry downloadCacheEntry) {
 	if elem, ok := s.downloadCacheIndex[key]; ok {
 		s.downloadCacheOrder.Remove(elem)
 		delete(s.downloadCacheIndex, key)
+	}
+	if entry.spoolFile != nil {
+		_ = entry.spoolFile.Close()
 	}
 	_ = os.Remove(entry.spoolPath)
 	_ = os.Remove(entry.metaPath)

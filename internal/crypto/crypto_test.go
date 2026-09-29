@@ -269,3 +269,138 @@ func TestStreamingCryptoRejectsWrongSecretAndDirectoryOutputs(t *testing.T) {
 		t.Fatal("OpenFile accepted a directory destination")
 	}
 }
+
+func TestProtectFileOpenFileLargeMultiBlock(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "large.bin")
+	protected := filepath.Join(dir, "large.gdt")
+	out := filepath.Join(dir, "large_out.bin")
+	// 256KB triggers multiple 64KB CBC blocks in the streaming path
+	want := bytes.Repeat([]byte("multi-block-cbc-test-"), 13107)
+	if err := os.WriteFile(src, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProtectFile("multi-block-secret", src, protected); err != nil {
+		t.Fatalf("ProtectFile: %v", err)
+	}
+	if err := OpenFile("multi-block-secret", protected, out); err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("multi-block streaming round trip mismatch: got %d bytes, want %d bytes", len(got), len(want))
+	}
+}
+
+func TestOpenFileMissingSource(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.bin")
+	err := OpenFile("secret", filepath.Join(dir, "nonexistent.gdt"), out)
+	if err == nil {
+		t.Fatal("OpenFile accepted missing source")
+	}
+}
+
+func TestProtectFileEmptyInput(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "empty.bin")
+	protected := filepath.Join(dir, "empty.gdt")
+	out := filepath.Join(dir, "empty_out.bin")
+	if err := os.WriteFile(src, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProtectFile("secret", src, protected); err != nil {
+		t.Fatalf("ProtectFile empty: %v", err)
+	}
+	if err := OpenFile("secret", protected, out); err != nil {
+		t.Fatalf("OpenFile empty: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty output, got %d bytes", len(got))
+	}
+}
+
+func TestOpenFileHMACFailCleanup(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "plain.bin")
+	protected := filepath.Join(dir, "protected.gdt")
+	out := filepath.Join(dir, "out.bin")
+	if err := os.WriteFile(src, []byte("hmac-test-payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProtectFile("secret", src, protected); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt ciphertext bytes (after header+MAC) to fail HMAC
+	raw, err := os.ReadFile(protected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offset := len("GDT2") + 16 + 16 + 32 // magic + salt + iv + mac
+	if offset < len(raw) {
+		raw[offset] ^= 0xff
+	}
+	if err := os.WriteFile(protected, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := OpenFile("secret", protected, out); err == nil {
+		t.Fatal("OpenFile accepted tampered ciphertext")
+	}
+	if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed decrypt retained output file: %v", err)
+	}
+}
+
+func TestOpenBase64InvalidEncoding(t *testing.T) {
+	_, err := OpenBase64("secret", "not-valid-base64!!!")
+	if err == nil {
+		t.Fatal("OpenBase64 accepted invalid base64")
+	}
+}
+
+func TestProtectOpenVariousLengths(t *testing.T) {
+	for _, size := range []int{1, 15, 16, 17, 31, 32, 33, 255, 256} {
+		data := bytes.Repeat([]byte("x"), size)
+		protected, err := Protect("len-test", data)
+		if err != nil {
+			t.Fatalf("Protect size=%d: %v", size, err)
+		}
+		got, err := Open("len-test", protected)
+		if err != nil {
+			t.Fatalf("Open size=%d: %v", size, err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("size=%d roundtrip mismatch", size)
+		}
+	}
+}
+
+func TestProtectToBase64EmptySecret(t *testing.T) {
+	_, err := ProtectToBase64("", []byte("x"))
+	if err == nil {
+		t.Fatal("expected error for empty secret")
+	}
+}
+
+func TestProtectFileDstDirNotWritable(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	if err := os.WriteFile(src, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roDir := filepath.Join(dir, "readonly")
+	if err := os.MkdirAll(roDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	err := ProtectFile("secret", src, filepath.Join(roDir, "out.gdt"))
+	if err == nil {
+		t.Fatal("expected error for non-writable directory")
+	}
+}

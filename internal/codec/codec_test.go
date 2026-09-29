@@ -320,3 +320,73 @@ func TestMaxEncodedSizeForSource(t *testing.T) {
 		t.Fatal("huge input should return MaxInt64 sentinel")
 	}
 }
+
+func TestPositiveModEdgeCases(t *testing.T) {
+	cases := []struct {
+		d, m, want int
+	}{
+		{0, 4, 0},
+		{5, 4, 1},
+		{-1, 4, 3},
+		{-3, 4, 1},
+		{-5, 4, 3},
+		{3, -4, -1},
+		{-3, -4, -3},
+	}
+	for _, c := range cases {
+		got := positiveMod(c.d, c.m)
+		if got != c.want {
+			t.Errorf("positiveMod(%d, %d)=%d want %d", c.d, c.m, got, c.want)
+		}
+	}
+}
+
+func TestDecodeDNSPayloadEmptyEncodingDefault(t *testing.T) {
+	input := []byte("default-encoding-test")
+	encoded, err := EncodeDNSPayload(input, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeDNSPayload(encoded, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(decoded) != string(input) {
+		t.Fatalf("got=%q want=%q", decoded, input)
+	}
+}
+
+func TestDecodeDNSPayloadInvalidBase64(t *testing.T) {
+	_, err := DecodeDNSPayload("!!!invalid!!!", "base64")
+	if err == nil {
+		t.Fatal("expected error for invalid base64")
+	}
+}
+
+func TestDecodeDNSPayloadInvalidBase32(t *testing.T) {
+	_, err := DecodeDNSPayload("!!!invalid!!!", "base32")
+	if err == nil {
+		t.Fatal("expected error for invalid base32")
+	}
+}
+
+func TestCompressDecompressEmpty(t *testing.T) {
+	compressed, err := Compress(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecompressLimit(compressed, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty, got %d bytes", len(got))
+	}
+}
+
+func TestDecompressLimitInvalidGzip(t *testing.T) {
+	_, err := DecompressLimit([]byte("not gzip"), 100)
+	if err == nil {
+		t.Fatal("expected error for invalid gzip data")
+	}
+}

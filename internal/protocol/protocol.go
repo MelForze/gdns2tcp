@@ -109,14 +109,16 @@ func CurrentTimestamp(now time.Time) string {
 }
 
 func AuthToken(secret, domain, command, timestamp string, args []string) string {
-	parts := []string{AuthVersion, AuthDomain(domain), strings.ToLower(command), timestamp}
-	// Lowercase every arg so a resolver that randomizes DNS-label case
-	// (RFC 5452 0x20 anti-spoofing) or upcases a whole label in transit
-	// can't invalidate a legitimate MAC. Client-side callers still pass
-	// lowercase by convention; this ensures the wire-observed case has
-	// no effect either way.
+	cmd := command
+	if hasUpper(cmd) {
+		cmd = strings.ToLower(cmd)
+	}
+	parts := []string{AuthVersion, AuthDomain(domain), cmd, timestamp}
 	for _, a := range args {
-		parts = append(parts, strings.ToLower(a))
+		if hasUpper(a) {
+			a = strings.ToLower(a)
+		}
+		parts = append(parts, a)
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(strings.Join(parts, "|")))
@@ -150,7 +152,11 @@ func VerifyAuth(secret, domain, command string, args []string, timestamp, token 
 		return false
 	}
 	expected := AuthToken(secret, domain, command, timestamp, args)
-	return hmac.Equal([]byte(expected), []byte(strings.ToLower(token)))
+	tok := token
+	if hasUpper(tok) {
+		tok = strings.ToLower(tok)
+	}
+	return hmac.Equal([]byte(expected), []byte(tok))
 }
 
 // AuthDriftMinutes returns how far the client's timestamp is from the
@@ -261,8 +267,23 @@ func JoinName(domain, command string, args []string) string {
 // once per tunnel and reuse across every DNS query in that tunnel to skip
 // the strings.ToLower / AuthDomain allocations on each round-trip.
 func JoinNameFast(authDomain, lowerCmd string, args []string) string {
-	labels := make([]string, 0, len(args)+2)
-	labels = append(labels, args...)
-	labels = append(labels, lowerCmd, authDomain)
-	return strings.Join(labels, ".")
+	n := len(authDomain) + 1 + len(lowerCmd)
+	for _, a := range args {
+		n += len(a) + 1
+	}
+	var b strings.Builder
+	b.Grow(n)
+	for i, a := range args {
+		if i > 0 {
+			b.WriteByte('.')
+		}
+		b.WriteString(a)
+	}
+	if len(args) > 0 {
+		b.WriteByte('.')
+	}
+	b.WriteString(lowerCmd)
+	b.WriteByte('.')
+	b.WriteString(authDomain)
+	return b.String()
 }

@@ -152,6 +152,7 @@ type downloadState struct {
 type downloadCacheEntry struct {
 	spoolPath    string
 	metaPath     string
+	spoolFile    *os.File
 	mtime        time.Time
 	size         int64
 	sha256       string
@@ -1576,7 +1577,7 @@ func normalizeDomains(csv string) (string, []string, error) {
 // Callers pass the matched suffix on to parseCommand so args are split
 // against the *actual* shard the query landed on.
 func hasAnyDomainSuffix(name string, domains []string) (string, bool) {
-	fqdn := strings.ToLower(dns.Fqdn(name))
+	fqdn := toLowerFast(dns.Fqdn(name))
 	for _, d := range domains {
 		if fqdn == d || strings.HasSuffix(fqdn, "."+d) {
 			return d, true
@@ -1586,8 +1587,24 @@ func hasAnyDomainSuffix(name string, domains []string) (string, bool) {
 }
 
 func hasDomainSuffix(name, domain string) bool {
-	fqdn := strings.ToLower(dns.Fqdn(name))
+	fqdn := toLowerFast(dns.Fqdn(name))
 	return fqdn == domain || strings.HasSuffix(fqdn, "."+domain)
+}
+
+func hasUpper(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+func toLowerFast(s string) string {
+	if hasUpper(s) {
+		return strings.ToLower(s)
+	}
+	return s
 }
 
 func clientID(addr net.Addr) string {
@@ -1610,7 +1627,7 @@ func clientID(addr net.Addr) string {
 // args internally for verification.
 func parseCommand(name, domain string) ([]string, string, bool) {
 	fqdn := dns.Fqdn(name)
-	fqdnLower := strings.ToLower(fqdn)
+	fqdnLower := toLowerFast(fqdn)
 	if fqdnLower != domain && !strings.HasSuffix(fqdnLower, "."+domain) {
 		return nil, "", false
 	}

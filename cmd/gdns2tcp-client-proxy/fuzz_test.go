@@ -84,3 +84,82 @@ func FuzzSkipDNSName(f *testing.F) {
 		_, _ = skipDNSName(buf, pos)
 	})
 }
+
+// FuzzBuildTXTQueryInto exercises the DNS query builder with arbitrary
+// names to catch panics from label splitting, length validation, or
+// buffer overflow in the wire-format encoder.
+func FuzzBuildTXTQueryInto(f *testing.F) {
+	f.Add("example.com", uint16(1))
+	f.Add("a.b.c.d.e.f.g", uint16(0))
+	f.Add("", uint16(42))
+	f.Add("x", uint16(65535))
+	f.Add(".leading.dot", uint16(100))
+	f.Add("trailing.dot.", uint16(100))
+	f.Add("double..dot", uint16(100))
+	// 63-char label (max allowed)
+	long63 := ""
+	for i := 0; i < 63; i++ {
+		long63 += "a"
+	}
+	f.Add(long63+".com", uint16(1))
+	// 64-char label (should fail)
+	f.Add(long63+"b.com", uint16(1))
+	// 253-char name (at the limit)
+	f.Add(long63+"."+long63+"."+long63+"."+long63[:60], uint16(1))
+
+	f.Fuzz(func(t *testing.T, name string, id uint16) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("buildTXTQueryInto panicked on name=%q id=%d: %v", name, id, r)
+			}
+		}()
+		buf := make([]byte, 0, 512)
+		_, _ = buildTXTQueryInto(buf, name, id)
+	})
+}
+
+// FuzzReorderBuffer stress-tests the reorder buffer's enqueueContiguous
+// logic with random insertion orders to catch off-by-one bugs or panics
+// in the contiguous-delivery loop.
+func FuzzReorderBuffer(f *testing.F) {
+	f.Add([]byte{1, 2, 3, 4, 5})
+	f.Add([]byte{5, 4, 3, 2, 1})
+	f.Add([]byte{1, 3, 5, 2, 4})
+	f.Add([]byte{1, 1, 2, 3, 3})
+	f.Add([]byte{})
+	f.Add([]byte{1})
+
+	f.Fuzz(func(t *testing.T, order []byte) {
+		if len(order) > 200 {
+			return
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("reorder panicked on order=%v: %v", order, r)
+			}
+		}()
+		done := make(chan struct{})
+		internalStop := make(chan struct{})
+		out := make(chan exchangeResult, len(order)+1)
+		pending := make(map[uint64][]byte, 32)
+		nextSeq := uint64(1)
+		for _, b := range order {
+			seq := uint64(b)
+			if seq == 0 || seq < nextSeq {
+				continue
+			}
+			pending[seq] = []byte{b}
+			enqueueContiguous(pending, &nextSeq, out, done, internalStop)
+		}
+		close(out)
+		var delivered []uint64
+		for r := range out {
+			delivered = append(delivered, r.readSeq)
+		}
+		for i := 1; i < len(delivered); i++ {
+			if delivered[i] != delivered[i-1]+1 {
+				t.Fatalf("non-contiguous delivery: %v", delivered)
+			}
+		}
+	})
+}
