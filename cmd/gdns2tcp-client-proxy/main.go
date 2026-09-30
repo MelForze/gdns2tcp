@@ -980,13 +980,13 @@ func runBidirectionalTunnel(cfg config, tuning tunnelTuning, resolver *txtResolv
 			continue
 		}
 		pending[r.readSeq] = r.readData
-		if len(pending) > tuning.reorderCap {
-			fmt.Fprintf(os.Stderr, "axchg cid=%s: reorder buffer overflow (lost seq %d?), closing\n", cid, nextSeq)
+		if !enqueueContiguous(pending, &nextSeq, orderedReads, done, internalStop) {
 			stopAll()
 			drainExchange(readResults)
 			return
 		}
-		if !enqueueContiguous(pending, &nextSeq, orderedReads, done, internalStop) {
+		if len(pending) > tuning.reorderCap {
+			fmt.Fprintf(os.Stderr, "axchg cid=%s: reorder buffer overflow (lost seq %d?), closing\n", cid, nextSeq)
 			stopAll()
 			drainExchange(readResults)
 			return

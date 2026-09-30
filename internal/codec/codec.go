@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 
 	"gdns2tcp/internal/dnshelpers"
@@ -78,7 +79,11 @@ func DecompressLimit(data []byte, maxBytes int64) ([]byte, error) {
 	var buf bytes.Buffer
 	reader := io.Reader(zr)
 	if maxBytes > 0 {
-		reader = io.LimitReader(zr, maxBytes+1)
+		limit := maxBytes
+		if limit < math.MaxInt64 {
+			limit++
+		}
+		reader = io.LimitReader(zr, limit)
 	}
 	if _, err := io.Copy(&buf, reader); err != nil {
 		return nil, fmt.Errorf("gzip copy: %w", err)

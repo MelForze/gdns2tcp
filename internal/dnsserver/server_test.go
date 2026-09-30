@@ -517,7 +517,11 @@ func TestExpiredUploadCleanupRemovesPartialFile(t *testing.T) {
 		t.Fatalf("partial spool missing before cleanup: %v", err)
 	}
 	state.expires = time.Now().Add(-time.Minute)
-	s.cleanupExpiredLocked(time.Now())
+	s.mu.Unlock()
+
+	s.cleanupExpired()
+
+	s.mu.Lock()
 	_, exists := s.uploads["expireme"]
 	s.mu.Unlock()
 
@@ -1030,7 +1034,11 @@ func TestCleanupExpiredDownload(t *testing.T) {
 	state := s.downloads[sid]
 	state.expires = time.Now().Add(-time.Minute)
 	s.downloads[sid] = state
-	s.cleanupExpiredLocked(time.Now())
+	s.mu.Unlock()
+
+	s.cleanupExpired()
+
+	s.mu.Lock()
 	_, exists := s.downloads[sid]
 	s.mu.Unlock()
 
@@ -1853,8 +1861,9 @@ func TestDownloadCacheEviction(t *testing.T) {
 	state := s.downloads["evictsid001"]
 	state.expires = time.Now().Add(-time.Minute)
 	s.downloads["evictsid001"] = state
-	s.cleanupExpiredLocked(time.Now())
 	s.mu.Unlock()
+
+	s.cleanupExpired()
 	startDownload(t, s, "evictsid002", "evict-second.txt")
 	s.mu.Lock()
 	_, firstStillCached := s.downloadCache[firstKey]
@@ -2453,7 +2462,11 @@ func TestClientArtifactProgressUsesBitmapAndExpires(t *testing.T) {
 	}
 	progress.lastSeen = time.Now().Add(-clientTransferTTL - time.Second)
 	s.clientTransfers[key] = progress
-	s.cleanupExpiredLocked(time.Now())
+	s.mu.Unlock()
+
+	s.cleanupExpired()
+
+	s.mu.Lock()
 	_, retained := s.clientTransfers[key]
 	s.mu.Unlock()
 	if retained {

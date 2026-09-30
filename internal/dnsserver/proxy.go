@@ -690,6 +690,7 @@ func (s *Server) ServeSOCKS5(addr string) error {
 	var accepts atomic.Int64
 	go s.runFirstAcceptWatchdog(addr, &accepts)
 
+	var acceptBackoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -697,9 +698,23 @@ func (s *Server) ServeSOCKS5(addr string) error {
 			case <-s.reverse.shutdownCh:
 				return nil
 			default:
-				return err
 			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			if acceptBackoff == 0 {
+				acceptBackoff = 5 * time.Millisecond
+			} else {
+				acceptBackoff *= 2
+			}
+			if acceptBackoff > time.Second {
+				acceptBackoff = time.Second
+			}
+			s.logger.Printf("socks5 accept error (retry in %v): %v", acceptBackoff, err)
+			time.Sleep(acceptBackoff)
+			continue
 		}
+		acceptBackoff = 0
 		accepts.Add(1)
 		go s.handleSOCKS5Operator(conn)
 	}
@@ -816,6 +831,11 @@ func (s *Server) handleSOCKS5Operator(conn net.Conn) {
 	if err != nil {
 		_ = socks5WriteReply(conn, 0x01)
 		s.logger.Printf("socks5 connect parse %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	if len(target) > 145 {
+		_ = socks5WriteReply(conn, 0x01)
+		s.logger.Printf("socks5 target too long for DNS encoding (%d bytes): %s", len(target), conn.RemoteAddr())
 		return
 	}
 	_ = conn.SetReadDeadline(time.Time{})
@@ -1807,6 +1827,7 @@ func (s *Server) collectAxchgRead(rc *reverseConn, maxRead int, now time.Time, a
 			rc.mu.Lock()
 			rc.outboundInFlight--
 			rc.outboundReservedBytes -= take
+			rc.opCond.Broadcast()
 			rc.mu.Unlock()
 		}
 	}()

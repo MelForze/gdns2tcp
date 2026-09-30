@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -103,6 +104,12 @@ func (s *Server) loadDownloadCache() error {
 			_ = os.Remove(spoolPath)
 			continue
 		}
+		if prev, dup := s.downloadCache[meta.Key]; dup {
+			if prev.spoolFile != nil {
+				_ = prev.spoolFile.Close()
+			}
+			s.downloadCacheBytes -= prev.encodedSize
+		}
 		entry := downloadCacheEntry{
 			spoolPath: spoolPath, metaPath: metaPath, spoolFile: sf,
 			mtime: time.Unix(0, meta.MTimeUnixNs), size: meta.Size, sha256: meta.SHA256,
@@ -198,7 +205,11 @@ func (s *Server) snapshotDownloadSource(path string, maxBytes int64) (snapshot s
 		}
 	}()
 	h := sha256.New()
-	limited := &io.LimitedReader{R: in, N: maxBytes + 1}
+	limit := maxBytes
+	if limit < math.MaxInt64 {
+		limit++
+	}
+	limited := &io.LimitedReader{R: in, N: limit}
 	n, copyErr := io.CopyBuffer(io.MultiWriter(tmp, h), limited, make([]byte, 64*1024))
 	if copyErr != nil {
 		return "", 0, "", copyErr
@@ -276,7 +287,7 @@ func (s *Server) prepareDownloadCache(path string, info os.FileInfo, now time.Ti
 	}
 	key := downloadCacheKey(path, sourceSHA)
 	s.mu.Lock()
-	if entry, ok := s.downloadCache[key]; ok && now.Before(entry.expires) {
+	if entry, ok := s.downloadCache[key]; ok && (now.Before(entry.expires) || entry.active > 0) {
 		entry.active++
 		entry.lastAccess = now
 		entry.expires = now.Add(s.cacheTTL)
@@ -315,6 +326,9 @@ func (s *Server) prepareDownloadCache(path string, info os.FileInfo, now time.Ti
 	}
 	s.mu.Unlock()
 	if buildErr != nil {
+		if built.spoolFile != nil {
+			_ = built.spoolFile.Close()
+		}
 		_ = os.Remove(built.spoolPath)
 		_ = os.Remove(finalSpool)
 		_ = os.Remove(filepath.Join(s.cacheDir, key+".json"))
@@ -563,16 +577,29 @@ func (s *Server) evictDownloadCacheLocked(now time.Time) {
 	}
 }
 
-func (s *Server) removeCacheLocked(key string, entry downloadCacheEntry) {
+type removedCacheFiles struct {
+	spoolFile           *os.File
+	spoolPath, metaPath string
+}
+
+func (r removedCacheFiles) closeAndRemove() {
+	if r.spoolFile != nil {
+		_ = r.spoolFile.Close()
+	}
+	_ = os.Remove(r.spoolPath)
+	_ = os.Remove(r.metaPath)
+}
+
+func (s *Server) removeCacheEntryLocked(key string, entry downloadCacheEntry) removedCacheFiles {
 	delete(s.downloadCache, key)
 	s.downloadCacheBytes -= entry.encodedSize
 	if elem, ok := s.downloadCacheIndex[key]; ok {
 		s.downloadCacheOrder.Remove(elem)
 		delete(s.downloadCacheIndex, key)
 	}
-	if entry.spoolFile != nil {
-		_ = entry.spoolFile.Close()
-	}
-	_ = os.Remove(entry.spoolPath)
-	_ = os.Remove(entry.metaPath)
+	return removedCacheFiles{entry.spoolFile, entry.spoolPath, entry.metaPath}
+}
+
+func (s *Server) removeCacheLocked(key string, entry downloadCacheEntry) {
+	s.removeCacheEntryLocked(key, entry).closeAndRemove()
 }

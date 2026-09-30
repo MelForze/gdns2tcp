@@ -336,7 +336,8 @@ func (e *udpConnEntry) readLoop(conn *net.UDPConn) {
 		n, err := conn.Read(buf)
 		if err != nil {
 			e.mu.Lock()
-			if e.conn == conn {
+			owned := e.conn == conn
+			if owned {
 				e.closed = true
 				e.conn = nil
 				for id, ch := range e.pending {
@@ -345,7 +346,9 @@ func (e *udpConnEntry) readLoop(conn *net.UDPConn) {
 				}
 			}
 			e.mu.Unlock()
-			_ = conn.Close()
+			if owned {
+				_ = conn.Close()
+			}
 			return
 		}
 		if n < 2 {
@@ -501,7 +504,6 @@ type tcpConnEntry struct {
 	nextID     uint16
 	conn       net.Conn
 	closed     bool
-	connectErr error
 	generation uint64
 }
 
@@ -556,7 +558,6 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 
 	conn, err := e.parent.dial(e.parent.addr, timeout)
 	if err != nil {
-		e.connectErr = err
 		return err
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
@@ -573,7 +574,6 @@ func (e *tcpConnEntry) ensure(timeout time.Duration) error {
 	}
 	e.conn = conn
 	e.closed = false
-	e.connectErr = nil
 	gen := e.generation
 	e.parent.wg.Add(1)
 	e.parent.mu.Unlock()

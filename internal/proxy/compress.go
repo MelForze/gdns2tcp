@@ -45,7 +45,7 @@ func GetCompressor() (*Compressor, error) {
 		sharedCompressorErr = err
 		return nil, err
 	}
-	dec, err := zstd.NewReader(nil)
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(1<<20))
 	if err != nil {
 		_ = enc.Close()
 		sharedCompressorErr = err

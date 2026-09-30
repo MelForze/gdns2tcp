@@ -319,7 +319,8 @@ func (e *tcpConnEntry) readLoop(conn net.Conn) {
 	defer e.parent.wg.Done()
 	defer func() {
 		e.mu.Lock()
-		if e.conn == conn {
+		owned := e.conn == conn
+		if owned {
 			e.closed = true
 			e.conn = nil
 			for id, ch := range e.pending {
@@ -328,7 +329,9 @@ func (e *tcpConnEntry) readLoop(conn net.Conn) {
 			}
 		}
 		e.mu.Unlock()
-		_ = conn.Close()
+		if owned {
+			_ = conn.Close()
+		}
 	}()
 	var prefix [2]byte
 	for {

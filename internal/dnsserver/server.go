@@ -309,14 +309,12 @@ func (s *Server) Shutdown() {
 func (s *Server) startJanitor() {
 	go func() {
 		defer close(s.janitorDone)
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				s.mu.Lock()
-				s.cleanupExpiredLocked(time.Now().UTC())
-				s.mu.Unlock()
+				s.cleanupExpired()
 			case <-s.janitorStop:
 				return
 			}
@@ -561,7 +559,6 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 	}
 
 	s.mu.Lock()
-	s.cleanupExpiredLocked(now)
 	if existing, exists := s.downloads[sid]; exists {
 		if existing.filename == filename {
 			existing.expires = now.Add(transferTTL)
@@ -596,7 +593,6 @@ func (s *Server) downloadInit(args []string, now time.Time) []string {
 	}
 
 	s.mu.Lock()
-	s.cleanupExpiredLocked(now)
 	if existing, exists := s.downloads[sid]; exists {
 		s.releaseCacheLocked(key)
 		if existing.filename == filename {
@@ -634,7 +630,6 @@ func (s *Server) downloadMeta(args []string, now time.Time) []string {
 	}
 
 	s.mu.Lock()
-	s.cleanupExpiredLocked(now)
 	state, exists := s.downloads[sid]
 	if !exists {
 		s.mu.Unlock()
@@ -662,7 +657,6 @@ func (s *Server) downloadChunk(args []string, now time.Time) []string {
 	}
 
 	s.mu.Lock()
-	s.cleanupExpiredLocked(now)
 	state, exists := s.downloads[sid]
 	if !exists {
 		s.mu.Unlock()
@@ -706,7 +700,6 @@ func (s *Server) downloadBatch(args []string, now time.Time) []string {
 	}
 
 	s.mu.Lock()
-	s.cleanupExpiredLocked(now)
 	state, exists := s.downloads[sid]
 	if !exists {
 		s.mu.Unlock()
@@ -755,9 +748,13 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 	if encoding != "base32" && encoding != "base64" {
 		return []string{"Incorrect upload encoding."}
 	}
-	maxWireLength := codec.MaxEncodedSizeForSource(s.maxUploadBytes)
-	if int64(total) > (maxWireLength+int64(chunkSize)-1)/int64(chunkSize) {
-		return []string{"Upload is too large for this server policy."}
+	if s.maxUploadBytes < math.MaxInt64 {
+		maxWireLength := codec.MaxEncodedSizeForSource(s.maxUploadBytes)
+		if maxWireLength < math.MaxInt64-int64(chunkSize) {
+			if int64(total) > (maxWireLength+int64(chunkSize)-1)/int64(chunkSize) {
+				return []string{"Upload is too large for this server policy."}
+			}
+		}
 	}
 	filename, path, err := s.safePathFromFilenameLabels(payload[4:])
 	if err != nil {
@@ -766,7 +763,6 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 	fingerprint := fmt.Sprintf("%s|%d|%d|%s", filename, total, chunkSize, encoding)
 
 	s.mu.Lock()
-	s.cleanupExpiredLocked(now)
 	if completion, exists := s.uploadCompletions[sid]; exists {
 		if completion.fingerprint != fingerprint {
 			s.mu.Unlock()
@@ -814,7 +810,6 @@ func (s *Server) uploadInit(args []string, now time.Time) []string {
 		nextIndex: 0, received: make(map[int][]byte), expires: now.Add(transferTTL),
 	}
 	s.mu.Lock()
-	s.cleanupExpiredLocked(now)
 	if completion, exists := s.uploadCompletions[sid]; exists {
 		s.mu.Unlock()
 		_ = spool.Close()
@@ -861,7 +856,6 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 	wireChunk := builder.String()
 
 	s.mu.Lock()
-	s.cleanupExpiredLocked(now)
 	state, exists := s.uploads[sid]
 	if !exists {
 		if completion, ok := s.uploadCompletions[sid]; ok {
@@ -937,6 +931,7 @@ func (s *Server) uploadChunk(args []string, now time.Time) []string {
 
 	// All chunks flushed — finalize.
 	if state.nextIndex == state.total {
+		state.expires = now.Add(transferTTL)
 		state.mu.Unlock()
 		completion := &uploadCompletion{
 			done:        make(chan struct{}),
@@ -1454,12 +1449,23 @@ func (s *Server) logClientArtifactProgress(client, alias string, artifact client
 	s.clientTransfers[key] = progress
 }
 
-func (s *Server) cleanupExpiredLocked(now time.Time) {
+func (s *Server) cleanupExpired() {
+	now := time.Now().UTC()
+
+	type uploadCleanup struct {
+		sid, filename, spoolPath string
+		spool                    *os.File
+	}
+	var expiredUploads []uploadCleanup
+
+	s.mu.Lock()
+
 	for key, progress := range s.clientTransfers {
 		if !progress.lastSeen.IsZero() && now.Sub(progress.lastSeen) > clientTransferTTL {
 			delete(s.clientTransfers, key)
 		}
 	}
+
 	for sid, state := range s.uploads {
 		if !state.mu.TryLock() {
 			continue
@@ -1469,17 +1475,14 @@ func (s *Server) cleanupExpiredLocked(now time.Time) {
 			continue
 		}
 		state.closed = true
-		spool, spoolPath, filename := state.spool, state.spoolPath, state.filename
+		expiredUploads = append(expiredUploads, uploadCleanup{
+			sid: sid, filename: state.filename,
+			spoolPath: state.spoolPath, spool: state.spool,
+		})
 		state.mu.Unlock()
-		if spool != nil {
-			_ = spool.Close()
-		}
-		if err := os.Remove(spoolPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			s.logger.Printf("remove expired upload spool %q: %v", filename, err)
-		}
 		delete(s.uploads, sid)
-		s.logger.Printf("expired upload %q (%s)", filename, sid)
 	}
+
 	for sid, state := range s.downloads {
 		if now.Before(state.expires) {
 			continue
@@ -1488,6 +1491,7 @@ func (s *Server) cleanupExpiredLocked(now time.Time) {
 		delete(s.downloads, sid)
 		s.logger.Printf("expired download %q (%s)", state.filename, sid)
 	}
+
 	for sid, completion := range s.uploadCompletions {
 		select {
 		case <-completion.done:
@@ -1497,7 +1501,21 @@ func (s *Server) cleanupExpiredLocked(now time.Time) {
 		default:
 		}
 	}
+
 	s.evictDownloadCacheLocked(now)
+
+	s.mu.Unlock()
+
+	for _, u := range expiredUploads {
+		if u.spool != nil {
+			_ = u.spool.Close()
+		}
+		if err := os.Remove(u.spoolPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.logger.Printf("remove expired upload spool %q: %v", u.filename, err)
+		}
+		s.logger.Printf("expired upload %q (%s)", u.filename, u.sid)
+	}
+
 	s.proxyCleanupExpiredLocked(now)
 }
 
@@ -1594,10 +1612,16 @@ func normalizeDomains(csv string) (string, []string, error) {
 // against the *actual* shard the query landed on.
 func hasAnyDomainSuffix(name string, domains []string) (string, bool) {
 	fqdn := toLowerFast(dns.Fqdn(name))
+	best := ""
 	for _, d := range domains {
 		if fqdn == d || strings.HasSuffix(fqdn, "."+d) {
-			return d, true
+			if len(d) > len(best) {
+				best = d
+			}
 		}
+	}
+	if best != "" {
+		return best, true
 	}
 	return "", false
 }
